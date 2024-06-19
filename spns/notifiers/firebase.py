@@ -7,7 +7,6 @@ from .util import encrypt_notify_payload, derive_notifier_key, warn_on_except, N
 
 import firebase_admin
 from firebase_admin import messaging
-from firebase_admin.exceptions import *
 
 import oxenc
 from oxenmq import OxenMQ, Message, Address, AuthLevel
@@ -92,7 +91,7 @@ def send_pending():
 
     i = 0
     while i < len(queue):
-        results = messaging.send_all(messages=queue[i : i + MAX_NOTIFIES], app=firebase_app)
+        results = messaging.send_each(messages=queue[i : i + MAX_NOTIFIES], app=firebase_app)
         with stats.lock:
             stats.notifies += min(len(queue) - i, MAX_NOTIFIES)
 
