@@ -1629,7 +1629,7 @@ FROM subscriptions)")) {
                     /*_skip_validation=*/true);
         }
 
-        if (++count % 100000 == 0) {
+        if (++count % 25000 == 0) {
             auto now = steady_clock::now();
             auto elapsed = now - last_print;
             if (elapsed >= 1s) {
