@@ -5,8 +5,7 @@ from ..config import logger
 from ..core import SUBSCRIBE
 from .util import encrypt_notify_payload, derive_notifier_key, warn_on_except, NotifyStats
 
-import firebase_admin
-from firebase_admin import messaging
+from pyfcm import FCMNotification
 
 import oxenc
 from oxenmq import OxenMQ, Message, Address, AuthLevel
@@ -72,11 +71,13 @@ def push_notification(msg: Message):
 
     device_token = data[b"&"].decode()  # unique service id, as we returned from validate
 
-    msg = messaging.Message(
-        data={"enc_payload": oxenc.to_base64(enc_payload), "spns": f"{SPNS_FIREBASE_VERSION}"},
-        token=device_token,
-        android=messaging.AndroidConfig(priority="high"),
-    )
+    msg = {
+        'fcm_token': device_token,
+        'data_payload': {
+            "enc_payload": oxenc.to_base64(enc_payload),
+            "spns": f"{SPNS_FIREBASE_VERSION}"
+        }
+    }
 
     global notify_queue, queue_lock
     with queue_lock:
@@ -91,7 +92,7 @@ def send_pending():
 
     i = 0
     while i < len(queue):
-        results = messaging.send_each(messages=queue[i : i + MAX_NOTIFIES], app=firebase_app)
+        results = firebase_app.async_notify_multiple_devices(params_list=queue[i : i + MAX_NOTIFIES])
         with stats.lock:
             stats.notifies += min(len(queue) - i, MAX_NOTIFIES)
 
@@ -120,7 +121,7 @@ def start():
     # restart/reconnect and receive messages sent while we where restarting.
     key = derive_notifier_key("firebase")
 
-    global omq, hivemind, firebase, queue_timer
+    global omq, hivemind, firebase_app, queue_timer
 
     omq = OxenMQ(pubkey=key.public_key.encode(), privkey=key.encode())
 
@@ -143,8 +144,8 @@ def start():
         Address(config.config.hivemind_sock), auth_level=AuthLevel.basic, ephemeral_routing_id=False
     )
 
-    firebase_app = firebase_admin.initialize_app(
-        firebase_admin.credentials.Certificate(conf["token_file"])
+    firebase_app = FCMNotification(
+        service_account_file=conf["token_file"], project_id="loki-5a81e"
     )
 
     omq.send(hivemind, "admin.register_service", "firebase")
