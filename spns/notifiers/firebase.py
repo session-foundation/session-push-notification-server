@@ -121,7 +121,7 @@ def start():
     # restart/reconnect and receive messages sent while we where restarting.
     key = derive_notifier_key("firebase")
 
-    global omq, hivemind, firebase, queue_timer
+    global omq, hivemind, firebase_app, queue_timer
 
     omq = OxenMQ(pubkey=key.public_key.encode(), privkey=key.encode())
 
