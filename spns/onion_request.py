@@ -4,15 +4,12 @@ from typing import Tuple
 
 from . import config
 from .web import app
-
 from .subrequest import make_subrequest
 
-import pyonionreq
+from session_util.onionreq import OnionReqParser
 
-_junk_parser = pyonionreq.junk.Parser(
-    privkey=config.PRIVKEYS["onionreq"].encode(), pubkey=config.PUBKEYS["onionreq"].encode()
-)
-
+onion_privkey_bytes = config.PRIVKEYS["onionreq"].encode()
+onion_pubkey_bytes = config.PUBKEYS["onionreq"].encode()
 
 def bencode_consume_string(body: memoryview) -> Tuple[memoryview, memoryview]:
     """
@@ -35,6 +32,64 @@ def bencode_consume_string(body: memoryview) -> Tuple[memoryview, memoryview]:
 
 
 def handle_v4_onionreq_plaintext(body):
+    try:
+        if not (body.startswith(b'l') and body.endswith(b'e')):
+            raise RuntimeError("Invalid onion request body: expected bencoded list")
+
+        belems = memoryview(body)[1:-1]
+
+        # Metadata json; this element is always required:
+        meta, belems = bencode_consume_string(belems)
+
+        meta = json.loads(meta.tobytes())
+
+        # Then we can have a second optional string containing the body:
+        if len(belems) > 1:
+            subreq_body, belems = bencode_consume_string(belems)
+            if len(belems):
+                raise RuntimeError("Invalid v4 onion request: found more than 2 parts")
+        else:
+            subreq_body = b''
+
+        method, endpoint = meta['method'], meta['endpoint']
+        if not endpoint.startswith('/'):
+            raise RuntimeError("Invalid v4 onion request: endpoint must start with /")
+
+        response, headers = make_subrequest(
+            method, endpoint, headers=meta.get('headers', {}), body=subreq_body
+        )
+
+        data = response.get_data()
+        app.logger.debug(
+            f"Onion sub-request for {endpoint} returned {response.status_code}, {len(data)} bytes"
+        )
+
+        meta = {'code': response.status_code, 'headers': headers}
+
+    except Exception as e:
+        app.logger.warning("Invalid v4 onion request: {}".format(e))
+        meta = {'code': http.BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
+        data = b'Invalid v4 onion request'
+
+    meta = json.dumps(meta).encode()
+    return b''.join(
+        (b'l', str(len(meta)).encode(), b':', meta, str(len(data)).encode(), b':', data, b'e')
+    )
+
+
+def decrypt_onionreq():
+    try:
+        return OnionReqParser(
+            onion_pubkey_bytes,
+            onion_privkey_bytes,
+            request.data)
+    except Exception as e:
+        app.logger.warning("Failed to decrypt onion request: {}".format(e))
+    abort(http.BAD_REQUEST)
+
+
+@app.post("/oxen/v4/lsrpc")
+def handle_v4_onion_request():
     """
     Handles a decrypted v4 onion request; this injects a subrequest to process it then returns the
     result of that subrequest.  In contrast to v3, it is more efficient (particularly for binary
@@ -53,11 +108,6 @@ def handle_v4_onionreq_plaintext(body):
     Unlike v3 requests, endpoints must always start with a /.  (If a legacy endpoint "whatever"
     needs to be accessed through a v4 request for some reason then it can be accessed via the
     "/legacy/whatever" endpoint).
-
-    If an "endpoint" contains unicode characters then it is recommended to provide it as direct
-    UTF-8 values (rather than URL-encoded UTF-8).  Both approaches will work, but the X-SOGS-*
-    authentication headers will always apply on the final, URL-decoded value and so avoiding
-    URL-encoding in the first place will typically simplify client implementations.
 
     The "headers" field typically carries X-SOGS-* authentication headers as well as fields like
     Content-Type.  Note that, unlike v3 requests, the Content-Type does *not* have any default and
@@ -128,61 +178,6 @@ def handle_v4_onionreq_plaintext(body):
     bytes are returned directly to the client (i.e. no base64 encoding applied, unlike v3 requests).
     """  # noqa: E501
 
-    try:
-        if not (body.startswith(b"l") and body.endswith(b"e")):
-            raise RuntimeError("Invalid onion request body: expected bencoded list")
-
-        belems = memoryview(body)[1:-1]
-
-        # Metadata json; this element is always required:
-        meta, belems = bencode_consume_string(belems)
-
-        meta = json.loads(meta.tobytes())
-
-        # Then we can have a second optional string containing the body:
-        if len(belems) > 1:
-            subreq_body, belems = bencode_consume_string(belems)
-            if len(belems):
-                raise RuntimeError("Invalid v4 onion request: found more than 2 parts")
-        else:
-            subreq_body = b""
-
-        method, endpoint = meta["method"], meta["endpoint"]
-        if not endpoint.startswith("/"):
-            raise RuntimeError("Invalid v4 onion request: endpoint must start with /")
-
-        response, headers = make_subrequest(
-            method,
-            endpoint,
-            headers=meta.get("headers", {}),
-            body=subreq_body,
-            user_reauth=True,  # Because onion requests have auth headers on the *inside*
-        )
-
-        data = response.get_data()
-        app.logger.debug(
-            f"Onion sub-request for {endpoint} returned {response.status_code}, {len(data)} bytes"
-        )
-
-        meta = {"code": response.status_code, "headers": headers}
-
-    except Exception as e:
-        app.logger.warning("Invalid v4 onion request: {}".format(e))
-        meta = {"code": 400, "headers": {"content-type": "text/plain; charset=utf-8"}}
-        data = b"Invalid v4 onion request"
-
-    meta = json.dumps(meta).encode()
-    return b"".join(
-        (b"l", str(len(meta)).encode(), b":", meta, str(len(data)).encode(), b":", data, b"e")
-    )
-
-
-@app.post("/oxen/v4/lsrpc")
-def handle_v4_onion_request():
-    """
-    Parse a v4 onion request.  See handle_v4_onionreq_plaintext().
-    """
-
     # Some less-than-ideal decisions in the onion request protocol design means that we are stuck
     # dealing with parsing the request body here in the internal format that is meant for storage
     # server, but the *last* hop's decrypted, encoded data has to get shared by us (and is passed on
@@ -198,7 +193,7 @@ def handle_v4_onion_request():
     # The parse_junk here takes care of decoding and decrypting this according to the fields *meant
     # for us* in the json (which include things like the encryption type and ephemeral key):
     try:
-        junk = _junk_parser.parse_junk(request.data)
+        parser = decrypt_onionreq()
     except RuntimeError as e:
         app.logger.warning("Failed to decrypt onion request: {}".format(e))
         abort(400)
@@ -206,5 +201,5 @@ def handle_v4_onion_request():
     # On the way back out we re-encrypt via the junk parser (which uses the ephemeral key and
     # enc_type that were specified in the outer request).  We then return that encrypted binary
     # payload as-is back to the client which bounces its way through the SN path back to the client.
-    response = handle_v4_onionreq_plaintext(junk.payload)
-    return junk.transformReply(response)
+    response = handle_v4_onionreq_plaintext(parser.payload)
+    return parser.encrypt_reply(response)
