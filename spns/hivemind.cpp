@@ -912,8 +912,9 @@ void HiveMind::log_stats(std::string_view pre_cmd) {
             total_notifies,
             pushes_processed_.load());
 
-    auto sd_format = pre_cmd.empty() ? "STATUS={1}" : "{0}\nSTATUS={1}";
-    sd_notify(0, fmt::format(sd_format, pre_cmd, stat_line).c_str());
+    auto sd_out = pre_cmd.empty() ? "STATUS={}"_format(stat_line)
+                                  : "{}\nSTATUS={}"_format(pre_cmd, stat_line);
+    sd_notify(0, sd_out.c_str());
 
     if (auto now = std::chrono::steady_clock::now(); now - last_stats_logged >= 4min + 55s) {
         log::info(stats, "Status: {}", stat_line);
@@ -1049,12 +1050,7 @@ void HiveMind::on_notifier_validation(
         response["message"] = std::move(message);
 
     sub_json_set_one_response(
-        std::move(replier),
-        final_response,
-        i,
-        remaining,
-        multi,
-        std::move(response));
+            std::move(replier), final_response, i, remaining, multi, std::move(response));
 }
 
 std::tuple<SwarmPubkey, std::optional<Subaccount>, int64_t, Signature, std::string, nlohmann::json>
@@ -1667,8 +1663,8 @@ SELECT
     ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
 FROM subscriptions
 WHERE
-    account = {} AND service = {} AND svcid = {})"_format(
-                    tx.quote(pubkey.id), tx.quote(service), tx.quote(service_id)));
+    account = $1 AND service = $2 AND svcid = $3)",
+            {pubkey.id, service, service_id});
     int64_t id;
     if (result) {
         auto& [row_id, sig_ts, ns_arr] = *result;

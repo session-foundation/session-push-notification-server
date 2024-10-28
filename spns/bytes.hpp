@@ -47,6 +47,9 @@ struct is_bytes_impl {
 template <typename T>
 inline constexpr bool is_bytes = decltype(is_bytes_impl::check(static_cast<T*>(nullptr)))::value;
 
+template <typename T>
+concept bytes_subtype = is_bytes<T>;
+
 struct AccountID : bytes<33> {};
 struct Ed25519PK : bytes<32> {};
 struct X25519PK : bytes<32> {};

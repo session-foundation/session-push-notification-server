@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <oxen/log/format.hpp>
 
 #include <charconv>
 #include <chrono>
@@ -40,37 +41,7 @@ inline ustring_view as_usv(bstring_view s) {
     return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
 }
 
-// Can replace this with a `using namespace oxen::log::literals` if we start using oxen-logging
-namespace detail {
-
-    // Internal implementation of _format that holds the format temporarily until the (...) operator
-    // is invoked on it.  This object cannot be moved, copied but only used ephemerally in-place.
-    struct fmt_wrapper {
-      private:
-        std::string_view format;
-
-        // Non-copyable and non-movable:
-        fmt_wrapper(const fmt_wrapper&) = delete;
-        fmt_wrapper& operator=(const fmt_wrapper&) = delete;
-        fmt_wrapper(fmt_wrapper&&) = delete;
-        fmt_wrapper& operator=(fmt_wrapper&&) = delete;
-
-      public:
-        constexpr explicit fmt_wrapper(const char* str, const std::size_t len) : format{str, len} {}
-
-        /// Calling on this object forwards all the values to fmt::format, using the format string
-        /// as provided during construction (via the "..."_format user-defined function).
-        template <typename... T>
-        auto operator()(T&&... args) && {
-            return fmt::format(format, std::forward<T>(args)...);
-        }
-    };
-
-}  // namespace detail
-
-inline detail::fmt_wrapper operator""_format(const char* str, size_t len) {
-    return detail::fmt_wrapper{str, len};
-}
+using namespace oxen::log::literals;
 
 /// Splits a string on some delimiter string and returns a vector of string_view's pointing into the
 /// pieces of the original string.  The pieces are valid only as long as the original string remains
