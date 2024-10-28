@@ -1,7 +1,9 @@
+#pragma once
+
 #include <chrono>
 #include <mutex>
 #include <pqxx/pqxx>
-#include <stack>
+#include <deque>
 
 #include "bytes.hpp"
 
@@ -117,7 +119,7 @@ inline const std::string type_name<spns::Signature>{"spns::Signature"};
 template <>
 inline const std::string type_name<spns::EncKey>{"spns::EncKey"};
 
-template <typename T, typename = std::enable_if_t<spns::is_bytes<T>>>
+template <spns::bytes_subtype T>
 struct spns_byte_helper {
     static constexpr size_t SIZE = T::SIZE;
     static T from_string(std::string_view text) {
@@ -147,9 +149,6 @@ struct spns_byte_helper {
         return internal::size_esc_bin(SIZE);
     }
 };
-
-template <typename T>
-struct nullness<T, std::enable_if_t<spns::is_bytes<T>>> : pqxx::no_null<T> {};
 
 template <>
 struct string_traits<spns::AccountID> : spns_byte_helper<spns::AccountID> {};

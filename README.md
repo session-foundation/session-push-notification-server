@@ -87,7 +87,7 @@ to be installed:
 - python3-uwsgidecorators
 - python3-coloredlogs
 - python3-oxenmq (available in our repository)
-- python3-pyonionreq (available in our repository)
+- python3-session-util (available in our repository)
 
 ### Just give me some stuff to blindly copy and paste!
 
@@ -97,7 +97,7 @@ Okay here you go (for a recent Ubuntu or Debian installation):
     echo "deb https://deb.oxen.io $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/oxen.list
     sudo apt update
     sudo apt install cmake g++ lib{sodium,oxenmq,oxenc,systemd,pq}-dev nlohmann-json3-dev \
-        python3 python3-{systemd,flask,uwsgidecorators,coloredlogs,oxenmq,pyonionreq} \
+        python3 python3-{systemd,flask,uwsgidecorators,coloredlogs,oxenmq,session-util} \
         uwsgi-plugin-python3 uwsgi-emperor
 ```
 
