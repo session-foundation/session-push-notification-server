@@ -190,7 +190,7 @@ def unsubscribe():
                 "message": "Timeout waiting for push notification backend",
             }
         )
-    except Exception:
+    except Exception as e:
         app.logger.warning(f"Error proxying subscription to hivemind backend: {e}")
         return jsonify(
             {
