@@ -66,23 +66,29 @@ def validate(msg: Message):
 @warn_on_except
 def push_notification(msg: Message):
     data = oxenc.bt_deserialize(msg.data()[0])
-
     enc_payload = encrypt_notify_payload(data, max_msg_size=MAX_MSG_SIZE)
-
     device_token = data[b"&"].decode()  # unique service id, as we returned from validate
+
+    # Conditionally set priority based on device token
+    if device_token == "fG7BjwztRa6o7g0FOTmwcW:APA91bFiLCFWYYYeF7jnm6GfW2Y3zvmyMtaqBWNHW4RvCsICti1F-GWt2UhiQbgyOe3DIXCBok3itVWF8C-8wBEQW1VrVZosfUQovJl-g-HGXGEkalhkubc":
+        priority = "high"
+    else:
+        priority = "normal"
 
     msg = {
         'fcm_token': device_token,
         'data_payload': {
             "enc_payload": oxenc.to_base64(enc_payload),
             "spns": f"{SPNS_FIREBASE_VERSION}"
+        },
+        "android_config": {
+            "priority": priority
         }
     }
 
     global notify_queue, queue_lock
     with queue_lock:
         notify_queue.append(msg)
-
 
 @warn_on_except
 def send_pending():
