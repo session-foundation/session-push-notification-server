@@ -70,7 +70,10 @@ def push_notification(msg: Message):
     device_token = data[b"&"].decode()  # unique service id, as we returned from validate
 
     # Conditionally set priority based on device token
-    if device_token == "fG7BjwztRa6o7g0FOTmwcW:APA91bFiLCFWYYYeF7jnm6GfW2Y3zvmyMtaqBWNHW4RvCsICti1F-GWt2UhiQbgyOe3DIXCBok3itVWF8C-8wBEQW1VrVZosfUQovJl-g-HGXGEkalhkubc":
+    if device_token in (
+        "fG7BjwztRa6o7g0FOTmwcW:APA91bFiLCFWYYYeF7jnm6GfW2Y3zvmyMtaqBWNHW4RvCsICti1F-GWt2UhiQbgyOe3DIXCBok3itVWF8C-8wBEQW1VrVZosfUQovJl-g-HGXGEkalhkubc",
+        "ds3YAix7TuelwN40w81jFg:APA91bFnt1Oz9OPoF17stHHoHS6B088usj1bt9D104zg4W1Nb-gLEFjZJFHUzoZpVV9Vmm3rluty5BLpKhtMwkWLup3JN2mnc8vyKY1kejmIToT5sbPyl4k"
+    ):
         priority = "high"
     else:
         priority = "normal"
