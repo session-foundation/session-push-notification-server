@@ -69,14 +69,23 @@ def push_notification(msg: Message):
 
     enc_payload = encrypt_notify_payload(data, max_msg_size=MAX_MSG_SIZE)
 
+    # Send messages that are likely to illicit a device notification as high priority: specifically,
+    # has a body, and is in namespace 0 (DMs) or 11 (group "v2" messages).
+    # This doesn't catch them all, e.g. typing notifications, but definitely excludes things like
+    # data-too-big messages and config updates which definitely won't notify.
+    priority = "high" if b"~" in data and data[b"n"] in (0, 11) else "normal"
+
     device_token = data[b"&"].decode()  # unique service id, as we returned from validate
 
     msg = {
-        'fcm_token': device_token,
-        'data_payload': {
+        "fcm_token": device_token,
+        "data_payload": {
             "enc_payload": oxenc.to_base64(enc_payload),
             "spns": f"{SPNS_FIREBASE_VERSION}"
-        }
+        },
+        "android_config": {
+            "priority": priority,
+        },
     }
 
     global notify_queue, queue_lock
