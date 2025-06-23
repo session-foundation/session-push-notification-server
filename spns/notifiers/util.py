@@ -48,7 +48,8 @@ def encrypt_notify_payload(data: dict, max_msg_size: int = 2500):
             metadata["B"] = True
             body = None
 
-    payload = bt_serialize([json.dumps(metadata), body] if body else [metadata])
+    metadata_json = json.dumps(metadata)
+    payload = bt_serialize([metadata_json, body] if body else [metadata_json])
     over = len(payload) % 256
     if over:
         payload += b"\0" * (256 - over)
