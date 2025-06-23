@@ -165,7 +165,8 @@ class APNSHandler:
     def push_notification(self, msg: Message):
         data = oxenc.bt_deserialize(msg.data()[0])
 
-        enc_payload = encrypt_notify_payload(data, max_msg_size=MAX_MSG_SIZE)
+        enc_payload = encrypt_notify_payload(data, max_msg_size=MAX_MSG_SIZE,
+                                             broken_nobody_hack=True)
 
         device_token = data[b"&"].decode()  # unique service id, as we returned from validate
 

@@ -36,7 +36,7 @@ def encrypt_payload(msg: bytes, enc_key: bytes):
     return nonce + ciphertext
 
 
-def encrypt_notify_payload(data: dict, max_msg_size: int = 2500):
+def encrypt_notify_payload(data: dict, max_msg_size: int = 2500, broken_nobody_hack: bool = False):
     enc_key = data[b"^"]
 
     metadata = {"@": data[b"@"].hex(), "#": data[b"#"].decode(), "n": data[b"n"], "t": data[b"t"], "z": data[b"z"]}
@@ -49,7 +49,7 @@ def encrypt_notify_payload(data: dict, max_msg_size: int = 2500):
             body = None
 
     metadata_json = json.dumps(metadata)
-    payload = bt_serialize([metadata_json, body] if body else [metadata_json])
+    payload = bt_serialize([metadata_json, body] if body else [metadata if broken_nobody_hack else metadata_json])
     over = len(payload) % 256
     if over:
         payload += b"\0" * (256 - over)
