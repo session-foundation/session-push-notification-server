@@ -33,8 +33,9 @@ add_library(spns STATIC
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.18)
-pkg_check_modules(OXENC REQUIRED IMPORTED_TARGET liboxenc>=1.0.4)
-pkg_check_modules(OXENMQ REQUIRED IMPORTED_TARGET liboxenmq>=1.2.14)
+pkg_check_modules(OXENC REQUIRED IMPORTED_TARGET liboxenc>=1.4.0)
+pkg_check_modules(OXENMQ REQUIRED IMPORTED_TARGET liboxenmq>=1.2.22)
+pkg_check_modules(OXENLOGGING REQUIRED IMPORTED_TARGET liboxen-logging>=1.2.0)
 pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json>=3.7.0)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 
@@ -74,15 +75,11 @@ if(SUBMODULE_CHECK)
     endfunction ()
 
     message(STATUS "Checking submodules")
-    check_submodule(oxen-logging fmt spdlog)
     check_submodule(libpqxx)
     check_submodule(pybind11)
 
   endif()
 endif()
-
-set(OXEN_LOGGING_SOURCE_ROOT "${PROJECT_SOURCE_DIR}" CACHE INTERNAL "")
-add_subdirectory(oxen-logging)
 
 add_subdirectory(libpqxx EXCLUDE_FROM_ALL)
 
@@ -90,11 +87,11 @@ target_link_libraries(spns PRIVATE
     PkgConfig::SODIUM
     PkgConfig::OXENC
     PkgConfig::OXENMQ
+    PkgConfig::OXENLOGGING
     PkgConfig::NLOHMANN_JSON
     PkgConfig::SYSTEMD
     PUBLIC
-    pqxx
-    oxen::logging)
+    pqxx)
 
 set_target_properties(spns PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 
