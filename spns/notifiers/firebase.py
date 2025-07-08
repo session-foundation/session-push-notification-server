@@ -3,13 +3,21 @@
 from .. import config
 from ..config import logger
 from ..core import SUBSCRIBE
-from .util import encrypt_notify_payload, derive_notifier_key, warn_on_except, NotifyStats
+from .util import (
+    encrypt_notify_payload,
+    derive_notifier_key,
+    warn_on_except,
+    NotifyStats,
+)
 
-from pyfcm import FCMNotification
+import firebase_admin
+from firebase_admin import messaging
+from firebase_admin.exceptions import *
 
 import oxenc
 from oxenmq import OxenMQ, Message, Address, AuthLevel
 
+import asyncio
 import datetime
 import time
 import json
@@ -17,6 +25,7 @@ import signal
 import systemd.daemon
 from threading import Lock
 
+loop = None
 omq = None
 hivemind = None
 firebase_app = None
@@ -75,18 +84,17 @@ def push_notification(msg: Message):
     # data-too-big messages and config updates which definitely won't notify.
     priority = "high" if b"~" in data and data[b"n"] in (0, 11) else "normal"
 
-    device_token = data[b"&"].decode()  # unique service id, as we returned from validate
+    # unique service id, as we returned from validate
+    device_token = data[b"&"].decode()
 
-    msg = {
-        "fcm_token": device_token,
-        "data_payload": {
+    msg = messaging.Message(
+        data={
             "enc_payload": oxenc.to_base64(enc_payload),
-            "spns": f"{SPNS_FIREBASE_VERSION}"
+            "spns": f"{SPNS_FIREBASE_VERSION}",
         },
-        "android_config": {
-            "priority": priority,
-        },
-    }
+        token=device_token,
+        android=messaging.AndroidConfig(priority=priority),
+    )
 
     global notify_queue, queue_lock
     with queue_lock:
@@ -95,19 +103,28 @@ def push_notification(msg: Message):
 
 @warn_on_except
 def send_pending():
-    global notify_queue, queue_lock, firebase_app, stats
+    global notify_queue, queue_lock, firebase_app, loop, stats
     with queue_lock:
         queue, notify_queue = notify_queue, []
 
     i = 0
+    results = []
     while i < len(queue):
-        results = firebase_app.async_notify_multiple_devices(params_list=queue[i : i + MAX_NOTIFIES])
-        with stats.lock:
-            stats.notifies += min(len(queue) - i, MAX_NOTIFIES)
-
-        # FIXME: process/reschedule failures?
-
+        results.append(
+            asyncio.run_coroutine_threadsafe(
+                messaging.send_each_async(
+                    messages=queue[i : i + MAX_NOTIFIES], app=firebase_app
+                ),
+                loop,
+            )
+        )
         i += MAX_NOTIFIES
+
+    results = [f.result() for f in results]
+    # FIXME: process/reschedule failures?
+
+    with stats.lock:
+        stats.notifies += len(queue)
 
 
 @warn_on_except
@@ -115,7 +132,9 @@ def ping():
     """Makes sure we are registered and reports updated stats to hivemind; called every few seconds"""
     global omq, hivemind, stats
     omq.send(hivemind, "admin.register_service", "firebase")
-    omq.send(hivemind, "admin.service_stats", "firebase", oxenc.bt_serialize(stats.collect()))
+    omq.send(
+        hivemind, "admin.service_stats", "firebase", oxenc.bt_serialize(stats.collect())
+    )
     systemd.daemon.notify(
         f"WATCHDOG=1\nSTATUS=Running; {stats.total_notifies} notifications, "
         f"{stats.total_retries} retries, {stats.total_failures} failures"
@@ -150,11 +169,13 @@ def start():
     omq.start()
 
     hivemind = omq.connect_remote(
-        Address(config.config.hivemind_sock), auth_level=AuthLevel.basic, ephemeral_routing_id=False
+        Address(config.config.hivemind_sock),
+        auth_level=AuthLevel.basic,
+        ephemeral_routing_id=False,
     )
 
-    firebase_app = FCMNotification(
-        service_account_file=conf["token_file"], project_id="loki-5a81e"
+    firebase_app = firebase_admin.initialize_app(
+        firebase_admin.credentials.Certificate(conf["token_file"])
     )
 
     omq.send(hivemind, "admin.register_service", "firebase")
@@ -177,7 +198,7 @@ def disconnect(flush_pending=True):
 def run(startup_delay=4.0):
     """Runs the firebase notifier, forever."""
 
-    global omq
+    global omq, loop
 
     if startup_delay > 0:
         time.sleep(startup_delay)
@@ -185,6 +206,7 @@ def run(startup_delay=4.0):
     logger.info("Starting firebase notifier")
     systemd.daemon.notify("STATUS=Initializing firebase notifier...")
     try:
+        loop = asyncio.new_event_loop()
         start()
     except Exception as e:
         logger.critical(f"Failed to start firebase notifier: {e}")
@@ -194,16 +216,17 @@ def run(startup_delay=4.0):
     systemd.daemon.notify("READY=1\nSTATUS=Started")
 
     def sig_die(signum, frame):
+        loop.stop()
         raise OSError(f"Caught signal {signal.Signals(signum).name}")
 
     try:
         signal.signal(signal.SIGHUP, sig_die)
         signal.signal(signal.SIGINT, sig_die)
 
-        while omq is not None:
-            time.sleep(3600)
+        loop.run_forever()
+
     except Exception as e:
-        logger.error(f"firebase notifier mule died via exception: {e}")
+        logger.error(f"firebase notifier died via exception: {e}")
 
 
 if __name__ == "__main__":
