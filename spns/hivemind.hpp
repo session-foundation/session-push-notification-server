@@ -233,6 +233,8 @@ class HiveMind {
             std::vector<std::string> data,
             const std::optional<UnsubData>& unsub = std::nullopt);
 
+    void on_drop_registrations(oxenmq::Message& m);
+
     std::tuple<
             SwarmPubkey,
             std::optional<Subaccount>,
