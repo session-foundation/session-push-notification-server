@@ -927,10 +927,9 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
         pqxx::work tx{conn};
         while (!drops.is_finished()) {
             reqed++;
-            auto del = tx.exec_params0(
-                                 "DELETE FROM subscriptions WHERE service = $1 AND svcid = $2",
-                                 service,
-                                 drops.consume_string_view())
+            auto del = tx.exec("DELETE FROM subscriptions WHERE service = $1 AND svcid = $2",
+                               {service, drops.consume_string_view()})
+                               .no_rows()
                                .affected_rows();
             deleted += del;
             if (del)
