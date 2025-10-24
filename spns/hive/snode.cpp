@@ -270,7 +270,7 @@ void SNode::check_subs(
             }
             if (sub.want_data)
                 dict.append("d", 1);
-            dict.append_list("n").append(sub.namespaces.begin(), sub.namespaces.end());
+            dict.append_list("n").extend(sub.namespaces.begin(), sub.namespaces.end());
             if (!acct.session_ed)
                 dict.append("p", acct.id.sv());
             dict.append("s", sub.sig.sv());

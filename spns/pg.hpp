@@ -1,9 +1,9 @@
 #pragma once
 
 #include <chrono>
+#include <deque>
 #include <mutex>
 #include <pqxx/pqxx>
-#include <deque>
 
 #include "bytes.hpp"
 
@@ -145,9 +145,7 @@ struct spns_byte_helper {
     static char* into_buf(char* begin, char* end, const T& val) {
         return BSV_traits::into_buf(begin, end, {val.data(), val.size()});
     }
-    static std::size_t size_buffer(const T&) noexcept {
-        return internal::size_esc_bin(SIZE);
-    }
+    static std::size_t size_buffer(const T&) noexcept { return internal::size_esc_bin(SIZE); }
 };
 
 template <>
@@ -165,6 +163,17 @@ template <>
 struct string_traits<spns::Int16ArrayLoader> {
     static spns::Int16ArrayLoader from_string(std::string_view in);
 };
+
+template <>
+struct nullness<spns::AccountID> : pqxx::no_null<spns::AccountID> {};
+template <>
+struct nullness<spns::Ed25519PK> : pqxx::no_null<spns::Ed25519PK> {};
+template <>
+struct nullness<spns::SubaccountTag> : pqxx::no_null<spns::SubaccountTag> {};
+template <>
+struct nullness<spns::Signature> : pqxx::no_null<spns::Signature> {};
+template <>
+struct nullness<spns::EncKey> : pqxx::no_null<spns::EncKey> {};
 
 template <>
 struct nullness<spns::Int16ArrayLoader> : pqxx::no_null<spns::Int16ArrayLoader> {};
