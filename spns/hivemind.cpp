@@ -261,6 +261,16 @@ HiveMind::HiveMind(Config conf_in) :
             .add_request_command(
                     "get_stats", ExcWrapper{*this, &HiveMind::on_get_stats, "on_get_stats"})
 
+            // Drops one or more registrations; this is invoked by a notifier when the upstream
+            // notification service has indicated that the notification token is no longer valid.
+            //
+            // Called with two values: the service id (e.g. "apns", "firebase") and a bt-encoded
+            // list of unique service ids (as would have been returned by the service's
+            // notifier.validate) to remote.  This endpoint is a command (i.e. has no reply).
+            .add_command(
+                    "drop_registrations",
+                    ExcWrapper{*this, &HiveMind::on_drop_registrations, "on_drop_registrations"})
+
             // end of "admin." commands
             ;
 
@@ -922,6 +932,55 @@ void HiveMind::log_stats(std::string_view pre_cmd) {
     } else {
         log::debug(stats, "Status: {}", stat_line);
     }
+}
+
+void HiveMind::on_drop_registrations(oxenmq::Message& m) {
+    if (m.data.size() != 2) {
+        log::warning(cat, "Invalid admin.drop_registrations call: expected 2-part message");
+        return;
+    }
+
+    auto service = m.data[0];
+    if (service.empty()) {
+        log::warning(cat, "admin.drop_registrations received illegal empty service name");
+        return;
+    }
+
+    oxenc::bt_list_consumer drops{m.data[1]};
+    if (drops.is_finished()) {
+        log::warning(cat, "admin.drop_registrations called with empty token list");
+        return;
+    }
+    auto conn = pool_.get();
+    int reqed = 0, deleted = 0, matched = 0;
+    try {
+        pqxx::work tx{conn};
+        while (!drops.is_finished()) {
+            reqed++;
+            auto del = tx.exec_params0(
+                                 "DELETE FROM subscriptions WHERE service = $1 AND svcid = $2",
+                                 service,
+                                 drops.consume_string_view())
+                               .affected_rows();
+            deleted += del;
+            if (del)
+                matched++;
+        }
+        tx.commit();
+    } catch (const oxenc::bt_deserialize_invalid_type&) {
+        log::warning(
+                cat,
+                "invalid admin.on_drop_registration request: expected list of service id strings");
+        return;
+    }
+
+    log::info(
+            cat,
+            "Dropped {} (of {} requested) {} service IDs, totalling {} account subscriptions",
+            matched,
+            reqed,
+            service,
+            deleted);
 }
 
 static void sub_json_set_one_response(
