@@ -49,39 +49,10 @@ if(CMAKE_VERSION VERSION_LESS "3.21")
     endforeach()
 endif()
 
-option(SUBMODULE_CHECK "Enables checking that vendored library submodules are up to date" ON)
-if(SUBMODULE_CHECK)
-  find_package(Git)
-  if(GIT_FOUND)
-    function(check_submodule relative_path)
-      execute_process(COMMAND git rev-parse "HEAD" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${relative_path} OUTPUT_VARIABLE localHead)
-      execute_process(COMMAND git rev-parse "HEAD:${relative_path}" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_VARIABLE checkedHead)
-      string(COMPARE EQUAL "${localHead}" "${checkedHead}" upToDate)
-      if (upToDate)
-        message(STATUS "Submodule '${relative_path}' is up-to-date")
-      else()
-        message(FATAL_ERROR "Submodule '${relative_path}' is not up-to-date. Please update with\ngit submodule update --init --recursive\nor run cmake with -DSUBMODULE_CHECK=OFF")
-      endif()
+include(cmake/submodule_check.cmake)
+include(cmake/system_or_submodule.cmake)
 
-      # Extra arguments check nested submodules
-      foreach(submod ${ARGN})
-        execute_process(COMMAND git rev-parse "HEAD" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${relative_path}/${submod} OUTPUT_VARIABLE localHead)
-        execute_process(COMMAND git rev-parse "HEAD:${submod}" WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/${relative_path} OUTPUT_VARIABLE checkedHead)
-        string(COMPARE EQUAL "${localHead}" "${checkedHead}" upToDate)
-        if (NOT upToDate)
-            message(FATAL_ERROR "Nested submodule '${relative_path}/${submod}' is not up-to-date. Please update with\ngit submodule update --init --recursive\nor run cmake with -DSUBMODULE_CHECK=OFF")
-        endif()
-      endforeach()
-    endfunction ()
-
-    message(STATUS "Checking submodules")
-    check_submodule(libpqxx)
-    check_submodule(pybind11)
-
-  endif()
-endif()
-
-add_subdirectory(libpqxx EXCLUDE_FROM_ALL)
+system_or_submodule(LIBPQXX libpqxx libpqxx::pqxx libpqxx>=7.10.0 libpqxx)
 
 target_link_libraries(spns PRIVATE
     PkgConfig::SODIUM
@@ -91,7 +62,7 @@ target_link_libraries(spns PRIVATE
     PkgConfig::NLOHMANN_JSON
     PkgConfig::SYSTEMD
     PUBLIC
-    pqxx)
+    libpqxx::pqxx)
 
 set_target_properties(spns PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 

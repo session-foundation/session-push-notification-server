@@ -22,52 +22,26 @@ namespace spns {
 
 namespace log = oxen::log;
 static auto cat = log::Cat("hivemind");
-static auto omq_cat = log::Cat("oxenmq");
 static auto stats = log::Cat("stats");
-
-static void omq_log(oxenmq::LogLevel level, const char* file, int line, std::string msg) {
-    // We bump the oxenmq log levels down one severity because oxenmq logging is probably less
-    // relevant.
-    if (level == oxenmq::LogLevel::trace)
-        return;
-    auto lvl = level == oxenmq::LogLevel::fatal ? log::Level::err
-             : level == oxenmq::LogLevel::error ? log::Level::warn
-             : level == oxenmq::LogLevel::warn  ? log::Level::info
-             : level == oxenmq::LogLevel::info  ? log::Level::debug
-                                                : log::Level::trace;
-    omq_cat->log(spdlog::source_loc{file, line, ""}, lvl, "{}", msg);
-}
 
 std::atomic<int> next_hivemind_id{1};
 
 HiveMind::HiveMind(Config conf_in) :
         config{std::move(conf_in)},
         pool_{config.pg_connect},
-        omq_{std::string{config.pubkey.sv()},
-             std::string{config.privkey.sv()},
-             false,
-             nullptr,
-             omq_log},
+        omq_{std::string{config.pubkey.sv()}, std::string{config.privkey.sv()}, false, nullptr},
         object_id_{next_hivemind_id++} {
 
     fiddle_rlimit_nofile();
 
     sd_notify(0, "STATUS=Initializing OxenMQ");
 
-    // Ignore debugging and below; get everything else and let our logger filter it
-    omq_.log_level(oxenmq::LogLevel::info);
-
     while (omq_push_.size() < config.omq_push_instances) {
         auto& o = omq_push_.emplace_back(
-                std::string{config.pubkey.sv()},
-                std::string{config.privkey.sv()},
-                false,
-                nullptr,
-                omq_log);
+                std::string{config.pubkey.sv()}, std::string{config.privkey.sv()}, false, nullptr);
         o.MAX_SOCKETS = 50000;
         o.MAX_MSG_SIZE = 10 * 1024 * 1024;
         o.EPHEMERAL_ROUTING_ID = false;
-        o.log_level(oxenmq::LogLevel::info);
         // Since we're splitting the load, we reduce number of workers per push server to
         // ceil(instances/N) + 1 (the +1 because the load is probably not perfectly evenly
         // distributed).
@@ -511,35 +485,32 @@ void HiveMind::on_reg_service(oxenmq::Message& m) {
 
 static void set_stat(
         pqxx::work& tx, std::string_view service, std::string_view name, std::string_view val) {
-    tx.exec_params0(
-            R"(
+    tx.exec(
+              R"(
 INSERT INTO service_stats (service, name, val_str) VALUES ($1, $2, $3)
 ON CONFLICT (service, name) DO UPDATE
     SET val_str = EXCLUDED.val_str, val_int = NULL)",
-            service,
-            name,
-            val);
+              {service, name, val})
+            .no_rows();
 }
 static void set_stat(pqxx::work& tx, std::string_view service, std::string_view name, int64_t val) {
-    tx.exec_params0(
-            R"(
+    tx.exec(
+              R"(
 INSERT INTO service_stats (service, name, val_int) VALUES ($1, $2, $3)
 ON CONFLICT (service, name) DO UPDATE
     SET val_str = NULL, val_int = EXCLUDED.val_int)",
-            service,
-            name,
-            val);
+              {service, name, val})
+            .no_rows();
 }
 static void increment_stat(
         pqxx::work& tx, std::string_view service, std::string_view name, int64_t incr) {
-    tx.exec_params0(
-            R"(
+    tx.exec(
+              R"(
 INSERT INTO service_stats (service, name, val_int) VALUES ($1, $2, $3)
 ON CONFLICT (service, name) DO UPDATE
     SET val_str = NULL, val_int = COALESCE(service_stats.val_int, 0) + EXCLUDED.val_int)",
-            service,
-            name,
-            incr);
+              {service, name, incr})
+            .no_rows();
 }
 
 extern "C" inline void message_buffer_destroy(void*, void* hint) {
@@ -683,13 +654,12 @@ void HiveMind::process_notifications() {
                     notifies;
             std::vector<Blake2B_32> filter_vals;
 
-            auto result = tx.exec_params(
+            auto result = tx.exec(
                     R"(
 SELECT want_data, enc_key, service, svcid, svcdata FROM subscriptions
 WHERE account = $1
     AND EXISTS(SELECT 1 FROM sub_namespaces WHERE subscription = id AND namespace = $2))",
-                    account,
-                    ns);
+                    {account, ns});
             notifies.reserve(result.size());
             filter_vals.reserve(result.size());
             for (auto row : result) {
@@ -1324,9 +1294,9 @@ void HiveMind::on_unsubscribe(oxenmq::Message& m) {
 void HiveMind::db_cleanup() {
     auto conn = pool_.get();
     pqxx::work tx{conn};
-    tx.exec_params0(
-            "DELETE FROM subscriptions WHERE signature_ts <= $1",
-            unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY));
+    tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1",
+            {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)})
+            .no_rows();
     tx.commit();
 }
 
@@ -1608,12 +1578,12 @@ bool HiveMind::allow_connect() {
         --pending_connects_;
         return false;
     }
-    ++connect_count_;
+    auto ccount = ++connect_count_;
     log::debug(
             cat,
             "establishing connection (currently have {} pending, {} total connects)",
-            pending_connects_,
-            connect_count_);
+            count,
+            ccount);
     return true;
 }
 
@@ -1731,44 +1701,46 @@ WHERE
 
         insert_ns = ns_arr.a != sub.namespaces;
         log::trace(cat, "updating subscription for {}", pubkey.id.hex());
-        tx.exec_params0(
-                R"(
+        tx.exec(
+                  R"(
 UPDATE subscriptions
 SET session_ed25519 = $2, subaccount_tag = $3, subaccount_sig = $4, signature = $5, signature_ts = $6, want_data = $7, enc_key = $8, svcdata = $9
 WHERE id = $1
                     )",
-                id,
-                pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
-                sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
-                sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
-                sub.sig,
-                sub.sig_ts,
-                sub.want_data,
-                enc_key,
-                service_data);
+                  {id,
+                   pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
+                   sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
+                   sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
+                   sub.sig,
+                   sub.sig_ts,
+                   sub.want_data,
+                   enc_key,
+                   service_data})
+                .no_rows();
         if (insert_ns)
-            tx.exec_params0("DELETE FROM sub_namespaces WHERE subscription = $1", id);
+            tx.exec("DELETE FROM sub_namespaces WHERE subscription = $1", {id}).no_rows();
     } else {
         new_sub = true;
         log::trace(cat, "inserting new subscription for {}", pubkey.id.hex());
-        auto row = tx.exec_params1(
-                R"(
+        auto row = tx.exec(
+                             R"(
 INSERT INTO subscriptions
     (account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data, enc_key, service, svcid, svcdata)
 VALUES ($1,   $2,              $3,             $4,             $5,        $6,           $7,        $8,      $9,      $10,   $11)
 RETURNING id
                 )",
-                pubkey.id,
-                pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
-                sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
-                sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
-                sub.sig,
-                sub.sig_ts,
-                sub.want_data,
-                enc_key,
-                service,
-                service_id,
-                service_data);
+                             {pubkey.id,
+                              pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
+                              sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
+                              sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
+                              sub.sig,
+                              sub.sig_ts,
+                              sub.want_data,
+                              enc_key,
+                              service,
+                              service_id,
+                              service_data})
+                           .one_row();
 
         id = row[0].as<int64_t>();
         insert_ns = true;
@@ -1776,10 +1748,9 @@ RETURNING id
 
     if (insert_ns)
         for (auto n : sub.namespaces)
-            tx.exec_params0(
-                    R"(INSERT INTO sub_namespaces (subscription, namespace) VALUES ($1, $2))",
-                    id,
-                    n);
+            tx.exec(R"(INSERT INTO sub_namespaces (subscription, namespace) VALUES ($1, $2))",
+                    {id, n})
+                    .no_rows();
 
     for (const auto& s : {""s, service})
         increment_stat(tx, s, new_sub ? "subscription" : "sub_renew", 1);
@@ -1858,11 +1829,10 @@ bool HiveMind::remove_subscription(
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result = tx.exec_params0(
-            R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3)",
-            pubkey.id,
-            service,
-            service_id);
+    auto result =
+            tx.exec(R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3)",
+                    {pubkey.id, service, service_id})
+                    .no_rows();
 
     tx.commit();
 
