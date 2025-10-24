@@ -99,7 +99,7 @@ HiveMind::HiveMind(Config conf_in) :
 
     // Keep a fairly large queue so that we can handle a sudden influx of notifications; if using
     // multiple instances, use smaller individual queues but with a slightly higher overall queue.
-    int notify_queue_size = omq_push_.size() <= 1 ? 4000 : (6000 / omq_push_.size());
+    int notify_queue_size = omq_push_.size() <= 1 ? 10000 : 5000;
 
     // Invoked by our oxend to notify of a new block:
     omq_.add_category("notify", oxenmq::AuthLevel::basic, /*reserved_threads=*/0, notify_queue_size)
