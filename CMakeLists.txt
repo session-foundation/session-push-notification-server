@@ -35,6 +35,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.18)
 pkg_check_modules(OXENC REQUIRED IMPORTED_TARGET liboxenc>=1.4.0)
 pkg_check_modules(OXENMQ REQUIRED IMPORTED_TARGET liboxenmq>=1.2.22)
+pkg_check_modules(LIBQUIC REQUIRED IMPORTED_TARGET liboxenquic>=1.6)
 pkg_check_modules(OXENLOGGING REQUIRED IMPORTED_TARGET liboxen-logging>=1.2.0)
 pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json>=3.7.0)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
@@ -52,12 +53,13 @@ endif()
 include(cmake/submodule_check.cmake)
 include(cmake/system_or_submodule.cmake)
 
-system_or_submodule(LIBPQXX libpqxx libpqxx::pqxx libpqxx>=7.10.0 libpqxx)
+system_or_submodule(LIBPQXX libpqxx libpqxx::pqxx libpqxx>=8 libpqxx)
 
 target_link_libraries(spns PRIVATE
     PkgConfig::SODIUM
     PkgConfig::OXENC
     PkgConfig::OXENMQ
+    PkgConfig::LIBQUIC
     PkgConfig::OXENLOGGING
     PkgConfig::NLOHMANN_JSON
     PkgConfig::SYSTEMD

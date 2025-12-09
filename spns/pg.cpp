@@ -50,7 +50,7 @@ void PGConnPool::clear_idle_conns() {
 
     if (max_idle_time > 0s) {
         auto cutoff = steady_clock::now() - max_idle_time;
-        while (idle_conns_.front().second < cutoff)
+        while (!idle_conns_.empty() && idle_conns_.front().second < cutoff)
             idle_conns_.pop_front();
     }
 }
@@ -78,27 +78,3 @@ PGConn::~PGConn() {
 }
 
 }  // namespace spns
-
-namespace pqxx {
-
-spns::Int16ArrayLoader string_traits<spns::Int16ArrayLoader>::from_string(std::string_view in) {
-    if (in.size() <= 2)
-        return {};
-    auto* pos = in.data();
-    assert(*pos == '{');
-    pos++;
-    auto* back = &in.back();
-    assert(*back == '}');
-    spns::Int16ArrayLoader vals;
-    vals.a.reserve(std::count(pos, back, ','));
-    while (pos < back) {
-        auto& ns = vals.a.emplace_back();
-        auto [ptr, ec] = std::from_chars(pos, back, ns);
-        assert(ec == std::errc());
-        assert(ptr == back || *ptr == ',');
-        pos = ptr + 1;
-    }
-    return vals;
-}
-
-}  // namespace pqxx

@@ -1,18 +1,23 @@
 #include "snode.hpp"
 
+#include <fmt/chrono.h>
 #include <oxenc/bt_producer.h>
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <oxen/log.hpp>
+#include <oxen/quic/address.hpp>
+#include <oxen/quic/format.hpp>
+#include <oxen/quic/opt.hpp>
 #include <random>
 #include <string>
 
 #include "../bytes.hpp"
 #include "../hivemind.hpp"
+#include "subscription.hpp"
 
 namespace spns::hive {
 
@@ -24,9 +29,8 @@ using namespace std::literals;
 
 thread_local std::mt19937_64 rng{std::random_device{}()};
 
-SNode::SNode(HiveMind& hivemind, oxenmq::OxenMQ& omq, oxenmq::address addr, uint64_t swarm) :
+SNode::SNode(HiveMind& hivemind, quic::RemoteAddress addr, uint64_t swarm) :
         hivemind_{hivemind},
-        omq_{omq},
         addr_{std::move(addr)},
         swarm_{swarm}
 
@@ -35,109 +39,117 @@ SNode::SNode(HiveMind& hivemind, oxenmq::OxenMQ& omq, oxenmq::address addr, uint
 }
 
 void SNode::connect() {
-    std::lock_guard lock{mutex_};
-
-    if (!conn_) {
-        if (hivemind_.allow_connect()) {
-            conn_ = omq_.connect_remote(
-                    addr_,
-                    [this](oxenmq::ConnectionID c) { on_connected(c); },
-                    [this](oxenmq::ConnectionID c, std::string_view err) {
-                        on_connect_fail(c, err);
-                    },
-                    oxenmq::AuthLevel::basic);
-            log::debug(cat, "Establishing connection to {}", addr_.full_address());
-        }
+    assert(hivemind_.loop().inside());
+    if (conn_)
+        return;
+    if (cooldown_until_) {
+        if (*cooldown_until_ > std::chrono::steady_clock::now())
+            return;
+        cooldown_until_.reset();
     }
+    if (!hivemind_.allow_connect())
+        return;
+
+    conn_ = hivemind_.quic().connect(
+            addr_,
+            hivemind_.creds(),
+            [this](quic::Connection& c) { on_connected(c); },
+            [this](quic::Connection& c, uint64_t ec) { on_disconnected(c, ec); },
+            quic::opt::keep_alive{10s});
+    stream_ = conn_->open_stream<quic::BTRequestStream>();
+    stream_->register_handler("notify", [this](quic::message msg) { on_notify(std::move(msg)); });
+
+    log::debug(
+            cat, "Initiated connection to {} @ {}", oxenc::to_hex(addr_.view_remote_key()), addr_);
 }
 
-void SNode::connect(oxenmq::address addr) {
-    bool reconnect;
-    {
-        std::lock_guard lock{mutex_};
-        reconnect = addr != addr_;
-    }
-
-    if (reconnect) {
-        log::debug(
-                cat,
-                "disconnecting; addr changing from {} to {}",
-                addr_.full_address(),
-                addr.full_address());
+void SNode::connect(quic::RemoteAddress addr) {
+    assert(hivemind_.loop().inside());
+    if (addr != addr_) {
+        log::debug(cat, "disconnecting; addr changing from {} to {}", addr_, addr);
         disconnect();
-        {
-            std::lock_guard lock{mutex_};
-            addr_ = std::move(addr);
-        }
+        addr_ = std::move(addr);
     }
 
     connect();
 }
 
 void SNode::disconnect() {
-    std::lock_guard lock{mutex_};
-
-    log::debug(cat, "disconnecting from {}", addr_.full_address());
+    assert(hivemind_.loop().inside());
     connected_ = false;
     if (conn_) {
-        omq_.disconnect(conn_);
-        conn_ = {};
+        log::debug(cat, "disconnecting from {}", addr_);
+        stream_.reset();
+        conn_->close_connection();
+        conn_.reset();
     }
 }
 
-void SNode::on_connected(oxenmq::ConnectionID c) {
+void SNode::on_connected(quic::Connection& c) {
+    assert(hivemind_.loop().inside());
     bool no_conn = false;
-    {
-        std::lock_guard lock{mutex_};
+    log::debug(cat, "Connection established to {}", addr_);
+    cooldown_fails_ = 0;
+    cooldown_until_.reset();
 
-        log::debug(cat, "Connection established to {}", addr_.full_address());
-        cooldown_fails_ = 0;
-        cooldown_until_.reset();
+    if (!conn_) {
+        // Our conn got replaced from under us, which probably means we are disconnecting, so do
+        // nothing.
+        no_conn = true;
+    } else {
+        // We either just connected or reconnected, so reset any re-subscription times (so that
+        // after a reconnection we force a re-subscription for everyone):
+        auto now = system_clock::now();
+        for (auto& [id, next] : next_)
+            next = system_epoch;
 
-        if (!conn_) {
-            // Our conn got replaced from under us, which probably means we are disconnecting, so do
-            // nothing.
-            no_conn = true;
-        } else {
-            // We either just connected or reconnected, so reset any re-subscription times (so that
-            // after a reconnection we force a re-subscription for everyone):
-            auto now = system_clock::now();
-            for (auto& [id, next] : next_)
-                next = system_epoch;
-
-            connected_ = true;
-        }
+        connected_ = true;
     }
 
     hivemind_.finished_connect();
 
     if (!no_conn)
-        hivemind_.check_my_subs(*this, true);
+        hivemind_.check_my_subs(*this);
 }
 
-void SNode::on_connect_fail(oxenmq::ConnectionID c, std::string_view reason) {
-    {
-        std::lock_guard lock{mutex_};
+void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
+    assert(hivemind_.loop().inside());
+    bool is_failed_connect = !connected_.exchange(false);
 
-        auto cooldown = cooldown_fails_ >= CONNECT_COOLDOWN.size()
-                              ? CONNECT_COOLDOWN.back()
-                              : CONNECT_COOLDOWN[cooldown_fails_];
-        cooldown_until_ = steady_clock::now() + cooldown;
-        cooldown_fails_++;
+    if (hivemind_.has_quic()) {
+        // If we don't have a quic object that means we're shutting down and this is the callback
+        // fired during shutdown, so don't do anything.
+        if (is_failed_connect) {
+            auto cooldown = cooldown_fails_ >= CONNECT_COOLDOWN.size()
+                                  ? CONNECT_COOLDOWN.back()
+                                  : CONNECT_COOLDOWN[cooldown_fails_];
+            cooldown_until_ = steady_clock::now() + cooldown;
+            cooldown_fails_++;
 
-        log::warning(
-                cat,
-                "Connection to {} failed: {} ({} consecutive failure(s); retrying in {}s)",
-                addr_.full_address(),
-                reason,
-                cooldown_fails_,
-                cooldown.count());
-
-        connected_ = false;
-        conn_ = {};
+            log::warning(
+                    cat,
+                    "Connection to {} failed (ec={}).  {} consecutive failure(s); retrying in {}",
+                    addr_,
+                    ec,
+                    cooldown_fails_,
+                    cooldown);
+        } else {
+            log::warning(
+                    cat,
+                    "Disconnected from {} (ec={}); reconnecting in {}",
+                    addr_,
+                    ec,
+                    RECONNECT_WAIT);
+            cooldown_until_ = steady_clock::now() + RECONNECT_WAIT;
+            cooldown_fails_ = 0;
+        }
     }
 
-    hivemind_.finished_connect();
+    stream_.reset();
+    conn_.reset();
+
+    if (hivemind_.has_quic() && is_failed_connect)
+        hivemind_.finished_connect();
 }
 
 /// Adds a new account to be signed up for subscriptions, if it is not already subscribed.
@@ -147,7 +159,10 @@ void SNode::on_connect_fail(oxenmq::ConnectionID c, std::string_view reason) {
 /// If `force_now` is True then the account is scheduled for subscription at the next update
 /// even if already exists.
 void SNode::add_account(const SwarmPubkey& account, bool force_now) {
-    std::lock_guard lock{mutex_};
+    // This isn't *always* called from directly inside: we also call it in multithreaded batch jobs
+    // where we *have* blocked the loop, but do work in threads (and don't touch different SNodes
+    // from different worker threads).
+    // assert(hivemind_.loop().inside());
 
     auto [it, inserted] = subs_.insert(account);
     if (inserted)
@@ -166,7 +181,7 @@ void SNode::add_account(const SwarmPubkey& account, bool force_now) {
 }
 
 void SNode::reset_swarm(uint64_t new_swarm) {
-    std::lock_guard lock{mutex_};
+    assert(hivemind_.loop().inside());
 
     next_.clear();
     subs_.clear();
@@ -174,7 +189,9 @@ void SNode::reset_swarm(uint64_t new_swarm) {
 }
 
 void SNode::remove_stale_swarm_members(const std::vector<uint64_t>& swarm_ids) {
-    std::lock_guard lock{mutex_};
+    // We *aren't* actually directly inside the loop when this is called: we are called from a
+    // multithreaded batch job where the loop is blocked pending completion of the jobs.
+    // assert(hivemind_.loop().inside());
 
     for (auto& s : subs_)
         s.update_swarm(swarm_ids);
@@ -187,41 +204,105 @@ void SNode::remove_stale_swarm_members(const std::vector<uint64_t>& swarm_ids) {
 }
 
 void SNode::check_subs(
-        const std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>>& all_subs,
-        bool initial_subs,
-        bool fast) {
+        const std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>>& all_subs) {
+    assert(hivemind_.loop().inside());
+    // log::trace(cat, "check subs");
     if (!connected_) {
-        {
-            std::lock_guard lock{mutex_};
+        if (conn_)
+            return;  // We're already trying to connect
 
-            if (conn_)
-                return;  // We're already trying to connect
-
-            // If we failed recently we'll be in cooldown mode for a while, so might not connect
-            // right away yet.
-            if (cooldown_until_) {
-                if (*cooldown_until_ > steady_clock::now())
-                    return;
-                cooldown_until_.reset();
-            }
+        // If we failed recently we'll be in cooldown mode for a while, so might not connect
+        // right away yet.
+        if (cooldown_until_) {
+            if (*cooldown_until_ > steady_clock::now())
+                return;
+            cooldown_until_.reset();
         }
 
         // We'll get called automatically as soon as the connection gets established, so just
         // make sure we are already connecting and don't do anything else for now.
-        return connect();  // NB: must not hold lock when calling this
+        connect();
+        return;
     }
 
-    std::string req_body = "l";  // We'll add the "e" later
     auto now = system_clock::now();
+    auto req = std::make_optional<oxenc::bt_list_producer>();
 
-    size_t next_added = 0, req_count = 0;
+    size_t subreq_count = 0, next_added = 0, req_count = 0;
 
-    std::lock_guard lock{mutex_};
-    while (req_body.size() < SUBS_REQUEST_LIMIT && !next_.empty()) {
+    bool rate_limited = false;
+
+    auto submit_req = [&req, &subreq_count, &rate_limited, this] {
+        stream_->command(
+                "monitor",
+                std::move(*req).str(),
+                /*timeout=*/60s,
+                [this, expected_count = subreq_count, rate_limited](quic::message response) {
+                    if (!response) {
+                        log::warning(
+                                cat,
+                                "Subscriptions request of {} subscriptions to {} failed: {}",
+                                expected_count,
+                                addr_,
+                                response.timed_out ? "timeout"sv : response.body());
+                        return;
+                    }
+
+                    try {
+                        oxenc::bt_list_consumer results{response.body()};
+                        int good = 0, bad = 0;
+                        while (!results.is_finished()) {
+                            auto r = results.consume_dict_consumer();
+                            if (r.skip_until("error")) {
+                                bad++;
+                                log::warning(
+                                        cat, "Subscription failure: {}", r.consume_string_view());
+                            } else if (r.skip_until("success"))
+                                good++;
+                        }
+                        if (bad || good != expected_count)
+                            log::warning(
+                                    cat,
+                                    "Subscriptions request for {} subscriptions to {} returned {} "
+                                    "success, {} failures",
+                                    expected_count,
+                                    addr_,
+                                    good,
+                                    bad);
+                        else
+                            log::debug(
+                                    cat,
+                                    "Successful subscription request to {} for {} subscriptions",
+                                    addr_,
+                                    good);
+
+                    } catch (const std::exception& e) {
+                        log::warning(
+                                cat,
+                                "Failed to parse 'monitor' response from {}: {}",
+                                addr_,
+                                e.what());
+                    }
+
+                    // If our previous iteration we stopped because we hit the limit (rather than
+                    // because we had nothing more to send) then check again to queue more
+                    // immediately:
+                    if (rate_limited)
+                        hivemind_.loop().call_soon([this] { hivemind_.check_my_subs(*this); });
+                });
+        // There's currently no exposed way to clear the internal string in a bt producer, so just
+        // reset it.  In theory if this is allocation bottlenecked we could revisit this to reuse an
+        // external, fixed buffer, but for now just reset it.
+        req.emplace();
+        subreq_count = 0;
+    };
+
+    auto sig_min = now - hive::Subscription::SIGNATURE_EXPIRY + 10s;
+    auto sig_max = now + hive::Subscription::SIGNATURE_EARLY;
+
+    while (!next_.empty()) {
         const auto& [maybe_acct, next] = next_.front();
         if (next > now)
-            break;
-        if (fast && next > system_epoch)
             break;
 
         if (!maybe_acct) {
@@ -237,29 +318,11 @@ void SNode::check_subs(
             continue;
         }
 
-        std::vector<char> buf;
         for (const auto& sub : subs->second) {
+            if (sub.sig_ts < sig_min || sub.sig_ts > sig_max)
+                continue;
 
-            // Size estimate; this can be over, but mustn't be under the actual size we'll need.
-            constexpr size_t base_size = 0 + 3 +
-                                         12      // 1:t and i...e where ... is a 10-digit timestamp
-                                       + 3 + 67  // 1:s and 64:...
-                                       + 3 + 36  // 1:p and 33:... (also covers 1:P and 32:...)
-                                       + 3 + 2   // 1:n and the le of the l...e list
-                                       + 3 + 3   // 1:d and i1e (only if want_data)
-                                       + 3 + 67 + 3 + 39 // 1:S, 64:..., 1:T, 36:... (for subaccount auth)
-                    ;
-
-            // The biggest int expression we have is i-32768e; this is almost certainly overkill
-            // most of the time though, but no matter.
-            auto size = base_size + sub.namespaces.size() * 8;
-
-            auto old_size = req_body.size();
-            req_body.resize(old_size + size);
-
-            char* start = req_body.data() + old_size;
-
-            oxenc::bt_dict_producer dict{start, size};
+            auto dict = req->append_dict();
 
             // keys in ascii-sorted order!
             if (acct.session_ed)
@@ -270,15 +333,13 @@ void SNode::check_subs(
             }
             if (sub.want_data)
                 dict.append("d", 1);
-            dict.append_list("n").extend(sub.namespaces.begin(), sub.namespaces.end());
+            dict.append_list("n").extend(sub.namespaces.cbegin(), sub.namespaces.cend());
             if (!acct.session_ed)
                 dict.append("p", acct.id.sv());
             dict.append("s", sub.sig.sv());
-            dict.append("t", sub.sig_ts);
+            dict.append("t", sub.sig_ts.time_since_epoch().count());
 
-            // Resize away any extra buffer space we didn't fill
-            req_body.resize(dict.end() - req_body.data());
-
+            subreq_count++;
             req_count++;
         }
 
@@ -288,15 +349,19 @@ void SNode::check_subs(
         next_.emplace_back(acct, now + delay);
         next_added++;
         next_.pop_front();
+
+        if (subreq_count >= SUBS_REQUEST_LIMIT) {
+            rate_limited = true;
+            break;
+        }
     }
 
-    if (req_body.size() == 1)  // just the initial "l"
-        return;
+    if (subreq_count)
+        submit_req();
 
-    req_body += 'e';
-
-    // The randomness of our delay will mean the tail of the list isn't sorted, so re-sort from
-    // the lowest possible value we could have inserted (now + RESUBSCRIBE_MIN) to the end.
+    // The randomness of our delay to the next re-subscription means that the tail of the list won't
+    // be sorted, so re-sort from the lowest possible value we could have inserted (now +
+    // RESUBSCRIBE_MIN) to the end.
 
     // Everything we didn't touch should already be sorted:
     assert(std::is_sorted(
@@ -318,26 +383,16 @@ void SNode::check_subs(
         return a.second < b.second;
     }));
 
-    auto on_reply = [this, right_away = initial_subs && req_body.size() >= SUBS_REQUEST_LIMIT](
-                            bool success, std::vector<std::string> data) {
-        if (!success) {
-            // TODO: log something about failed request, but otherwise ignore it.  We don't
-            // worry about the subscriptions that might lapse because we have full swarm
-            // redundancy so it really doesn't matter if a subscription with one or two of
-            // the swarm members times out.
-        }
-        if (right_away) {
-            // We're doing the initial subscriptions, and sent a size-limited request so we
-            // likely have more that we want to subscribe to ASAP: so we continue as soon as
-            // we get the reply back so that we're subscribing as quickly as possible
-            // without having more than one (large) subscription request in flight at a
-            // time.
-            hivemind_.check_my_subs(*this, true);
-        }
-    };
+    log::log(
+            cat,
+            req_count ? log::Level::debug : log::Level::trace,
+            "Submitted (re-)subscriptions to {} accounts on {}",
+            req_count,
+            addr_);
+}
 
-    omq_.request(conn_, "monitor.messages", std::move(on_reply), std::move(req_body));
-    log::debug(cat, "(Re-)subscribing to {} accounts from {}", req_count, addr_.full_address());
+void SNode::on_notify(quic::message msg) {
+    hivemind_.on_message_notification(std::move(msg));
 }
 
 }  // namespace spns::hive

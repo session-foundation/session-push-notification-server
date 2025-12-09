@@ -1,5 +1,6 @@
 #include "subscription.hpp"
 
+#include <fmt/chrono.h>
 #include <oxenc/endian.h>
 #include <oxenc/hex.h>
 
@@ -12,7 +13,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -20,11 +20,14 @@
 
 namespace spns::hive {
 
-template <typename Int>
+template <std::integral Int>
 static void append_int(std::string& s, Int val) {
     char sig_ts_buf[20];
     auto [end, ec] = std::to_chars(std::begin(sig_ts_buf), std::end(sig_ts_buf), val);
     s.append(sig_ts_buf, end - sig_ts_buf);
+}
+static void append_int(std::string& s, std::chrono::sys_seconds val) {
+    append_int(s, val.time_since_epoch().count());
 }
 
 Subscription::Subscription(
@@ -32,9 +35,10 @@ Subscription::Subscription(
         std::optional<Subaccount> subaccount_,
         std::vector<int16_t> namespaces_,
         bool want_data_,
-        int64_t sig_ts_,
+        std::chrono::sys_seconds sig_ts_,
         Signature sig_,
-        bool _skip_validation) :
+        bool _skip_validation,
+        std::chrono::sys_seconds now) :
 
         subaccount{std::move(subaccount_)},
         namespaces{std::move(namespaces_)},
@@ -42,24 +46,22 @@ Subscription::Subscription(
         sig_ts{sig_ts_},
         sig{std::move(sig_)} {
 
-    if (namespaces.empty())
+    if (namespaces.size() == 0)
         throw std::invalid_argument{"Subscription: namespaces missing or empty"};
 
-    for (size_t i = 0; i < namespaces.size() - 1; i++) {
-        if (namespaces[i] > namespaces[i + 1])
+    for (size_t i = 1; i < namespaces.size(); i++) {
+        if (namespaces[i - 1] > namespaces[i])
             throw std::invalid_argument{"Subscription: namespaces are not sorted numerically"};
-        if (namespaces[i] == namespaces[i + 1])
+        if (namespaces[i - 1] == namespaces[i])
             throw std::invalid_argument{"Subscription: namespaces contains duplicates"};
     }
 
-    if (!sig_ts)
+    if (sig_ts == std::chrono::sys_seconds{})
         throw std::invalid_argument{"Subscription: signature timestamp is missing"};
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-    if (sig_ts <= now - 14 * 24 * 60 * 60)
-        throw std::invalid_argument{"Subscription: sig_ts timestamp is too old"};
-    if (sig_ts >= now + 24 * 60 * 60)
+    if (now - sig_ts >= SIGNATURE_EXPIRY)
+        throw std::invalid_argument{
+                "Subscription: sig_ts timestamp is too old ({} ago)"_format(now - sig_ts)};
+    if (sig_ts - now >= SIGNATURE_EARLY)
         throw std::invalid_argument{"Subscription: sig_ts timestamp is too far in the future"};
 
     if (!_skip_validation) {

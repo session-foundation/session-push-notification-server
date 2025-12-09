@@ -1,22 +1,28 @@
 #include "hivemind.hpp"
 
 #include <fmt/chrono.h>
+#include <fmt/std.h>
 #include <oxenc/base32z.h>
 #include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/batch.h>
+#include <sodium/crypto_sign_ed25519.h>
 #include <spdlog/common.h>
 #include <systemd/sd-daemon.h>
 
 #include <chrono>
 #include <nlohmann/json.hpp>
 #include <oxen/log.hpp>
+#include <oxen/quic/gnutls_crypto.hpp>
 #include <oxenmq/zmq.hpp>
 #include <set>
 #include <stdexcept>
+#include <tuple>
+#include <utility>
 
 #include "blake2b.hpp"
 #include "hive/signature.hpp"
+#include "hive/subscription.hpp"
 
 namespace spns {
 
@@ -32,40 +38,14 @@ HiveMind::HiveMind(Config conf_in) :
         omq_{std::string{config.pubkey.sv()}, std::string{config.privkey.sv()}, false, nullptr},
         object_id_{next_hivemind_id++} {
 
-    fiddle_rlimit_nofile();
+    // fiddle_rlimit_nofile();
 
     sd_notify(0, "STATUS=Initializing OxenMQ");
 
-    while (omq_push_.size() < config.omq_push_instances) {
-        auto& o = omq_push_.emplace_back(
-                std::string{config.pubkey.sv()}, std::string{config.privkey.sv()}, false, nullptr);
-        o.MAX_SOCKETS = 50000;
-        o.MAX_MSG_SIZE = 10 * 1024 * 1024;
-        o.EPHEMERAL_ROUTING_ID = false;
-        // Since we're splitting the load, we reduce number of workers per push server to
-        // ceil(instances/N) + 1 (the +1 because the load is probably not perfectly evenly
-        // distributed).
-        o.set_general_threads(
-                1 + (std::thread::hardware_concurrency() + config.omq_push_instances - 1) /
-                            config.omq_push_instances);
-    }
-    omq_push_next_ = omq_push_.begin();
-
-    if (omq_push_.empty()) {
-        // the main omq_ is dealing with push conns and notifications so increase limits
-        omq_.MAX_SOCKETS = 50000;
-        omq_.MAX_MSG_SIZE = 10 * 1024 * 1024;
-        omq_.EPHEMERAL_ROUTING_ID = false;
-
-        // We always need to ensure we have some batch threads available because for swarm updates
-        // we keep a lock held during the batching and need to ensure that there will always be some
-        // workers available, even if a couple workers lock waiting on that lock.
-        omq_.set_batch_threads(std::max<int>(4, std::thread::hardware_concurrency() / 2));
-    } else {
-        // When in multi-instance mode the main worker can get by with fewer threads
-        omq_.set_general_threads(std::max<int>(4, std::thread::hardware_concurrency() / 4));
-        omq_.set_batch_threads(std::max<int>(4, std::thread::hardware_concurrency() / 4));
-    }
+    // OMQ is only used for local traffic from the web worker (new/renewed subscriptions) and the
+    // individual notifiers, so we don't need a huge number of threads.
+    omq_.set_general_threads(std::max<int>(4, std::thread::hardware_concurrency() / 8));
+    omq_.set_batch_threads(std::max<int>(4, std::thread::hardware_concurrency() / 2));
 
     // We listen on a local socket for connections from other local services (web frontend,
     // notification services).
@@ -97,34 +77,11 @@ HiveMind::HiveMind(Config conf_in) :
         log::info(cat, "Listening for incoming connections on {}", log_addr);
     }
 
-    // Keep a fairly large queue so that we can handle a sudden influx of notifications; if using
-    // multiple instances, use smaller individual queues but with a slightly higher overall queue.
-    int notify_queue_size = omq_push_.size() <= 1 ? 10000 : 5000;
-
     // Invoked by our oxend to notify of a new block:
-    omq_.add_category("notify", oxenmq::AuthLevel::basic, /*reserved_threads=*/0, notify_queue_size)
+    omq_.add_category("notify", oxenmq::AuthLevel::basic)
             .add_command("block", ExcWrapper{*this, &HiveMind::on_new_block, "on_new_block"});
 
-    if (omq_push_.empty())
-        omq_.add_command(
-                "notify",
-                "message",
-                ExcWrapper{*this, &HiveMind::on_message_notification, "on_message_notification"});
-    else
-        for (auto& push : omq_push_)
-            push.add_category(
-                        "notify",
-                        oxenmq::AuthLevel::basic,
-                        /*reserved_threads=*/0,
-                        notify_queue_size)
-                    .add_command(
-                            "message",
-                            ExcWrapper{
-                                    *this,
-                                    &HiveMind::on_message_notification,
-                                    "on_message_notification"});
-
-    omq_.add_category("push", oxenmq::AuthLevel::none)
+    omq_.add_category("push", oxenmq::AuthLevel::none, 0, 1000)
 
             // Adds/updates a subscription.  This is called from the HTTP process to pass along an
             // incoming (re)subscription.  The request must be json such as:
@@ -248,22 +205,42 @@ HiveMind::HiveMind(Config conf_in) :
             // end of "admin." commands
             ;
 
-    notify_proc_thread_ = std::thread{[this] { process_notifications(); }};
+    // TODO: Once all nodes are running the SS version that comes with 11.6.0+ we can just get rid
+    // of creds_ and remove it from the `connect()` calls to do unauthenticated connections (which
+    // are allowed in SS 2.11.1+, which comes with 11.6.0+), but in earlier versions of quic that
+    // results in stateless reset-rejected connections.
+    //
+    // Thus for now, this randomly generated key:
+    {
+        std::array<unsigned char, crypto_sign_ed25519_PUBLICKEYBYTES> pk;
+        std::array<unsigned char, crypto_sign_ed25519_SECRETKEYBYTES> sk;
+        crypto_sign_ed25519_keypair(pk.data(), sk.data());
+        creds_ = quic::GNUTLSCreds::make_from_ed_seckey(
+                std::string_view{reinterpret_cast<const char*>(sk.data()), sk.size()});
+    }
+
+    quic_ = quic::Endpoint::endpoint(
+            loop_, quic::Address{"0.0.0.0", 0}, quic::opt::alpn("oxenstorage"));
 
     sd_notify(0, "STATUS=Cleaning database");
     db_cleanup();
     sd_notify(0, "STATUS=Loading existing subscriptions");
-    load_saved_subscriptions();
+    try {
+        load_saved_subscriptions();
+    } catch (const std::exception& e) {
+        log::critical(cat, "Failed to load saved subscriptions: {}", e.what());
+        throw;
+    }
 
-    {
-        std::lock_guard lock{mutex_};
+    // std::this_thread::sleep_for(5s);
+    // throw std::runtime_error{"DEBUG"};
 
+    notify_proc_thread_ = std::thread{[this] { process_notifications(); }};
+
+    loop_.call_get([this] {
         sd_notify(0, "STATUS=Starting OxenMQ");
         log::info(cat, "Starting OxenMQ");
         omq_.start();
-        for (auto& o : omq_push_)
-            o.start();
-
         log::info(cat, "Started OxenMQ");
 
         sd_notify(0, "STATUS=Connecting to oxend");
@@ -317,13 +294,11 @@ HiveMind::HiveMind(Config conf_in) :
                     "Waiting for notifiers to register (max {})",
                     wait_until - steady_clock::now());
             while (!notifier_startup_done(wait_until)) {
-                mutex_.unlock();
                 std::this_thread::sleep_for(25ms);
-                mutex_.lock();
             }
             log::info(cat, "Done waiting for notifiers; {} registered", services_.size());
         }
-    }
+    });
 
     // Set our ready flag, and process any requests that accumulated while we were starting up.
     set_ready();
@@ -331,16 +306,13 @@ HiveMind::HiveMind(Config conf_in) :
     refresh_sns();
 
     omq_.add_timer([this] { db_cleanup(); }, 30s);
-    // This is for operations that can be high latency, like re-subscriptions, clearing expiries,
-    // etc.:
-    omq_.add_timer([this] { subs_slow(); }, config.subs_interval);
+
+    // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
+    // timer because nothing in here is time critical:
+    subs_ticker_ = loop_.call_every(10s, [this] { check_subs(); });
 
     // For updating systemd Status line
     omq_.add_timer([this] { log_stats(); }, 15s);
-
-    // This one is much more frequent: it handles any immediate subscription duties (e.g. to
-    // deal with a new subscriber we just added):
-    omq_.add_timer([this] { subs_fast(); }, 100ms);
 
     log::info(cat, "Startup complete");
 }
@@ -350,6 +322,20 @@ HiveMind::~HiveMind() {
         notify_push_sock().send(zmq::message_t{"QUIT"sv}, zmq::send_flags::none);
         notify_proc_thread_.join();
     }
+    loop_.call_get([this] {
+        // We destroy the Endpoint first, because during its destruction it triggers disconnect
+        // callbacks which still have captured pointers into the SNode objects living in
+        // swarms_/sns_.
+        //
+        // We also transfer the shared ptr into a local variable immediately before destruction so
+        // that during the actual destruction `quic_` will be empty (which can be queried and
+        // detected to alter behaviour, e.g. for disconnections during shutdown).
+        auto quic = std::move(quic_);
+        quic.reset();
+
+        swarms_.clear();
+        sns_.clear();
+    });
 }
 
 zmq::socket_t& HiveMind::notify_push_sock() {
@@ -463,24 +449,17 @@ void HiveMind::on_reg_service(oxenmq::Message& m) {
         return;
     }
 
-    bool added = false, replaced = false;
-    {
-        std::lock_guard lock{mutex_};
-        auto [it, ins] = services_.emplace(service, m.conn);
+    loop_.call([this, cid = m.conn, service = std::move(service)] {
+        bool added = false, replaced = false;
+        auto [it, ins] = services_.emplace(service, cid);
         if (ins)
-            added = true;
-        else if (m.conn != it->second) {
-            it->second = m.conn;
-            replaced = true;
-        }
-    }
-
-    if (added)
-        log::info(cat, "'{}' notification service registered", service);
-    else if (replaced)
-        log::info(cat, "'{}' notification service reconnected/reregistered", service);
-    else
-        log::trace(cat, "'{}' notification service confirmed (already registered)", service);
+            log::info(cat, "'{}' notification service registered", service);
+        else if (cid != it->second) {
+            it->second = cid;
+            log::info(cat, "'{}' notification service reconnected/reregistered", service);
+        } else
+            log::trace(cat, "'{}' notification service confirmed (already registered)", service);
+    });
 }
 
 static void set_stat(
@@ -517,18 +496,10 @@ extern "C" inline void message_buffer_destroy(void*, void* hint) {
     delete static_cast<std::string*>(hint);
 }
 
-void HiveMind::on_message_notification(oxenmq::Message& m) {
-    if (m.data.size() != 1) {
-        log::warning(
-                cat,
-                "Unexpected message notification: {}-part data, expected 1-part",
-                m.data.size());
-        return;
-    }
-
-    // Put the message into a new string, and then transfer ownership to the notification processer
+void HiveMind::on_message_notification(quic::message m) {
+    // Put the message into a new object, then transfer ownership to the notification processer
     // by sending the pointer value: the processor then picks up the pointer and takes ownership.
-    auto* push = new std::string{m.data[0]};
+    auto* push = new quic::message{std::move(m)};
     uintptr_t ptr = reinterpret_cast<uintptr_t>(push);
     std::string cmd = "PUSH";
     cmd += std::string_view{reinterpret_cast<const char*>(&ptr), sizeof(ptr)};
@@ -538,7 +509,7 @@ void HiveMind::on_message_notification(oxenmq::Message& m) {
 
 void HiveMind::process_notifications() {
     notify_pull_.bind("inproc://notify_handler");
-    std::vector<std::string> process;
+    std::vector<std::unique_ptr<quic::message>> process;
     zmq::message_t msg;
 
     constexpr size_t MAX_BATCH = 100;
@@ -554,9 +525,7 @@ void HiveMind::process_notifications() {
                 // Read back the pointer and take back ownership
                 uintptr_t ptr;
                 std::memcpy(&ptr, cmd.data() + 4, sizeof(uintptr_t));
-                auto* str = reinterpret_cast<std::string*>(ptr);
-                process.push_back(std::move(*str));
-                delete str;
+                process.emplace_back().reset(reinterpret_cast<quic::message*>(ptr));
             } else {
                 log::error(cat, "Error: received unexpected internal proc command {}", cmd);
             }
@@ -573,178 +542,186 @@ void HiveMind::process_notifications() {
 
         log::debug(cat, "Processing {} network message notifications", process.size());
 
-        std::lock_guard lock{mutex_};
-
-        if (auto now = steady_clock::now(); now >= filter_rotate_time_) {
-            filter_rotate_ = std::move(filter_);
-            filter_.clear();
-            filter_rotate_time_ = now + config.filter_lifetime;
-        }
-
-        std::string buf;
-        size_t notify_count = 0;
-
-        auto conn = pool_.get();
-        pqxx::work tx{conn};
-
-        for (const auto& msg : process) {
-
-            oxenc::bt_dict_consumer dict{msg};
-
-            // Parse oxen-storage-server notification:
-            if (!dict.skip_until("@")) {
-                log::warning(cat, "Unexpected notification: missing account (@)");
-                continue;
-            }
-            auto account_str = dict.consume_string_view();
-            AccountID account;
-            if (account_str.size() != account.SIZE) {
-                log::warning(cat, "Unexpected notification: wrong account size (@)");
-                continue;
-            }
-            std::memcpy(account.data(), account_str.data(), account.size());
-
-            if (!dict.skip_until("h")) {
-                log::warning(cat, "Unexpected notification: missing msg hash (h)");
-                continue;
-            }
-            auto hash = dict.consume_string_view();
-            if (bool too_small = hash.size() < MSG_HASH_MIN_SIZE;
-                too_small || hash.size() > MSG_HASH_MAX_SIZE) {
-                log::warning(cat, "Unexpected notification: msg hash too small");
-                continue;
+        loop_.call_get([&] {
+            if (auto now = steady_clock::now(); now >= filter_rotate_time_) {
+                filter_rotate_ = std::move(filter_);
+                filter_.clear();
+                filter_rotate_time_ = now + config.filter_lifetime;
             }
 
-            if (!dict.skip_until("n")) {
-                log::warning(cat, "Unexpected notification: missing namespace (n)");
-                continue;
-            }
-            auto ns = dict.consume_integer<int16_t>();
+            std::string buf;
+            size_t notify_count = 0;
 
-            if (!dict.skip_until("t")) {
-                log::warning(cat, "Unexpected notification: missing message timestamp (t)");
-                continue;
-            }
-            auto timestamp_ms = dict.consume_integer<int64_t>();
+            auto conn = pool_.get();
+            pqxx::work tx{conn};
 
-            if (!dict.skip_until("z")) {
-                log::warning(cat, "Unexpected notification: missing message expiry (z)");
-                continue;
-            }
-            auto expiry_ms = dict.consume_integer<int64_t>();
+            for (const auto& msg : process) {
+                try {
+                    oxenc::bt_dict_consumer dict{msg->body()};
 
-            std::optional<std::string_view> maybe_data;
-            if (dict.skip_until("~"))
-                maybe_data = dict.consume_string_view();
+                    // Parse oxen-storage-server notification:
+                    if (!dict.skip_until("@")) {
+                        log::warning(cat, "Unexpected notification: missing account (@)");
+                        continue;
+                    }
+                    auto account_str = dict.consume_string_view();
+                    AccountID account;
+                    if (account_str.size() != account.SIZE) {
+                        log::warning(cat, "Unexpected notification: wrong account size (@)");
+                        continue;
+                    }
+                    std::memcpy(account.data(), account_str.data(), account.size());
 
-            log::trace(
-                    cat,
-                    "Got a notification for {}, msg hash {}, namespace {}, timestamp {}, exp {}, "
-                    "data "
-                    "{}B",
-                    account.hex(),
-                    hash,
-                    ns,
-                    timestamp_ms,
-                    expiry_ms,
-                    maybe_data ? fmt::to_string(maybe_data->size()) : "(N/A)");
+                    if (!dict.skip_until("h")) {
+                        log::warning(cat, "Unexpected notification: missing msg hash (h)");
+                        continue;
+                    }
+                    auto hash = dict.consume_string_view();
+                    if (bool too_small = hash.size() < MSG_HASH_MIN_SIZE;
+                        too_small || hash.size() > MSG_HASH_MAX_SIZE) {
+                        log::warning(cat, "Unexpected notification: msg hash too small");
+                        continue;
+                    }
 
-            // [(want_data, enc_key, service, svcid, svcdata), ...]
-            std::vector<std::tuple<bool, EncKey, std::string, std::string, std::optional<bstring>>>
-                    notifies;
-            std::vector<Blake2B_32> filter_vals;
+                    if (!dict.skip_until("n")) {
+                        log::warning(cat, "Unexpected notification: missing namespace (n)");
+                        continue;
+                    }
+                    auto ns = dict.consume_integer<int16_t>();
 
-            auto result = tx.exec(
-                    R"(
+                    if (!dict.skip_until("t")) {
+                        log::warning(cat, "Unexpected notification: missing message timestamp (t)");
+                        continue;
+                    }
+                    auto timestamp_ms = dict.consume_integer<int64_t>();
+
+                    if (!dict.skip_until("z")) {
+                        log::warning(cat, "Unexpected notification: missing message expiry (z)");
+                        continue;
+                    }
+                    auto expiry_ms = dict.consume_integer<int64_t>();
+
+                    auto maybe_data = dict.maybe<std::string_view>("~");
+
+                    log::trace(
+                            cat,
+                            "Got a notification for {}, msg hash {}, namespace {}, timestamp {}, "
+                            "exp {}, data {}B",
+                            account.hex(),
+                            hash,
+                            ns,
+                            timestamp_ms,
+                            expiry_ms,
+                            maybe_data ? fmt::to_string(maybe_data->size()) : "(N/A)");
+
+                    // [(want_data, enc_key, service, svcid, svcdata), ...]
+                    std::vector<std::tuple<
+                            bool,
+                            EncKey,
+                            std::string,
+                            std::string,
+                            std::optional<bstring>>>
+                            notifies;
+                    std::vector<Blake2B_32> filter_vals;
+
+                    auto result = tx.exec(
+                            R"(
 SELECT want_data, enc_key, service, svcid, svcdata FROM subscriptions
 WHERE account = $1
     AND EXISTS(SELECT 1 FROM sub_namespaces WHERE subscription = id AND namespace = $2))",
-                    {account, ns});
-            notifies.reserve(result.size());
-            filter_vals.reserve(result.size());
-            for (auto row : result) {
-                row.to(notifies.emplace_back());
-                auto& [_wd, _ek, service, svcid, _sd] = notifies.back();
-                filter_vals.push_back(blake2b(service, svcid, hash));
-            }
+                            {account, ns});
+                    notifies.reserve(result.size());
+                    filter_vals.reserve(result.size());
+                    for (auto row : result) {
+                        row.to(notifies.emplace_back());
+                        auto& [_wd, _ek, service, svcid, _sd] = notifies.back();
+                        filter_vals.push_back(blake2b(service, svcid, hash));
+                    }
 
-            if (notifies.empty()) {
-                log::debug(cat, "No active notifications match, ignoring notification");
-                continue;
-            }
+                    if (notifies.empty()) {
+                        log::debug(cat, "No active notifications match, ignoring notification");
+                        continue;
+                    }
 
-            assert(filter_vals.size() == notifies.size());
-            auto filter_it = filter_vals.begin();
-            for (auto& [want_data, enc_key, service, svcid, svcdata] : notifies) {
-                auto& filt_hash = *filter_it++;
+                    assert(filter_vals.size() == notifies.size());
+                    auto filter_it = filter_vals.begin();
+                    for (auto& [want_data, enc_key, service, svcid, svcdata] : notifies) {
+                        auto& filt_hash = *filter_it++;
 
-                if (filter_rotate_.count(filt_hash) || !filter_.insert(filt_hash).second) {
-                    log::debug(cat, "Ignoring duplicate notification");
-                    continue;
-                } else {
-                    log::trace(cat, "Not filtered: {}", filt_hash.hex());
-                }
+                        if (filter_rotate_.count(filt_hash) || !filter_.insert(filt_hash).second) {
+                            log::trace(cat, "Ignoring duplicate notification");
+                            continue;
+                        } else {
+                            log::trace(cat, "Not filtered: {}", filt_hash.hex());
+                        }
 
-                oxenmq::ConnectionID conn;
-                if (auto it = services_.find(service); it != services_.end())
-                    conn = it->second;
-                else {
-                    log::warning(
-                            cat,
-                            "Notification depends on unregistered service {}, ignoring",
-                            service);
-                    continue;
-                }
+                        oxenmq::ConnectionID conn;
+                        if (auto it = services_.find(service); it != services_.end())
+                            conn = it->second;
+                        else {
+                            log::warning(
+                                    cat,
+                                    "Notification depends on unregistered service {}, ignoring",
+                                    service);
+                            continue;
+                        }
 
-                // We overestimate a little here (e.g. allowing for 20 spaces for string
-                // lengths) because a few extra bytes of allocation doesn't really matter.
-                size_t size_needed = 2 + 35 +                 // 0: 32:service (or shorter)
-                                     3 + 21 + svcid.size() +  // 1:& N:svcid
-                                     3 + 35 +                 // 1:^ 32:enckey
-                                     3 + 21 + hash.size() +   // 1:# N:hash
-                                     3 + 36 +                 // 1:@ 33:account
-                                     3 + 8 +                  // 1:n i-32768e
-                                     3 + 15 +                 // 1:t i1695078498534e (timestamp)
-                                     3 + 15 +                 // 1:t i1695078498534e (expiry)
-                                     (svcdata ? 3 + 21 + svcdata->size() : 0) +
-                                     (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
+                        // We overestimate a little here (e.g. allowing for 20 spaces for string
+                        // lengths) because a few extra bytes of allocation doesn't really matter.
+                        size_t size_needed =
+                                2 + 35 +                 // 0: 32:service (or shorter)
+                                3 + 21 + svcid.size() +  // 1:& N:svcid
+                                3 + 35 +                 // 1:^ 32:enckey
+                                3 + 21 + hash.size() +   // 1:# N:hash
+                                3 + 36 +                 // 1:@ 33:account
+                                3 + 8 +                  // 1:n i-32768e
+                                3 + 15 +                 // 1:t i1695078498534e (timestamp)
+                                3 + 15 +                 // 1:t i1695078498534e (expiry)
+                                (svcdata ? 3 + 21 + svcdata->size() : 0) +
+                                (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
 
-                if (buf.size() < size_needed)
-                    buf.resize(size_needed);
+                        if (buf.size() < size_needed)
+                            buf.resize(size_needed);
 
-                oxenc::bt_dict_producer dict{buf.data(), buf.data() + buf.size()};
+                        oxenc::bt_dict_producer dict{buf.data(), buf.data() + buf.size()};
 
-                try {
-                    // NB: ascii sorted keys
-                    dict.append("", service);
-                    if (svcdata)
-                        dict.append("!", as_sv(*svcdata));
-                    dict.append("#", hash);
-                    dict.append("&", svcid);
-                    dict.append("@", account.sv());
-                    dict.append("^", enc_key.sv());
-                    dict.append("n", ns);
-                    dict.append("t", timestamp_ms);
-                    dict.append("z", expiry_ms);
-                    if (want_data && maybe_data)
-                        dict.append("~", *maybe_data);
+                        try {
+                            // NB: ascii sorted keys
+                            dict.append("", service);
+                            if (svcdata)
+                                dict.append("!", as_sv(*svcdata));
+                            dict.append("#", hash);
+                            dict.append("&", svcid);
+                            dict.append("@", account.sv());
+                            dict.append("^", enc_key.sv());
+                            dict.append("n", ns);
+                            dict.append("t", timestamp_ms);
+                            dict.append("z", expiry_ms);
+                            if (want_data && maybe_data)
+                                dict.append("~", *maybe_data);
+                        } catch (const std::exception& e) {
+                            log::critical(
+                                    cat, "failed to build notifier message: bad size estimation?");
+                            continue;
+                        }
+
+                        log::debug(cat, "Sending push via {} notifier", service);
+                        omq_.send(conn, "notifier.push", dict.view());
+                        notify_count++;
+                    }
                 } catch (const std::exception& e) {
-                    log::critical(cat, "failed to build notifier message: bad size estimation?");
+                    log::warning(cat, "Failed to process incoming notification: {}", e.what());
                     continue;
                 }
-
-                log::debug(cat, "Sending push via {} notifier", service);
-                omq_.send(conn, "notifier.push", dict.view());
-                notify_count++;
             }
-        }
 
-        increment_stat(tx, "", "notifications", notify_count);
-        increment_stat(tx, "", "pushes", process.size());
-        tx.commit();
-        pushes_processed_ += process.size();
+            increment_stat(tx, "", "notifications", notify_count);
+            increment_stat(tx, "", "pushes", process.size());
+            tx.commit();
+            pushes_processed_ += process.size();
 
-        process.clear();
+            process.clear();
+        });
     }
 }
 
@@ -841,8 +818,7 @@ nlohmann::json HiveMind::get_stats_json() {
         tx.commit();
     }
 
-    {
-        std::lock_guard lock{mutex_};
+    loop_.call_get([&] {
         size_t n_conns = 0;
         for (auto& sn : sns_)
             n_conns += sn.second->connected();
@@ -856,7 +832,7 @@ nlohmann::json HiveMind::get_stats_json() {
         result["pending_connections"] = pending_connects_.load();
         result["uptime"] =
                 std::chrono::duration<double>(system_clock::now() - startup_time).count();
-    }
+    });
     return result;
 }
 
@@ -1039,8 +1015,6 @@ void HiveMind::on_notifier_validation(
                         std::move(service_data),
                         *enc_key,
                         std::move(*sub));
-                if (newsub)
-                    have_new_subs_ = true;
 
                 response[newsub ? "added" : "updated"] = true;
                 message = newsub ? "Subscription successful" : "Resubscription successful";
@@ -1110,14 +1084,13 @@ HiveMind::sub_unsub_args(nlohmann::json& args) {
 }
 
 oxenmq::ConnectionID HiveMind::sub_unsub_service_conn(const std::string& service) {
-    {
-        std::lock_guard lock{mutex_};
+    return loop_.call_get([&] {
         if (auto it = services_.find(service); it != services_.end())
             return it->second;
-    }
-    throw hive::subscribe_error{
-            hive::SUBSCRIBE::SERVICE_NOT_AVAILABLE,
-            service + " notification service not currently available"};
+        throw hive::subscribe_error{
+                hive::SUBSCRIBE::SERVICE_NOT_AVAILABLE,
+                service + " notification service not currently available"};
+    });
 }
 
 static void json_error(oxenmq::Message& m, hive::SUBSCRIBE err, std::string_view msg) {
@@ -1188,7 +1161,8 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
                                          std::move(subaccount),
                                          e.at("namespaces").get<std::vector<int16_t>>(),
                                          e.at("data").get<bool>(),
-                                         e.at("sig_ts").get<int64_t>(),
+                                         std::chrono::sys_seconds{std::chrono::seconds{
+                                                 e.at("sig_ts").get<int64_t>()}},
                                          std::move(sig)),
                                  pubkey = pubkey,
                                  enc_key = std::move(enc_key),
@@ -1304,14 +1278,13 @@ void HiveMind::refresh_sns() {
             oxend_,
             "rpc.get_service_nodes",
             [this](bool success, std::vector<std::string> data) {
-                if (success) {
-                    on_sns_response(std::move(data));
-                } else {
+                if (success)
+                    loop_.call_get([&] { on_sns_response(std::move(data)); });
+                else
                     log::warning(
                             cat,
                             "get_service_nodes request failed: {}",
                             "{}"_format(fmt::join(data, " ")));
-                }
             },
             _get_sns_params);
 }
@@ -1351,8 +1324,6 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
             return;
         }
 
-        std::unique_lock lock{mutex_};
-
         bool swarms_changed = false;
         auto new_hash = res.at("block_hash").get<std::string>();
         auto new_height = res.at("height").get<int64_t>();
@@ -1380,19 +1351,19 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
             last_block_ = {std::move(new_hash), new_height};
         }
 
-        std::unordered_map<X25519PK, std::tuple<std::string, uint16_t, uint64_t>> sns;
+        std::unordered_map<Ed25519PK, std::tuple<std::string, uint16_t, uint64_t>> sns;
         sns.reserve(sn_st.size());
         for (const auto& s : sn_st) {
-            auto pkx = s.at("pubkey_x25519").get<std::string_view>();
+            auto pked = s.at("pubkey_ed25519").get<std::string_view>();
             auto ip = s.at("public_ip").get<std::string_view>();
             auto port = s.at("storage_lmq_port").get<uint16_t>();
             auto swarm = s.at("swarm_id").get<uint64_t>();
 
-            if (pkx.size() == 64 && !ip.empty() && ip != "0.0.0.0" && port > 0 &&
+            if (pked.size() == 64 && !ip.empty() && ip != "0.0.0.0" && port > 0 &&
                 swarm != INVALID_SWARM_ID)
                 sns.emplace(
                         std::piecewise_construct,
-                        std::forward_as_tuple(from_hex_or_b64<X25519PK>(pkx)),
+                        std::forward_as_tuple(from_hex_or_b64<Ed25519PK>(pked)),
                         std::forward_as_tuple(std::move(ip), port, swarm));
         }
 
@@ -1405,13 +1376,13 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
         // disconnect from these (if any are connected).
         int dropped = 0;
         for (auto it = sns_.begin(); it != sns_.end();) {
-            const auto& [xpk, snode] = *it;
-            if (sns.count(xpk)) {
+            const auto& [pk, snode] = *it;
+            if (sns.count(pk)) {
                 ++it;
                 continue;
             }
 
-            log::debug(cat, "Disconnecting {}", xpk);
+            log::debug(cat, "Disconnecting {}", pk);
             swarms_[snode->swarm].erase(snode);
             snode->disconnect();
             it = sns_.erase(it);
@@ -1420,11 +1391,11 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
 
         std::unordered_set<std::shared_ptr<hive::SNode>> new_or_changed_sns;
 
-        for (const auto& [xpk, details] : sns) {
+        for (const auto& [pk, details] : sns) {
             const auto& [ip, port, swarm] = details;
-            oxenmq::address addr{"tcp://{}:{}"_format(ip, port), as_sv(xpk.view())};
+            quic::RemoteAddress addr{pk.span<unsigned char>(), ip, port};
 
-            if (auto it = sns_.find(xpk); it != sns_.end()) {
+            if (auto it = sns_.find(pk); it != sns_.end()) {
                 // We already know about this service node from the last update, but it might
                 // have changed address or swarm, in which case we want to disconnect and then
                 // store it as "new" so that we reconnect to it (if required) later.  (We don't
@@ -1442,16 +1413,9 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
                 // otherwise.
                 snode->connect(std::move(addr));
             } else {
-                // If we are using separate oxenmq instances for push handling then select the next
-                // one, round-robin style:
-                if (!omq_push_.empty() && omq_push_next_ == omq_push_.end())
-                    omq_push_next_ = omq_push_.begin();
-
-                auto& omq_instance = omq_push_.empty() ? omq_ : *omq_push_next_++;
                 // New snode
-                auto snode =
-                        std::make_shared<hive::SNode>(*this, omq_instance, std::move(addr), swarm);
-                sns_.emplace(xpk, snode);
+                auto snode = loop_.make_shared<hive::SNode>(*this, std::move(addr), swarm);
+                sns_.emplace(pk, snode);
                 swarms_[swarm].insert(snode);
                 new_or_changed_sns.insert(snode);
             }
@@ -1470,7 +1434,7 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
         // If we had a change to the network's swarms then we need to trigger a full recheck of
         // swarm membership, ejecting any pubkeys that moved while adding all pubkeys again to
         // be sure they are in each(possibly new) slot.
-        if (swarms_changed) {
+        if (swarms_changed || !new_or_changed_sns.empty()) {
             int sw_changes = 0;
             // Recalculate the swarm id of all subscribers:
             for (auto& [pk, v] : subscribers_)
@@ -1482,6 +1446,10 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
             batch.reserve(swarms_.size());
             for (auto& [swid, snodes] : swarms_) {
                 batch.add_job([this, swid = swid, s = &snodes] {
+                    // This seems suspicious that we are modifying multiple SN objects from
+                    // different threads, but we aren't because each SNode is only inside `swarms_`
+                    // once, and so there shouldn't be any overlap across SNs while this batch is
+                    // running.
                     for (auto& sn : *s)
                         sn->remove_stale_swarm_members(swarm_ids_);
                     for (auto& [swarmpk, v] : subscribers_)
@@ -1490,19 +1458,16 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
                                 sn->add_account(swarmpk);
                 });
             }
-            // We release the lock *without* unlocking it below, then deal with finally unlocking
-            // it in the completion function when we finish at the end of the batch job.
-            batch.completion([this](auto&&) mutable {
-                std::unique_lock lock{mutex_, std::adopt_lock};
-                check_subs();
-            });
 
+            std::promise<void> done;
+            batch.completion([&done](auto&&) { done.set_value(); });
             omq_.batch(std::move(batch));
 
-            // Leak the lock:
-            lock.release();
-
-        } else if (!new_or_changed_sns.empty()) {
+            done.get_future().get();
+            check_subs();
+        }
+#if 0  // TODO: this is much slower than the above full scan; investigate
+        else if (!new_or_changed_sns.empty()) {
             // Otherwise swarms stayed the same(which means no accounts changed swarms), but
             // snodes might have moved in / out of existing swarms, so re-add any subscribers to
             // swarm changers to ensure they have all the accounts that belong to them.
@@ -1522,56 +1487,53 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
 
             check_subs();
         }
+#endif
     } catch (const std::exception& e) {
         log::warning(cat, "An exception occured while processing the SN update: {}", e.what());
     }
 }
 
-// Re-checks all SN subscriptions; the mutex must be held externally.
-void HiveMind::check_subs(bool fast) {
-    for (const auto& [xpk, snode] : sns_) {
+void HiveMind::check_subs() {
+    assert(loop_.inside());
+
+    for (const auto& [pk, snode] : sns_) {
         try {
-            snode->check_subs(subscribers_, false, fast);
+            snode->check_subs(subscribers_);
         } catch (const std::exception& e) {
-            log::warning(cat, "Failed to check subs on {}: {}", xpk, e.what());
+            log::warning(cat, "Failed to check subs on {}: {}", pk, e.what());
         }
     }
 }
 
-void HiveMind::check_my_subs(hive::SNode& snode, bool initial) {
-    std::lock_guard lock{mutex_};
-    snode.check_subs(subscribers_, initial);
-}
+void HiveMind::make_conns() {
+    assert(loop_.inside());
 
-void HiveMind::subs_slow() {
-    // Ignore the confirm response from this; we can't really do anything with it, we just want
-    // to make sure we stay subscribed.
-    omq_.request(oxend_, "sub.block", nullptr);
+    for (const auto& [pk, snode] : sns_) {
+        if (pending_connects_ >= config.max_pending_connects)
+            return;
 
-    {
-        std::lock_guard lock{mutex_};
-        check_subs();
+        snode->connect();
     }
 }
 
-void HiveMind::subs_fast() {
-    if (have_new_subs_.exchange(false)) {
-        std::lock_guard lock{mutex_};
-        check_subs(true);
-    }
+void HiveMind::check_my_subs(hive::SNode& snode) {
+    snode.check_subs(subscribers_);
 }
 
 void HiveMind::finished_connect() {
-    bool try_more = pending_connects_ >= config.max_pending_connects;
+    assert(loop_.inside());
+
+    bool try_more = pending_connects_ < config.max_pending_connects;
     log::trace(cat, "finished connection; {}triggering more", try_more ? "" : "not ");
     --pending_connects_;
-    if (try_more) {
-        std::lock_guard lock{mutex_};
-        check_subs();
-    }
+    if (try_more)
+        make_conns();
 }
 
 bool HiveMind::allow_connect() {
+    if (!quic_)
+        return false;
+
     int count = ++pending_connects_;
     if (count > config.max_pending_connects) {
         --pending_connects_;
@@ -1588,77 +1550,147 @@ bool HiveMind::allow_connect() {
 
 void HiveMind::load_saved_subscriptions() {
 
-    // mutex_ lock not needed: we are only ever called before oxenmq startup in the constructor
-    // (i.e.  before there are any other threads to worry about).
-
-    auto started = steady_clock::now();
-    auto last_print = started;
-
     auto conn = pool_.get();
     pqxx::work txn{conn};
 
-    auto [total] = txn.query1<int64_t>("SELECT COUNT(*) FROM subscriptions");
-    log::info(cat, "Loading {} stored subscriptions from database", total);
+    auto [total] = txn.query1<int>("SELECT COUNT(*) FROM subscriptions");
 
-    int64_t count = 0, unique = 0;
-    for (auto [acc, ed, sub_tag, sub_sig, sig, sigts, wd, ns_arr] :
-         txn
-                 .stream<AccountID,
-                         std::optional<Ed25519PK>,
-                         std::optional<SubaccountTag>,
-                         std::optional<Signature>,
-                         Signature,
-                         int64_t,
-                         bool,
-                         Int16ArrayLoader>(R"(
+    int n = std::max<int>(1, std::thread::hardware_concurrency() / 4);
+
+    log::info(cat, "Loading {} stored subscriptions from database using {} threads", total, n);
+
+    AccountID jagerman;
+    auto jagerman_id = "05fb466d312e1666ad1c84c4ee55b7e034151c0e366a313d95d11436a5f36e1e75"sv;
+    oxenc::from_hex(jagerman_id.begin(), jagerman_id.end(), jagerman.begin());
+
+    std::vector<std::pair<
+            std::thread,
+            std::vector<std::tuple<
+                    std::optional<SwarmPubkey>,  // Not optional, but we need to default construct
+                    std::optional<Subaccount>,
+                    Signature,
+                    std::chrono::sys_seconds,
+                    bool,
+                    std::vector<int16_t>>>>>
+            threads;
+
+    threads.resize(n);
+    for (auto& [t, rows] : threads)
+        // There is some small randomness in how many rows each threads get, so reserve 10% extra
+        // the perfectly even value.
+        rows.reserve(11 * total / (10 * n));
+
+    for (int i = 0; i < n; i++) {
+        threads[i].first = std::thread{[i, n, &rows = threads[i].second, &pool = pool_] {
+            auto conn = pool.get();
+            pqxx::work txn{conn};
+
+            for (auto [acc, ed, sub_tag, sub_sig, sig_in, sigts_in, wd_in, ns_arr_in] :
+                 txn
+                         .stream<AccountID,
+                                 std::optional<Ed25519PK>,
+                                 std::optional<SubaccountTag>,
+                                 std::optional<Signature>,
+                                 Signature,
+                                 int64_t,
+                                 bool,
+                                 pqxx::array<int16_t>>(R"(
 SELECT account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data,
     ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
-FROM subscriptions)")) {
-        auto [it, ins] = subscribers_.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(std::move(acc), std::move(ed), /*_skip_validation=*/true),
-                std::forward_as_tuple());
+FROM subscriptions
+WHERE id % {0} = {1})"_format(n, i))) {
 
-        std::optional<Subaccount> subaccount;
-        if (sub_tag && sub_sig) {
-            subaccount.emplace();
-            subaccount->tag = std::move(*sub_tag);
-            subaccount->sig = std::move(*sub_sig);
-        }
-
-        // Weed out potential duplicates: if two+ devices are subscribed to the same
-        // account with all the same relevant subscription settings then we can just
-        // keep whichever one is newer.
-        bool dupe = false;
-        for (auto& existing : it->second) {
-            if (existing.is_same(subaccount, ns_arr.a, wd)) {
-                if (sigts > existing.sig_ts) {
-                    existing.sig_ts = sigts;
-                    existing.sig = std::move(sig);
+                auto& [swpk, subaccount, sig, sigts, wd, ns_arr] = rows.emplace_back();
+                swpk.emplace(acc, ed, /*skip_validation=*/true);
+                if (sub_tag && sub_sig) {
+                    subaccount.emplace();
+                    subaccount->tag = std::move(*sub_tag);
+                    subaccount->sig = std::move(*sub_sig);
                 }
-                dupe = true;
-                break;
+                sig = std::move(sig_in);
+                sigts = std::chrono::sys_seconds{std::chrono::seconds{sigts_in}};
+                wd = wd_in;
+                ns_arr = std::vector<int16_t>{ns_arr_in.begin(), ns_arr_in.end()};
             }
-        }
+        }};
+    }
 
-        if (!dupe) {
-            unique++;
-            it->second.emplace_back(
-                    it->first,
-                    std::move(subaccount),
-                    std::move(ns_arr.a),
-                    wd,
-                    sigts,
-                    std::move(sig),
-                    /*_skip_validation=*/true);
-        }
+    int64_t th_count = 0;
+    for (auto& [t, rows] : threads) {
+        t.join();
+        log::debug(cat, "Thead got {} rows", rows.size());
+        th_count += rows.size();
+    }
 
-        if (++count % 25000 == 0) {
-            auto now = steady_clock::now();
-            auto elapsed = now - last_print;
-            if (elapsed >= 1s) {
-                log::info(cat, "... processed {}/{} subscriptions", count, total);
-                last_print = now;
+    log::info(cat, "Collected {} rows via threads", th_count);
+
+    steady_clock::time_point now;
+    std::chrono::sys_seconds sys_now;
+    std::pair<std::chrono::sys_seconds, std::chrono::sys_seconds> sigts_cutoff;
+    auto update_clocks = [&] {
+        now = steady_clock::now();
+        sys_now = std::chrono::floor<std::chrono::seconds>(system_clock::now());
+        sigts_cutoff.first = sys_now - hive::Subscription::SIGNATURE_EXPIRY + 5s;
+        sigts_cutoff.second = sys_now + hive::Subscription::SIGNATURE_EARLY;
+    };
+    update_clocks();
+    int last_decile = 0;
+
+    int64_t raw_count = 0, count = 0, unique = 0;
+    for (auto& [t, rows] : threads) {
+        for (auto& [swpk, subaccount, sig, sigts, wd, ns_arr] : rows) {
+            raw_count++;
+
+            if (sigts <= sigts_cutoff.first || sigts >= sigts_cutoff.second)
+                // Don't try loading entries that are about to expire
+                continue;
+
+            // DEBUG
+            // if (!std::equal(swpk->id.begin(), swpk->id.begin() + 3, jagerman.begin()))
+            //    continue;
+            // log::critical(cat, "LOADED {}", swpk->id);
+
+            auto& sub = subscribers_[*swpk];
+
+            // Weed out potential duplicates: if two+ devices are subscribed to the same
+            // account with all the same relevant subscription settings then we can just
+            // keep whichever one is newer.
+            bool dupe = false;
+            for (auto& existing : sub) {
+                if (existing.is_same(subaccount, ns_arr, wd)) {
+                    if (sigts > existing.sig_ts) {
+                        existing.sig_ts = sigts;
+                        existing.sig = std::move(sig);
+                    }
+                    dupe = true;
+                    break;
+                }
+            }
+
+            if (!dupe) {
+                unique++;
+                sub.emplace_back(
+                        std::move(*swpk),
+                        std::move(subaccount),
+                        std::move(ns_arr),
+                        wd,
+                        sigts,
+                        std::move(sig),
+                        /*_skip_validation=*/true,
+                        sys_now);
+            }
+
+            if (++count % 1000 == 0 || raw_count == th_count) {
+                update_clocks();
+                if (int decile = 10 * raw_count / th_count; decile != last_decile) {
+                    log::info(
+                            cat,
+                            "... processed {}/{} ({}%) subscriptions",
+                            raw_count,
+                            total,
+                            decile * 10);
+                    last_decile = decile;
+                }
             }
         }
     }
@@ -1683,7 +1715,7 @@ bool HiveMind::add_subscription(
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result = tx.query01<int64_t, int64_t, Int16ArrayLoader>(
+    auto result = tx.query01<int64_t, int64_t, pqxx::array<int16_t>>(
             R"(
 SELECT
     id,
@@ -1695,10 +1727,11 @@ WHERE
             {pubkey.id, service, service_id});
     int64_t id;
     if (result) {
-        auto& [row_id, sig_ts, ns_arr] = *result;
+        auto& [row_id, sig_ts, ns_arr_in] = *result;
+        std::vector<int16_t> ns_arr{ns_arr_in.cbegin(), ns_arr_in.cend()};
         id = row_id;
 
-        insert_ns = ns_arr.a != sub.namespaces;
+        insert_ns = ns_arr != sub.namespaces;
         log::trace(cat, "updating subscription for {}", pubkey.id.hex());
         tx.exec(
                   R"(
@@ -1711,7 +1744,7 @@ WHERE id = $1
                    sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
                    sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
                    sub.sig,
-                   sub.sig_ts,
+                   sub.sig_ts.time_since_epoch().count(),
                    sub.want_data,
                    enc_key,
                    service_data})
@@ -1733,7 +1766,7 @@ RETURNING id
                               sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
                               sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
                               sub.sig,
-                              sub.sig_ts,
+                              sub.sig_ts.time_since_epoch().count(),
                               sub.want_data,
                               enc_key,
                               service,
@@ -1756,34 +1789,35 @@ RETURNING id
 
     tx.commit();
 
-    std::lock_guard lock{mutex_};
-    pubkey.update_swarm(swarm_ids_);
+    return loop_.call_get([&] {
+        pubkey.update_swarm(swarm_ids_);
 
-    auto& subscriptions = subscribers_[pubkey];
-    bool found_existing = false;
-    for (auto& existing : subscriptions) {
-        if (existing.is_same(sub)) {
-            if (sub.is_newer(existing)) {
-                existing.sig = sub.sig;
-                existing.sig_ts = sub.sig_ts;
+        auto& subscriptions = subscribers_[pubkey];
+        bool found_existing = false;
+        for (auto& existing : subscriptions) {
+            if (existing.is_same(sub)) {
+                if (sub.is_newer(existing)) {
+                    existing.sig = sub.sig;
+                    existing.sig_ts = sub.sig_ts;
+                }
+                found_existing = true;
+                break;
             }
-            found_existing = true;
-            break;
         }
-    }
-    if (!found_existing)
-        subscriptions.push_back(std::move(sub));
+        if (!found_existing)
+            subscriptions.push_back(std::move(sub));
 
-    // If this is actually adding a new subscription (and not just renewing an
-    // existing one) then we need to force subscription (or resubscription) on all
-    // of the account's swarm members to get the subscription active ASAP.
-    // (Otherwise don't do anything because we already have an equivalent
-    // subscription in place).
-    if (new_sub)
-        for (auto& sn : swarms_[pubkey.swarm])
-            sn->add_account(pubkey, /*force_now=*/true);
+        // If this is actually adding a new subscription (and not just renewing an
+        // existing one) then we need to force subscription (or resubscription) on all
+        // of the account's swarm members to get the subscription active ASAP.
+        // (Otherwise don't do anything because we already have an equivalent
+        // subscription in place).
+        if (new_sub)
+            for (auto& sn : swarms_[pubkey.swarm])
+                sn->add_account(pubkey, /*force_now=*/true);
 
-    return new_sub;
+        return new_sub;
+    });
 }
 
 /// Removes a subscription for monitoring.  Returns true if the given pubkey was

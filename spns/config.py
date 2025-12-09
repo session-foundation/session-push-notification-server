@@ -173,7 +173,8 @@ def load_config():
                 if opt == "level":
                     core_logger.set_level(cp["log"][opt])
                 elif opt.startswith("level-") and len(opt) > 6:
-                    core_logger.set_level(opt[6:], cp["log"][opt])
+                    logger.warning(f"{opt} = ... is deprecated; use a compound level=... instead")
+                    core_logger.set_level(f'{opt[6:]}={cp["log"][opt]}')
                 else:
                     logger.warning(f"Ignoring unknown log item [log] {opt} in {conf_ini}")
 

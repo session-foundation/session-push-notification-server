@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <oxen/log.hpp>
+#include <oxen/log/level.hpp>
 
 #include "bytes.hpp"
 #include "config.hpp"
@@ -139,38 +140,9 @@ PYBIND11_MODULE(core, m) {
                     })
             .def_static(
                     "set_level",
-                    [](const std::string& level) {
-                        oxen::log::reset_level(oxen::log::level_from_string(level));
-                    },
-                    "Sets/resets the log level of all spns.core log categories to the given "
-                    "value.\n"
-                    "Can be any of 'trace', 'debug', 'info', 'warn', 'error', 'critical', or "
-                    "'none'.",
-                    "level"_a)
-            .def_static(
-                    "set_level",
-                    [](const std::string& cat, const std::string& level) {
-                        oxen::log::set_level(cat, oxen::log::level_from_string(level));
-                    },
-                    "Sets/resets the log level of a single spns.core log categories to the given "
-                    "value.\n"
-                    "Can be any of 'trace', 'debug', 'info', 'warning', 'error', 'critical', or "
-                    "'none'.",
-                    "category"_a,
-                    "level"_a)
-            .def_static(
-                    "get_level",
-                    [](const std::string& cat) { oxen::log::get_level(cat); },
-                    "Gets the log level of the given spns.core log category")
-            .def_static(
-                    "get_level",
-                    [](const std::string& cat) { oxen::log::get_level(cat); },
-                    "Gets the log level of the given spns.core log category")
-            .def_static(
-                    "get_level",
-                    []() { oxen::log::get_level_default(); },
-                    "Gets the default log level of spns.core categories (those that have not been "
-                    "changed via a category-specific `set_level`)")
+                    [](std::string_view cat_levels) { oxen::log::apply_categories(cat_levels); },
+                    "Sets/resets the log level; can be a global level (e.g. 'info') or individual "
+                    "'cat=debug' level values")
             //
             ;
 
