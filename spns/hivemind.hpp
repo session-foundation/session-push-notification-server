@@ -85,34 +85,35 @@ struct startup_request_defer {};
 class ExcWrapper {
   private:
     HiveMind& hivemind;
-    void (HiveMind::* const meth)(oxenmq::Message&);
+    std::variant<
+            void (HiveMind::* const)(oxenmq::Message&),
+            void (HiveMind::* const)(quic::message&)>
+            meth;
     const std::string meth_name;
-    bool is_json_request;
 
   public:
     ExcWrapper(
-            HiveMind& hivemind,
-            void (HiveMind::*meth)(oxenmq::Message&),
-            std::string meth_name,
-            bool is_json_request = false) :
-            hivemind{hivemind},
-            meth{meth},
-            meth_name{std::move(meth_name)},
-            is_json_request{is_json_request} {}
+            HiveMind& hivemind, void (HiveMind::*meth)(oxenmq::Message&), std::string meth_name) :
+            hivemind{hivemind}, meth{meth}, meth_name{std::move(meth_name)} {}
+
+    ExcWrapper(HiveMind& hivemind, void (HiveMind::*meth)(quic::message&), std::string meth_name) :
+            hivemind{hivemind}, meth{meth}, meth_name{std::move(meth_name)} {}
 
     void operator()(oxenmq::Message& m);
+    void operator()(quic::message& m);
 };
 
 // If requests arrive during startup we copy the request here to defer calling until after
 // startup completes.
 struct DeferredRequest {
-    oxenmq::Message message;
+    std::variant<oxenmq::Message, quic::message> message;
     std::vector<std::string> data;
     ExcWrapper& callback;
 
     DeferredRequest(oxenmq::Message&& m, ExcWrapper& callback);
+    DeferredRequest(quic::message&& m, ExcWrapper& callback);
 
-    void operator()() && { callback(message); }
+    void operator()() && { std::visit(callback, message); }
 };
 
 class HiveMind {
@@ -127,8 +128,10 @@ class HiveMind {
 
     // QUIC endpoint used to connect to service nodes (for receiving pushes)
     quic::Loop loop_;
-    std::shared_ptr<quic::TLSCreds> creds_;
-    std::shared_ptr<quic::Endpoint> quic_;
+    std::shared_ptr<quic::TLSCreds> creds_out_, creds_in_;
+    std::list<std::shared_ptr<quic::Endpoint>> quic_in_;
+    std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
+                                                // if there is a suitable one for outbound use.
 
     std::shared_ptr<quic::Ticker> subs_ticker_;
 
@@ -189,6 +192,7 @@ class HiveMind {
     std::mutex deferred_mutex_;
     std::list<DeferredRequest> deferred_;
     void defer_request(oxenmq::Message&& m, ExcWrapper& callback);
+    void defer_request(quic::message&& m, ExcWrapper& callback);
 
   public:
     HiveMind(Config conf_);
@@ -216,12 +220,12 @@ class HiveMind {
     /// integer and string values are permitted (+keys only allow integers).
     void on_service_stats(oxenmq::Message& m);
 
-    nlohmann::json get_stats_json();
+    void get_stats_json(std::function<void(nlohmann::json)> when_ready);
 
     void on_get_stats(oxenmq::Message& m);
 
     std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now() - 1h;
-    void log_stats(std::string_view pre_cmd = "WATCHDOG=1"sv);
+    void log_stats(std::string pre_cmd = "WATCHDOG=1"s);
 
     using UnsubData = std::tuple<Signature, std::optional<Subaccount>, int64_t>;
     void on_notifier_validation(
@@ -230,7 +234,7 @@ class HiveMind {
             std::atomic<int>& remaining,
             bool multi,
             bool success,
-            oxenmq::Message::DeferredSend replier,
+            const std::function<void(std::string_view response)>& replier,
             std::string service,
             const SwarmPubkey& pubkey,
             std::shared_ptr<hive::Subscription> sub,
@@ -251,9 +255,16 @@ class HiveMind {
 
     oxenmq::ConnectionID sub_unsub_service_conn(const std::string& service);
 
+    void on_quic_request(quic::message& m);
+    void quic_subscribe(quic::message& m);
+    void quic_unsubscribe(quic::message& m);
+    ExcWrapper handle_quic_subscribe{*this, &HiveMind::quic_subscribe, "quic_subscribe"};
+    ExcWrapper handle_quic_unsubscribe{*this, &HiveMind::quic_unsubscribe, "quic_unsubscribe"};
+
     void on_subscribe(oxenmq::Message& m);
     void on_unsubscribe(oxenmq::Message& m);
-    void on_sub_unsub_impl(oxenmq::Message& m, bool subscribe);
+    template <typename Message>
+    void on_sub_unsub_impl(Message& m, bool subscribe);
 
     void db_cleanup();
 
@@ -278,9 +289,9 @@ class HiveMind {
     void finished_connect();
 
     // Accesses the quic endpoint used to connect to SNodes
-    quic::Endpoint& quic() { return *quic_; }
+    quic::Endpoint& quic_out() { return *quic_out_; }
 
-    bool has_quic() { return (bool)quic_; }
+    bool has_quic_out() { return (bool)quic_out_; }
 
     // Accesses the quic loop governing SNode connections (and various internals)
     quic::Loop& loop() { return loop_; }
@@ -288,7 +299,7 @@ class HiveMind {
     // Returns the creds object for establishing outbound connections.  TODO: This isn't needed once
     // all nodes are running an updated libquic, but older libquic doesn't allow no-creds
     // connections.
-    const std::shared_ptr<quic::TLSCreds>& creds() { return creds_; }
+    const std::shared_ptr<quic::TLSCreds>& creds_out() { return creds_out_; }
 
     // Internal helper called by SNode with itself to dispatch a call back into itself with a
     // reference to the HiveMind's master subscriber container.
@@ -358,5 +369,8 @@ class HiveMind {
     // Called from SNode when we get a message notification
     void on_message_notification(quic::message m);
 };
+
+extern template void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe);
+extern template void HiveMind::on_sub_unsub_impl(quic::message& m, bool subscribe);
 
 }  // namespace spns

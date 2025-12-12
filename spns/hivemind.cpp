@@ -6,14 +6,19 @@
 #include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/batch.h>
+#include <oxenmq/message.h>
 #include <sodium/crypto_sign_ed25519.h>
 #include <spdlog/common.h>
 #include <systemd/sd-daemon.h>
 
 #include <chrono>
+#include <concepts>
 #include <nlohmann/json.hpp>
 #include <oxen/log.hpp>
+#include <oxen/quic/btstream.hpp>
+#include <oxen/quic/format.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxen/quic/opt.hpp>
 #include <oxenmq/zmq.hpp>
 #include <set>
 #include <stdexcept>
@@ -35,7 +40,10 @@ std::atomic<int> next_hivemind_id{1};
 HiveMind::HiveMind(Config conf_in) :
         config{std::move(conf_in)},
         pool_{config.pg_connect},
-        omq_{std::string{config.pubkey.sv()}, std::string{config.privkey.sv()}, false, nullptr},
+        omq_{std::string{config.omq_pubkey.sv()},
+             std::string{config.omq_privkey.sv()},
+             false,
+             nullptr},
         object_id_{next_hivemind_id++} {
 
     // fiddle_rlimit_nofile();
@@ -125,11 +133,10 @@ HiveMind::HiveMind(Config conf_in) :
             // Note that the "message" strings are subject to change and should not be relied on
             // programmatically; instead rely on the "error" or "success" values.
             .add_request_command(
-                    "subscribe", ExcWrapper{*this, &HiveMind::on_subscribe, "on_subscribe", true})
+                    "subscribe", ExcWrapper{*this, &HiveMind::on_subscribe, "on_subscribe"})
 
             .add_request_command(
-                    "unsubscribe",
-                    ExcWrapper{*this, &HiveMind::on_unsubscribe, "on_unsubscribe", true})
+                    "unsubscribe", ExcWrapper{*this, &HiveMind::on_unsubscribe, "on_unsubscribe"})
 
             // end of "push." commands
             ;
@@ -205,24 +212,56 @@ HiveMind::HiveMind(Config conf_in) :
             // end of "admin." commands
             ;
 
-    // TODO: Once all nodes are running the SS version that comes with 11.6.0+ we can just get rid
-    // of creds_ and remove it from the `connect()` calls to do unauthenticated connections (which
-    // are allowed in SS 2.11.1+, which comes with 11.6.0+), but in earlier versions of quic that
-    // results in stateless reset-rejected connections.
-    //
-    // Thus for now, this randomly generated key:
-    {
+    const auto out_alpn = quic::opt::outbound_alpn("oxenstorage");
+    const auto in_alpn = quic::opt::inbound_alpn("spns");
+
+    if (!config.quic_listen.empty()) {
+        if (!config.quic_keys)
+            throw std::runtime_error{"Configuration error: quic_listen requires quic_keys"};
+        creds_in_ = quic::GNUTLSCreds::make_from_ed_seckey(config.quic_keys->sv());
+        creds_out_ = creds_in_;
+
+        for (const auto& addr : config.quic_listen) {
+            // We only use one address for outbound connections, but it needs to be IPv4 capable
+            std::optional<quic::opt::outbound_alpns> maybe_out_alpn;
+            if (!quic_out_ &&
+                (addr.is_ipv4() || (addr.is_ipv6() && addr.is_any_addr() && addr.dual_stack)))
+                maybe_out_alpn = out_alpn;
+
+            auto ep = quic::Endpoint::endpoint(loop_, addr, in_alpn, maybe_out_alpn);
+
+            ep->listen(
+                    creds_in_,
+                    [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
+                        return e.loop.make_shared<quic::BTRequestStream>(
+                                c, e, [this](quic::message m) { on_quic_request(m); });
+                    });
+
+            if (maybe_out_alpn)
+                quic_out_ = ep;
+            quic_in_.push_back(std::move(ep));
+        }
+    } else {
+        // TODO: Once all nodes are running the SS version that comes with 11.6.0+ we can just get
+        // rid of creds_out_ and remove it from the `connect()` calls to do unauthenticated
+        // connections (which are allowed in SS 2.11.1+, which comes with 11.6.0+), but in earlier
+        // versions of quic that results in stateless reset-rejected connections.
+        //
+        // Thus for now, this randomly generated key:
         std::array<unsigned char, crypto_sign_ed25519_PUBLICKEYBYTES> pk;
         std::array<unsigned char, crypto_sign_ed25519_SECRETKEYBYTES> sk;
         crypto_sign_ed25519_keypair(pk.data(), sk.data());
-        creds_ = quic::GNUTLSCreds::make_from_ed_seckey(
+        creds_out_ = quic::GNUTLSCreds::make_from_ed_seckey(
                 std::string_view{reinterpret_cast<const char*>(sk.data()), sk.size()});
     }
-
-    quic_ = quic::Endpoint::endpoint(
-            loop_, quic::Address{"0.0.0.0", 0}, quic::opt::alpn("oxenstorage"));
+    if (!quic_out_) {
+        // Either we aren't listening, or aren't listening on any IPv4 capable address so add
+        // another non-listening endpoint that we can use for outbound connections.
+        quic_out_ = quic::Endpoint::endpoint(loop_, quic::Address{}, out_alpn);
+    }
 
     sd_notify(0, "STATUS=Cleaning database");
+    log::info(cat, "Performing initial database clean-up");
     db_cleanup();
     sd_notify(0, "STATUS=Loading existing subscriptions");
     try {
@@ -323,15 +362,20 @@ HiveMind::~HiveMind() {
         notify_proc_thread_.join();
     }
     loop_.call_get([this] {
-        // We destroy the Endpoint first, because during its destruction it triggers disconnect
-        // callbacks which still have captured pointers into the SNode objects living in
-        // swarms_/sns_.
+        // We destroy the Endpoints first, because during quic_opt_'s destruction it triggers
+        // disconnect callbacks which still have captured pointers into the SNode objects living in
+        // swarms_/sns_.  We clear quic_in_ at the same time because, although it doesn't have the
+        // same callback issue, quic_out_ might be shared with one of the elements in quic_in_ and
+        // so could keep it alive if we don't clear it too and it is indeed shared.
         //
-        // We also transfer the shared ptr into a local variable immediately before destruction so
-        // that during the actual destruction `quic_` will be empty (which can be queried and
-        // detected to alter behaviour, e.g. for disconnections during shutdown).
-        auto quic = std::move(quic_);
-        quic.reset();
+        // We transfer the quic_out_ shared ptr into a local variable here so that quic_out_ itself
+        // will be empty when the callbacks fire, which allow them to detect that it is during
+        // shutdown and alter their behaviour.  (Shared ptr object destruction happens before the
+        // pointer is cleared, so without transferring it would still be set during disconnect
+        // callbacks).
+        auto q = std::move(quic_out_);
+        quic_in_.clear();
+        q.reset();
 
         swarms_.clear();
         sns_.clear();
@@ -411,26 +455,67 @@ void HiveMind::defer_request(oxenmq::Message&& m, ExcWrapper& callback) {
     // Must have flipped between the check and now, so don't actually defer it
     callback(m);
 }
+void HiveMind::defer_request(quic::message&& m, ExcWrapper& callback) {
+    {
+        std::lock_guard lock{deferred_mutex_};
+        if (!ready) {
+            deferred_.emplace_back(std::move(m), callback);
+            return;
+        }
+    }
+    // Must have flipped between the check and now, so don't actually defer it
+    callback(m);
+}
 DeferredRequest::DeferredRequest(oxenmq::Message&& m, ExcWrapper& callback) :
-        message{m.oxenmq, std::move(m.conn), std::move(m.access), std::move(m.remote)},
+        message{std::in_place_type<oxenmq::Message>,
+                m.oxenmq,
+                std::move(m.conn),
+                std::move(m.access),
+                std::move(m.remote)},
         callback{callback} {
+    auto& msg = std::get<oxenmq::Message>(message);
     data.reserve(m.data.size());
     for (const auto& d : m.data)
-        message.data.emplace_back(data.emplace_back(d));
+        msg.data.emplace_back(data.emplace_back(d));
 }
+DeferredRequest::DeferredRequest(quic::message&& m, ExcWrapper& callback) :
+        message{std::move(m)}, callback{callback} {}
+
+static void json_error(oxenmq::Message& m, hive::SUBSCRIBE err, std::string_view msg) {
+    int code = static_cast<int>(err);
+    log::debug(cat, "Replying with error code {}: {}", code, msg);
+    m.send_reply(nlohmann::json{{"error", code}, {"message", msg}}.dump());
+}
+static void json_error(quic::message& m, hive::SUBSCRIBE err, std::string_view msg) {
+    int code = static_cast<int>(err);
+    log::debug(cat, "Replying with error code {}: {}", code, msg);
+    m.respond(nlohmann::json{{"error", code}, {"message", msg}}.dump(), /*error=*/true);
+}
+
 void ExcWrapper::operator()(oxenmq::Message& m) {
     try {
-        (hivemind.*meth)(m);
+        (hivemind.*(std::get<0>(meth)))(m);
     } catch (const startup_request_defer&) {
         hivemind.defer_request(std::move(m), *this);
     } catch (const std::exception& e) {
         log::error(cat, "Exception in HiveMind::{}: {}", meth_name, e.what());
-        if (is_json_request) {
-            m.send_reply(nlohmann::json{
-                    {"error", static_cast<int>(hive::SUBSCRIBE::INTERNAL_ERROR)},
-                    {"message", "An internal error occurred while processing your request"}}
-                                 .dump());
-        }
+        json_error(
+                m,
+                hive::SUBSCRIBE::INTERNAL_ERROR,
+                "An internal error occurred while processing your request");
+    }
+}
+void ExcWrapper::operator()(quic::message& m) {
+    try {
+        (hivemind.*(std::get<1>(meth)))(m);
+    } catch (const startup_request_defer&) {
+        hivemind.defer_request(std::move(m), *this);
+    } catch (const std::exception& e) {
+        log::error(cat, "Exception in HiveMind::{}: {}", meth_name, e.what());
+        json_error(
+                m,
+                hive::SUBSCRIBE::INTERNAL_ERROR,
+                "An internal error occurred while processing your request");
     }
 }
 
@@ -780,7 +865,7 @@ void HiveMind::on_service_stats(oxenmq::Message& m) {
     }
 }
 
-nlohmann::json HiveMind::get_stats_json() {
+void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
     auto result = nlohmann::json{};
 
     {
@@ -818,66 +903,69 @@ nlohmann::json HiveMind::get_stats_json() {
         tx.commit();
     }
 
-    loop_.call_get([&] {
-        size_t n_conns = 0;
-        for (auto& sn : sns_)
-            n_conns += sn.second->connected();
+    loop_.call_soon(
+            [when_ready = std::move(when_ready), result = std::move(result), this]() mutable {
+                size_t n_conns = 0;
+                for (auto& sn : sns_)
+                    n_conns += sn.second->connected();
 
-        result["block_hash"] = last_block_.first;
-        result["block_height"] = last_block_.second;
-        result["swarms"] = swarms_.size();
-        result["snodes"] = sns_.size();
-        result["accounts_monitored"] = subscribers_.size();
-        result["connections"] = n_conns;
-        result["pending_connections"] = pending_connects_.load();
-        result["uptime"] =
-                std::chrono::duration<double>(system_clock::now() - startup_time).count();
-    });
-    return result;
+                result["block_hash"] = last_block_.first;
+                result["block_height"] = last_block_.second;
+                result["swarms"] = swarms_.size();
+                result["snodes"] = sns_.size();
+                result["accounts_monitored"] = subscribers_.size();
+                result["connections"] = n_conns;
+                result["pending_connections"] = pending_connects_.load();
+                result["uptime"] =
+                        std::chrono::duration<double>(system_clock::now() - startup_time).count();
+
+                when_ready(std::move(result));
+            });
 }
 
 void HiveMind::on_get_stats(oxenmq::Message& m) {
-    m.send_reply(get_stats_json().dump());
+    get_stats_json([m = m.send_later()](nlohmann::json stats) { m(stats.dump()); });
 }
 
-void HiveMind::log_stats(std::string_view pre_cmd) {
-    auto s = get_stats_json();
+void HiveMind::log_stats(std::string pre_cmd) {
+    get_stats_json([this, pre_cmd = std::move(pre_cmd)](nlohmann::json s) {
+        std::list<std::string> notifiers;
+        for (auto& [k, v] : s.items())
+            if (starts_with(k, "last."))
+                if (auto t = v.get<int64_t>(); t >= unix_timestamp(startup_time) &&
+                                               t >= unix_timestamp(system_clock::now() - 1min))
+                    notifiers.push_back(k.substr(5));
 
-    std::list<std::string> notifiers;
-    for (auto& [k, v] : s.items())
-        if (starts_with(k, "last."))
-            if (auto t = v.get<int64_t>(); t >= unix_timestamp(startup_time) &&
-                                           t >= unix_timestamp(system_clock::now() - 1min))
-                notifiers.push_back(k.substr(5));
+        int64_t total_notifies = 0;
+        for (auto& [service, data] : s["notifier"].items())
+            if (auto it = data.find("notifies"); it != data.end())
+                total_notifies += it->get<int64_t>();
 
-    int64_t total_notifies = 0;
-    for (auto& [service, data] : s["notifier"].items())
-        if (auto it = data.find("notifies"); it != data.end())
-            total_notifies += it->get<int64_t>();
+        auto stat_line = fmt::format(
+                "SN conns: {}/{} ({} pending); Height: {}; Accts/Subs: {}/{}; svcs: {}; notifies: "
+                "{}; "
+                "pushes recv'd: {}",
+                s["connections"].get<int>(),
+                s["snodes"].get<int>(),
+                s["pending_connections"].get<int>(),
+                s["block_height"].get<int>(),
+                s["accounts_monitored"].get<int>(),
+                s["subscriptions"]["total"].get<int>(),
+                "{}"_format(fmt::join(notifiers, ", ")),
+                total_notifies,
+                pushes_processed_.load());
 
-    auto stat_line = fmt::format(
-            "SN conns: {}/{} ({} pending); Height: {}; Accts/Subs: {}/{}; svcs: {}; notifies: {}; "
-            "pushes recv'd: {}",
-            s["connections"].get<int>(),
-            s["snodes"].get<int>(),
-            s["pending_connections"].get<int>(),
-            s["block_height"].get<int>(),
-            s["accounts_monitored"].get<int>(),
-            s["subscriptions"]["total"].get<int>(),
-            "{}"_format(fmt::join(notifiers, ", ")),
-            total_notifies,
-            pushes_processed_.load());
+        auto sd_out = pre_cmd.empty() ? "STATUS={}"_format(stat_line)
+                                      : "{}\nSTATUS={}"_format(pre_cmd, stat_line);
+        sd_notify(0, sd_out.c_str());
 
-    auto sd_out = pre_cmd.empty() ? "STATUS={}"_format(stat_line)
-                                  : "{}\nSTATUS={}"_format(pre_cmd, stat_line);
-    sd_notify(0, sd_out.c_str());
-
-    if (auto now = std::chrono::steady_clock::now(); now - last_stats_logged >= 4min + 55s) {
-        log::info(stats, "Status: {}", stat_line);
-        last_stats_logged = now;
-    } else {
-        log::debug(stats, "Status: {}", stat_line);
-    }
+        if (auto now = std::chrono::steady_clock::now(); now - last_stats_logged >= 4min + 55s) {
+            log::info(stats, "Status: {}", stat_line);
+            last_stats_logged = now;
+        } else {
+            log::debug(stats, "Status: {}", stat_line);
+        }
+    });
 }
 
 void HiveMind::on_drop_registrations(oxenmq::Message& m) {
@@ -928,8 +1016,9 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
             deleted);
 }
 
+template <std::invocable<std::string> Reply>
 static void sub_json_set_one_response(
-        oxenmq::Message::DeferredSend&& m,
+        Reply& reply,
         nlohmann::json& response,
         size_t i,
         std::atomic<int>& remaining,
@@ -940,9 +1029,9 @@ static void sub_json_set_one_response(
     if (--remaining == 0) {
         // This is the last response set, so we have to send all the responses
         if (!multi)
-            m(response[0].dump());
+            reply(response[0].dump());
         else
-            m(response.dump());
+            reply(response.dump());
     }
 }
 
@@ -952,7 +1041,7 @@ void HiveMind::on_notifier_validation(
         std::atomic<int>& remaining,
         bool multi,
         bool success,
-        oxenmq::Message::DeferredSend replier,
+        const std::function<void(std::string_view response)>& replier,
         std::string service,
         const SwarmPubkey& pubkey,
         std::shared_ptr<hive::Subscription> sub,
@@ -1051,8 +1140,7 @@ void HiveMind::on_notifier_validation(
     if (!message.empty())
         response["message"] = std::move(message);
 
-    sub_json_set_one_response(
-            std::move(replier), final_response, i, remaining, multi, std::move(response));
+    sub_json_set_one_response(replier, final_response, i, remaining, multi, std::move(response));
 }
 
 std::tuple<SwarmPubkey, std::optional<Subaccount>, int64_t, Signature, std::string, nlohmann::json>
@@ -1093,30 +1181,65 @@ oxenmq::ConnectionID HiveMind::sub_unsub_service_conn(const std::string& service
     });
 }
 
-static void json_error(oxenmq::Message& m, hive::SUBSCRIBE err, std::string_view msg) {
-    int code = static_cast<int>(err);
-    log::debug(cat, "Replying with error code {}: {}", code, msg);
-    m.send_reply(nlohmann::json{{"error", code}, {"message", msg}}.dump());
-}
+namespace {
 
-void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
+    std::string_view get_body(oxenmq::Message& m) {
+        return m.data.at(0);
+    }
+    std::string_view get_body(quic::message& m) {
+        return m.body();
+    }
+
+    template <typename M>
+    static std::optional<nlohmann::json> parse_sub_unsub(M& m) {
+        std::optional<nlohmann::json> args;
+        try {
+            args = nlohmann::json::parse(get_body(m));
+        } catch (const nlohmann::json::exception&) {
+            log::debug(cat, "Subscription failed: bad json");
+            json_error(m, hive::SUBSCRIBE::BAD_INPUT, "Invalid JSON");
+            return std::nullopt;
+        } catch (const std::out_of_range&) {
+            log::debug(cat, "Subscription failed: no request data provided");
+            json_error(m, hive::SUBSCRIBE::BAD_INPUT, "Invalid request: missing request data");
+            return std::nullopt;
+        }
+        if (!(args->is_array() || args->is_object())) {
+            log::debug(cat, "Subscription failed: bad json -- expected object or array");
+            json_error(
+                    m,
+                    hive::SUBSCRIBE::BAD_INPUT,
+                    "Invalid JSON: expected object or array of objects");
+            return std::nullopt;
+        }
+
+        return args;
+    }
+
+    struct missing_parameter : std::out_of_range {
+        missing_parameter(std::string_view key) :
+                std::out_of_range{"Missing required parameter '{}'"_format(key)} {}
+    };
+
+    nlohmann::json& at(nlohmann::json& obj, std::string_view key) {
+        try {
+            return obj.at(key);
+        } catch (...) {
+            throw missing_parameter{key};
+        }
+    }
+
+}  // namespace
+
+template <typename Message>
+void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
     ready_or_defer();
 
     nlohmann::json args;
-    try {
-        args = nlohmann::json::parse(m.data.at(0));
-    } catch (const nlohmann::json::exception&) {
-        log::debug(cat, "Subscription failed: bad json");
-        return json_error(m, hive::SUBSCRIBE::BAD_INPUT, "Invalid JSON");
-    } catch (const std::out_of_range&) {
-        log::debug(cat, "Subscription failed: no request data provided");
-        return json_error(m, hive::SUBSCRIBE::BAD_INPUT, "Invalid request: missing request data");
-    }
-    if (!(args.is_array() || args.is_object())) {
-        log::debug(cat, "Subscription failed: bad json -- expected object or array");
-        return json_error(
-                m, hive::SUBSCRIBE::BAD_INPUT, "Invalid JSON: expected object or array of objects");
-    }
+    if (auto a = parse_sub_unsub(msg))
+        args = std::move(*a);
+    else
+        return;
 
     const bool multi = args.is_array();
 
@@ -1131,8 +1254,26 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
         args = std::move(single);
     }
 
+    if (args.empty()) {
+        json_error(msg, hive::SUBSCRIBE::BAD_INPUT, "Invalid request: {} list cannot be empty");
+        return;
+    }
+
     for (auto& e : args)
         response->push_back(nlohmann::json::object());
+
+    std::function<void(std::string_view)> replier;
+    if constexpr (std::same_as<Message, oxenmq::Message>)
+        replier = msg.send_later();
+    else {
+        replier = [reqid = msg.rid(),
+                   wstr = std::weak_ptr{msg.stream()}](std::string_view response) {
+            auto str = wstr.lock();
+            if (!str)
+                return;
+            str->respond(reqid, response);
+        };
+    }
 
     for (size_t i = 0; i < args.size(); i++) {
         auto& e = args[i];
@@ -1147,8 +1288,8 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
             oxenmq::OxenMQ::ReplyCallback reply_handler;
 
             if (subscribe) {
-                auto enc_key = from_hex_or_b64<EncKey>(e.at("enc_key").get<std::string_view>());
-                auto namespaces = e.at("namespaces").get<std::vector<int16_t>>();
+                auto enc_key = from_hex_or_b64<EncKey>(at(e, "enc_key").get<std::string_view>());
+                auto namespaces = at(e, "namespaces").get<std::vector<int16_t>>();
 
                 reply_handler = [this,
                                  response,
@@ -1159,22 +1300,21 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
                                  sub = std::make_shared<hive::Subscription>(  // Throws on bad sig
                                          pubkey,
                                          std::move(subaccount),
-                                         e.at("namespaces").get<std::vector<int16_t>>(),
-                                         e.at("data").get<bool>(),
+                                         at(e, "namespaces").get<std::vector<int16_t>>(),
+                                         at(e, "data").get<bool>(),
                                          std::chrono::sys_seconds{std::chrono::seconds{
-                                                 e.at("sig_ts").get<int64_t>()}},
+                                                 at(e, "sig_ts").get<int64_t>()}},
                                          std::move(sig)),
                                  pubkey = pubkey,
                                  enc_key = std::move(enc_key),
-                                 replier = m.send_later()](
-                                        bool success, std::vector<std::string> data) mutable {
+                                 replier](bool success, std::vector<std::string> data) mutable {
                     on_notifier_validation(
                             *response,
                             i,
                             *remaining,
                             multi,
                             success,
-                            std::move(replier),
+                            replier,
                             std::move(service),
                             std::move(pubkey),
                             std::move(sub),
@@ -1201,15 +1341,14 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
                                  service = service,
                                  pubkey = pubkey,
                                  unsub = UnsubData{std::move(sig), std::move(subaccount), sig_ts},
-                                 replier = m.send_later()](
-                                        bool success, std::vector<std::string> data) mutable {
+                                 replier](bool success, std::vector<std::string> data) mutable {
                     on_notifier_validation(
                             *response,
                             i,
                             *remaining,
                             multi,
                             success,
-                            std::move(replier),
+                            replier,
                             std::move(service),
                             std::move(pubkey),
                             nullptr,
@@ -1226,9 +1365,9 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
                     service,
                     service_info.dump());
 
-        } catch (const std::out_of_range& e) {
-            log::debug(cat, "Sub failed: missing param {}", e.what());
-            error = {hive::SUBSCRIBE::BAD_INPUT, "Missing required parameter"};
+        } catch (const missing_parameter& e) {
+            log::debug(cat, "Request failed: {}", e.what());
+            error = {hive::SUBSCRIBE::BAD_INPUT, e.what()};
         } catch (const hive::subscribe_error& e) {
             error = {e.code, e.what()};
         } catch (const std::exception& e) {
@@ -1245,7 +1384,7 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
                     code,
                     error->second);
             sub_json_set_one_response(
-                    m.send_later(),
+                    replier,
                     *response,
                     i,
                     *remaining,
@@ -1254,6 +1393,29 @@ void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe) {
         }
         // Otherwise the reply is getting deferred and handled later in on_notifier_validation
     }
+}
+template void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe);
+template void HiveMind::on_sub_unsub_impl(quic::message& m, bool subscribe);
+
+void HiveMind::on_quic_request(quic::message& m) {
+    omq_.job([this, m = std::move(m)]() mutable {
+        if (m.endpoint() == "subscribe")
+            handle_quic_subscribe(m);
+        else if (m.endpoint() == "unsubscribe")
+            handle_quic_unsubscribe(m);
+        else if (m.endpoint() == "ping")
+            m.respond("pong");
+        else
+            json_error(m, hive::SUBSCRIBE::BAD_INPUT, "No such endpoint '{}'"_format(m.endpoint()));
+    });
+}
+
+void HiveMind::quic_subscribe(quic::message& m) {
+    on_sub_unsub_impl(m, true);
+}
+
+void HiveMind::quic_unsubscribe(quic::message& m) {
+    on_sub_unsub_impl(m, true);
 }
 
 void HiveMind::on_subscribe(oxenmq::Message& m) {
@@ -1531,7 +1693,7 @@ void HiveMind::finished_connect() {
 }
 
 bool HiveMind::allow_connect() {
-    if (!quic_)
+    if (!quic_out_)
         return false;
 
     int count = ++pending_connects_;

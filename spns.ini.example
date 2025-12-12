@@ -21,12 +21,17 @@ listen = ipc://./hivemind.sock
 # connecting to the listen_curve address.
 listen_curve_admin = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
+# Optional address(es) on which we listen for public quic requests (i.e. subscribe or unsubscribe
+# from clients).  This is an alternative to submitting via onion request can be used instead of
+# OMQ, e.g. over Session Router.  `[keys]:quic` must be set when this option is enabled.
+#
+# The first address in this list that is either an IPv4 address, or the IPv6 any address (`[::]`)
+# will be used for *outgoing* connections to SNs.
+quic_listen = [::]:5522
+
 # OMQ address where we can make RPC requests to oxend.  This can be a local oxend (e.g.
 # ipc:///path/to/oxend.sock), a plaintext address, or a curve-encrypted address with pubkey.
 oxend_rpc = tcp://localhost:22029
-
-# How often (in seconds) the main process re-checks existing subscriptions (for push renewals, expiries, etc.)
-subs_interval = 10
 
 # How many SN connections we attempt to establish at once.  Can be large to make a huge burst of
 # connections at startup, or lower to pace those connections a little more.
@@ -36,15 +41,6 @@ max_connects = 1000
 # controls the minimum time for which we will filter duplicates.  (In practice, the filter will
 # often last somewhat longer than this, but this is the minimum).
 filter_lifetime = 300
-
-# How many separate oxenmq instances to start to talk to network service nodes.  Increasing this can
-# be helpful if a single oxenmq instance (typically the proxy thread) starts bottlenecking under
-# heavy load.  If this is set to 1 or greater then this many extra servers are started and each
-# connection to a remote service node is assigned in round-robin order across the instances, while
-# the main local oxenmq instance will be used only for non-push requests (subscriptions, timers,
-# communication with notifiers, local admin stats endpoints, etc.).  If unset or set to 0 then just
-# one oxenmq instance will be used for everything (both local and push traffic).
-#omq_push_instances = 4
 
 # How long the main hivemind process will wait at startup before establishing connections to
 # the network's service nodes.  This delay is designed to allow subordinate notification processes
@@ -61,18 +57,21 @@ startup_wait = 8.0
 
 [keys]
 
-# This section lists the files containing keys needed by the PN server.  Each file is the 32-bytes
-# private key, either in binary or as a single 64-character hex string.
-#
-# You can generate these X25519 keys using:
+# This section lists the files containing keys needed by the PN server.
+
+
+# These two keys are X25519 keys used for internal hivemind communications and for decode onion
+# requests.  You can generate these X25519 keys using:
 #
 #     ./make-x25519-key.py FILENAME
 #
-
 hivemind = key_x25519
-
 onionreq = onionreq_x25519
 
+# This key is the Ed25519 used for the QUIC listener, if QUIC listening is enabled via the
+# [hivemind] quic_listen option.  You can create it using `session-router-config --key FILENAME`
+# (from the session-router-bin package).
+quic = key_ed25519
 
 [notify-firebase]
 

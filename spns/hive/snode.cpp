@@ -50,9 +50,9 @@ void SNode::connect() {
     if (!hivemind_.allow_connect())
         return;
 
-    conn_ = hivemind_.quic().connect(
+    conn_ = hivemind_.quic_out().connect(
             addr_,
-            hivemind_.creds(),
+            hivemind_.creds_out(),
             [this](quic::Connection& c) { on_connected(c); },
             [this](quic::Connection& c, uint64_t ec) { on_disconnected(c, ec); },
             quic::opt::keep_alive{10s});
@@ -116,7 +116,7 @@ void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
     assert(hivemind_.loop().inside());
     bool is_failed_connect = !connected_.exchange(false);
 
-    if (hivemind_.has_quic()) {
+    if (hivemind_.has_quic_out()) {
         // If we don't have a quic object that means we're shutting down and this is the callback
         // fired during shutdown, so don't do anything.
         if (is_failed_connect) {
@@ -148,7 +148,7 @@ void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
     stream_.reset();
     conn_.reset();
 
-    if (hivemind_.has_quic() && is_failed_connect)
+    if (hivemind_.has_quic_out() && is_failed_connect)
         hivemind_.finished_connect();
 }
 

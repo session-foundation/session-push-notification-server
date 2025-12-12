@@ -4,6 +4,7 @@ import re
 import logging
 import coloredlogs
 from nacl.public import PrivateKey
+from nacl.signing import SigningKey
 from spns.core import Config, logger as core_logger
 import oxenmq
 
@@ -15,8 +16,9 @@ coloredlogs.install(milliseconds=True, isatty=True, logger=logger)
 # Global config; we set values in here, then pass it to HiveMind during startup.
 config = Config()
 
-# Keypairs; the "hivemind" key in here gets set in `config` for the main hivemind instance;
-# "onionreq" is the main onionreq keypair; other keys can be set as well (e.g. for notifiers).
+# Keypairs; the "hivemind" and "quic" keys in here gets set in `config` for the main hivemind
+# instance; "onionreq" is the main onionreq keypair; other keys can be set as well (e.g. for
+# notifiers).
 PRIVKEYS = {}
 PUBKEYS = {}
 
@@ -53,7 +55,9 @@ def load_config():
     if "SPNS_CONFIG" in os.environ:
         conf_ini = os.environ["SPNS_CONFIG"]
         if conf_ini and not os.path.exists(conf_ini):
-            raise RuntimeError(f"SPNS_CONFIG={conf_ini} specified, but path does not exist!")
+            raise RuntimeError(
+                f"SPNS_CONFIG={conf_ini} specified, but path does not exist!"
+            )
     else:
         conf_ini = "spns.ini"
         if not os.path.exists(conf_ini):
@@ -92,7 +96,7 @@ def load_config():
         return (name, lambda x: x in booly, lambda x: x in truthy)
 
     # Map of: section => { param => ('config_property', test lambda, value lambda) }
-    # global is the string name of the global variable to set
+    # config_property is the string name of the config object property to set
     # test lambda returns True/False for validation (if None/omitted, accept anything)
     # value lambda extracts the value (if None/omitted use str value as-is)
     setting_map = {
@@ -102,7 +106,6 @@ def load_config():
             "subs_interval": ("subs_interval", None, int),
             "max_connects": ("max_pending_connects", None, int),
             "filter_lifetime": ("filter_lifetime", None, int),
-            "omq_push_instances": ("omq_push_instances", None, int),
             "startup_wait": ("notifier_wait", None, lambda x: round(1000 * float(x))),
             "notifiers_expected": (
                 "notifiers_expected",
@@ -116,7 +119,15 @@ def load_config():
                 lambda x: re.search("^(?:[a-fA-F0-9]{64}\s+)*[a-fA-F0-9]{64}\s*$", x),
                 lambda x: set(bytes.fromhex(y) for y in x.split() if y),
             ),
-            "oxend_rpc": ("oxend_rpc", lambda x: re.search("^(?:tcp|ipc|curve)://.", x)),
+            "oxend_rpc": (
+                "oxend_rpc",
+                lambda x: re.search("^(?:tcp|ipc|curve)://.", x),
+            ),
+            "quic_listen": (
+                "quic_listen",
+                lambda x: re.search(r"^(?:(?:\[[0-9a-fA-F:.]+\]|(?:\d+\.){3}\d+):\d+(?=\s|$)\s*)+$", x),
+                lambda x: [y for y in x.split() if y],
+            ),
         },
     }
 
@@ -144,15 +155,22 @@ def load_config():
     for s in cp.sections():
         if s == "keys":
             for opt in cp["keys"]:
+                rawlen = None
+                if opt in ("hivemind", "onionreq"):
+                    rawlen = 32
+                elif opt in ("quic"):
+                    rawlen = 64
+                else:
+                    raise RuntimeError(f"Don't know key type for key '{opt}'")
+
+                keybytes = None
                 filename = cp["keys"][opt]
                 with open(filename, "rb") as f:
                     keybytes = f.read()
-                    if len(keybytes) == 32:
-                        privkey = PrivateKey(keybytes)
-                    else:
+                    if len(keybytes) >= 2 * rawlen:
                         # Assume hex-encoded
                         keyhex = keybytes.decode().strip()
-                        if len(keyhex) != 64:
+                        if len(keyhex) != 2 * rawlen:
                             raise RuntimeError(
                                 f"Could not read '{filename}' for option [keys]{opt}: invalid file size"
                             )
@@ -161,22 +179,41 @@ def load_config():
                                 f"Could not read '{filename}' for option [keys]{opt}: expected bytes or hex"
                             )
 
-                        privkey = PrivateKey(bytes.fromhex(keyhex))
-                    PRIVKEYS[opt] = privkey
-                    PUBKEYS[opt] = privkey.public_key
+                        keybytes = bytes.fromhex(keyhex)
+
+                    elif len(keybytes) != rawlen:
+                        raise RuntimeError(
+                            f"Could not read '{filename}' for option [keys]{opt}: invalid file size"
+                        )
+
+                    if rawlen == 32:  # X25519 privkey
+                        PRIVKEYS[opt] = PrivateKey(keybytes)
+                        PUBKEYS[opt] = PRIVKEYS[opt].public_key
+                    else:
+                        PRIVKEYS[opt] = SigningKey(keybytes[0:32])
+                        PUBKEYS[opt] = PRIVKEYS[opt].verify_key
+
+                        if PUBKEYS[opt].encode() != keybytes[32:]:
+                            raise RuntimeError(
+                                f"[keys]{opt} keypair invalid: seed (bytes 0-31) does not yield pubkey (bytes 32-63)"
+                            )
 
                     logger.info(
-                        f"Loaded {opt} X25519 keypair with pubkey {PUBKEYS[opt].encode().hex()}"
+                        f"Loaded {opt} keypair with pubkey {PUBKEYS[opt].encode().hex()}"
                     )
         elif s == "log":
             for opt in cp["log"]:
                 if opt == "level":
                     core_logger.set_level(cp["log"][opt])
                 elif opt.startswith("level-") and len(opt) > 6:
-                    logger.warning(f"{opt} = ... is deprecated; use a compound level=... instead")
+                    logger.warning(
+                        f"{opt} = ... is deprecated; use a compound level=... instead"
+                    )
                     core_logger.set_level(f'{opt[6:]}={cp["log"][opt]}')
                 else:
-                    logger.warning(f"Ignoring unknown log item [log] {opt} in {conf_ini}")
+                    logger.warning(
+                        f"Ignoring unknown log item [log] {opt} in {conf_ini}"
+                    )
 
         elif s.startswith("notify-"):
             for opt in cp[s]:
@@ -189,8 +226,11 @@ def load_config():
         else:
             logger.warning(f"Ignoring unknown section [{s}] in {conf_ini}")
 
-    config.privkey = PRIVKEYS["hivemind"].encode()
-    config.pubkey = PUBKEYS["hivemind"].encode()
+    config.omq_privkey = PRIVKEYS["hivemind"].encode()
+    config.omq_pubkey = PUBKEYS["hivemind"].encode()
+
+    if "quic" in PRIVKEYS:
+        config.quic_keys = PRIVKEYS["quic"].encode() + PUBKEYS["quic"].encode()
 
 
 try:

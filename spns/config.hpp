@@ -4,8 +4,8 @@
 
 #include <chrono>
 #include <optional>
+#include <oxen/quic/address.hpp>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 
 #include "bytes.hpp"
@@ -27,8 +27,15 @@ struct Config {
     std::unordered_set<X25519PK> hivemind_curve_admin;
 
     // The main hivemind omq listening keypair.  Must be set explicitly.
-    X25519PK pubkey;
-    X25519SK privkey;
+    X25519PK omq_pubkey;
+    X25519SK omq_privkey;
+
+    // Listening address(es) for QUIC
+    std::vector<oxen::quic::Address> quic_listen;
+
+    // The Ed25519 keypair to use for QUIC connections.  This is the 64-byte libsodium secret key
+    // value (i.e. the 32 byte seed followed by 32 byte pubkey).
+    std::optional<Ed25519Secret> quic_keys;
 
     std::chrono::seconds filter_lifetime = 10min;
 
@@ -39,15 +46,6 @@ struct Config {
     // If non-empty then we stop waiting (i.e. before `notifier_wait`) for new notifiers once we
     // have a registered notifier for all of the services in this set.
     std::unordered_set<std::string> notifiers_expected;
-
-    // How often we recheck for re-subscriptions for push renewals, expiries, etc.
-    std::chrono::seconds subs_interval = 30s;
-
-    // Number of extra oxenmq instances to start up for push notifications.  If 0 then no extra ones
-    // are started and just the main oxenmq instance is used for everything.  The extra instances
-    // are used exlusively for push notifications; each connection to a new SN is round-robin
-    // assigned across the instances.
-    int omq_push_instances = 0;
 
     // Maximum connections we will attempt to establish simultaneously (we can have more, we just
     // won't try to open more than this at once until some succeed or fail).  You can set this to 0

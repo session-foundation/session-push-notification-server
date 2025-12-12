@@ -55,6 +55,7 @@ concept bytes_subtype = is_bytes<T>;
 
 struct AccountID : bytes<33> {};
 struct Ed25519PK : bytes<32> {};
+struct Ed25519Secret : bytes<64> {};
 struct X25519PK : bytes<32> {};
 struct X25519SK : bytes<32> {};
 struct SubaccountTag : bytes<36> {};
