@@ -45,7 +45,7 @@ import coloredlogs
 
 from .. import config
 from ..config import logger
-from ..core import SUBSCRIBE
+from spns_hivemind import SUBSCRIBE
 from .util import encrypt_notify_payload, derive_notifier_key, warn_on_except, NotifyStats
 
 import oxenc

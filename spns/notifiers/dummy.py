@@ -11,7 +11,7 @@ import systemd.daemon
 from .util import derive_notifier_key, warn_on_except
 from .. import config
 from ..config import logger
-from ..core import SUBSCRIBE
+from spns_hivemind import SUBSCRIBE
 from datetime import timedelta
 
 omq = None

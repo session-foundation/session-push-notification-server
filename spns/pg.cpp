@@ -69,7 +69,9 @@ std::unique_ptr<pqxx::connection> PGConnPool::make_conn() {
     log::debug(cat, "Creating pg connection");
     std::lock_guard lock{mutex_};
     count_++;
-    return std::make_unique<pqxx::connection>(pg_connect_);
+    auto conn = std::make_unique<pqxx::connection>(pg_connect_);
+    conn->set_client_encoding("UTF8");
+    return conn;
 }
 
 PGConn::~PGConn() {

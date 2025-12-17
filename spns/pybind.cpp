@@ -70,7 +70,7 @@ struct type_caster<oxen::quic::Address> {
 };
 }  // namespace pybind11::detail
 
-PYBIND11_MODULE(core, m) {
+PYBIND11_MODULE(spns_hivemind, m) {
 
     using namespace spns;
 
@@ -148,17 +148,6 @@ PYBIND11_MODULE(core, m) {
 
     class Logger {};
     py::class_<Logger>{m, "logger"}
-            .def_static(
-                    "start",
-                    [](const std::string& out) {
-                        oxen::log::clear_sinks();
-                        if (out == "stdout" || out == "-" || out == "")
-                            oxen::log::add_sink(oxen::log::Type::Print, "stdout");
-                        else if (out == "stderr")
-                            oxen::log::add_sink(oxen::log::Type::Print, "stderr");
-                        else
-                            oxen::log::add_sink(oxen::log::Type::File, out);
-                    })
             .def_static(
                     "set_level",
                     [](std::string_view cat_levels) { oxen::log::apply_categories(cat_levels); },

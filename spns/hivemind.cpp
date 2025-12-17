@@ -271,9 +271,6 @@ HiveMind::HiveMind(Config conf_in) :
         throw;
     }
 
-    // std::this_thread::sleep_for(5s);
-    // throw std::runtime_error{"DEBUG"};
-
     notify_proc_thread_ = std::thread{[this] { process_notifications(); }};
 
     loop_.call_get([this] {
