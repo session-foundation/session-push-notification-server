@@ -321,20 +321,19 @@ HiveMind::HiveMind(Config conf_in) :
         log::info(cat, "Connected to oxend");
 
         sd_notify(0, "READY=1\nSTATUS=Waiting for notifiers");
-
-        if (config.notifier_wait > 0s) {
-            // Wait for notification servers that start up before or alongside us to connect:
-            auto wait_until = steady_clock::now() + config.notifier_wait;
-            log::info(
-                    cat,
-                    "Waiting for notifiers to register (max {})",
-                    wait_until - steady_clock::now());
-            while (!notifier_startup_done(wait_until)) {
-                std::this_thread::sleep_for(25ms);
-            }
-            log::info(cat, "Done waiting for notifiers; {} registered", services_.size());
-        }
     });
+
+    if (config.notifier_wait > 0s) {
+        // Wait for notification servers that start up before or alongside us to connect:
+        auto wait_until = steady_clock::now() + config.notifier_wait;
+        log::info(
+                cat,
+                "Waiting for notifiers to register (max {})",
+                wait_until - steady_clock::now());
+        while (!loop_.call_get([this, wait_until] { return notifier_startup_done(wait_until); }))
+            std::this_thread::sleep_for(25ms);
+        log::info(cat, "Done waiting for notifiers; {} registered", services_.size());
+    }
 
     // Set our ready flag, and process any requests that accumulated while we were starting up.
     set_ready();
