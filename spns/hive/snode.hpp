@@ -33,7 +33,7 @@ using namespace std::literals;
 
 // Maximum number of simultaneous subscriptions in a single subscription request to a single SN; if
 // we have more than this then we send this many and wait for the response before sending more.
-inline constexpr size_t SUBS_REQUEST_LIMIT = 5000;
+inline constexpr size_t SUBS_REQUEST_LIMIT = 2000;
 
 // How long (in seconds) after a successful subscription before we re-subscribe; each subscription
 // gets a uniform random value between these two values (to spread out the renewal requests a bit).
