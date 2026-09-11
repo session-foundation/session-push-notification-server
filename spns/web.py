@@ -7,7 +7,7 @@ from uwsgidecorators import postfork
 
 app = flask.Flask(__name__)
 coloredlogs.install(
-    milliseconds=True, isatty=True, logger=app.logger, level=config.core_logger.get_level()
+    milliseconds=True, isatty=True, logger=app.logger, level=coloredlogs.DEFAULT_LOG_LEVEL
 )
 
 # Monkey-patch app.get/post/etc. for Flask <2 compatibility; this has to be before the imports,

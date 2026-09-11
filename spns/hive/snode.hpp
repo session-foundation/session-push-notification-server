@@ -1,7 +1,5 @@
 #pragma once
 
-#include <oxenmq/oxenmq.h>
-
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -10,6 +8,10 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <oxen/quic/btstream.hpp>
+#include <oxen/quic/connection.hpp>
+#include <oxen/quic/connection_ids.hpp>
+#include <oxen/quic/endpoint.hpp>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -25,23 +27,27 @@ class HiveMind;
 
 namespace spns::hive {
 
+namespace quic = oxen::quic;
+
 using namespace std::literals;
 
-// Maximum size of simultaneous subscriptions in a single subscription request; if we overflow then
-// any stragglers wait until the next request, delaying them by a few seconds.  (This is not a rock
-// hard limit: we estimate slightly and stop as soon as we exceed it, which means we can go over it
-// a bit after appending the last record).
-inline constexpr size_t SUBS_REQUEST_LIMIT = 5'000'000;
+// Maximum number of simultaneous subscriptions in a single subscription request to a single SN; if
+// we have more than this then we send this many and wait for the response before sending more.
+inline constexpr size_t SUBS_REQUEST_LIMIT = 2000;
 
 // How long (in seconds) after a successful subscription before we re-subscribe; each subscription
 // gets a uniform random value between these two values (to spread out the renewal requests a bit).
 inline constexpr std::chrono::seconds RESUBSCRIBE_MIN = 45min;
 inline constexpr std::chrono::seconds RESUBSCRIBE_MAX = 55min;
 
-// How long we wait (in seconds) after a connection failure to a snode storage server before
+// How long we wait (in seconds) after a failed connection attempt to a snode storage server before
 // re-trying the connection; we use the first value after the first failure, the second one after
 // the second failure, and so on (if we run off the end we use the last value).
 inline constexpr std::array CONNECT_COOLDOWN = {10s, 30s, 60s, 120s};
+
+// How long are a disconnection from a SNode until we attempt to reconnect.  If the reconnection
+// fails then we enter the cooldown, above.
+inline constexpr auto RECONNECT_WAIT = 1s;
 
 template <typename T, typename = std::enable_if_t<is_bytes<T>>>
 inline std::string_view as_sv(const T& data) {
@@ -52,15 +58,12 @@ class SNode {
     // Class managing a connection to a single service node
 
     HiveMind& hivemind_;
-    oxenmq::OxenMQ& omq_;
-    oxenmq::ConnectionID conn_;
-    oxenmq::address addr_;
+    std::shared_ptr<quic::Connection> conn_;
+    quic::RemoteAddress addr_;
+    std::shared_ptr<quic::BTRequestStream> stream_;
     std::atomic<bool> connected_ = false;
     std::unordered_set<SwarmPubkey> subs_;
     uint64_t swarm_;
-
-    std::mutex mutex_;  // Mutex for our local stuff; we must *never* do something with hivemind
-                        // that requires a (HiveMind) lock while we hold this.
 
     using system_clock = std::chrono::system_clock;
     using steady_clock = std::chrono::steady_clock;
@@ -78,7 +81,7 @@ class SNode {
   public:
     const uint64_t& swarm{swarm_};
 
-    SNode(HiveMind& hivemind, oxenmq::OxenMQ& omq, oxenmq::address addr, uint64_t swarm);
+    SNode(HiveMind& hivemind, quic::RemoteAddress addr, uint64_t swarm);
 
     ~SNode() { disconnect(); }
 
@@ -87,7 +90,7 @@ class SNode {
     /// address.
     ///
     /// Does nothing if already connected to the given address.
-    void connect(oxenmq::address addr);
+    void connect(quic::RemoteAddress addr);
 
     /// Initiates a connection, if not already connected, to the current address.
     void connect();
@@ -95,10 +98,6 @@ class SNode {
     bool connected() { return connected_; }
 
     void disconnect();
-
-    void on_connected(oxenmq::ConnectionID c);
-
-    void on_connect_fail(oxenmq::ConnectionID c, std::string_view reason);
 
     /// Adds a new account to be signed up for subscriptions, if it is not already subscribed.
     /// The new account's subscription will be submitted to the SS the next time check_subs() is
@@ -123,18 +122,15 @@ class SNode {
     /// Check our subscriptions to resubscribe to any that need it.  Takes a reference to hivemind's
     /// master list of all subscriptions (to be able to pull subscription details from).
     ///
-    /// If initial_subs is true then this is the initial request and we fire off a batch of
-    /// subscriptions and then another batch upon reply, etc. until there are no more subs to send;
-    /// otherwise we fire off just up to SUBS_LIMIT re-subscriptions.
-    ///
-    /// If `fast` is true then we only look for and process unix-epoch leading elements, which are
-    /// the ones we put on we a brand new subscription comes in.
-    ///
     /// This method is *only* called from HiveMind.
-    void check_subs(
-            const std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>>& subs,
-            bool initial_subs = false,
-            bool fast = false);
+    void check_subs(const std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>>& subs);
+
+  private:
+    void on_connected(quic::Connection& c);
+
+    void on_disconnected(quic::Connection& c, uint64_t errcode);
+
+    void on_notify(quic::message msg);
 };
 
 }  // namespace spns::hive

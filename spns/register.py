@@ -1,6 +1,6 @@
 from . import web
 from .web import app
-from .core import SUBSCRIBE
+from spns_hivemind import SUBSCRIBE
 from flask import request, jsonify, Response
 
 

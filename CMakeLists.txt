@@ -1,5 +1,5 @@
 
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.20)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -20,7 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-add_library(spns STATIC
+add_library(spns-hivemind SHARED
     spns/hivemind.cpp
     spns/pg.cpp
     spns/swarmpubkey.cpp
@@ -35,6 +35,8 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.18)
 pkg_check_modules(OXENC REQUIRED IMPORTED_TARGET liboxenc>=1.4.0)
 pkg_check_modules(OXENMQ REQUIRED IMPORTED_TARGET liboxenmq>=1.2.22)
+pkg_check_modules(LIBQUIC REQUIRED IMPORTED_TARGET liboxenquic>=1.7)
+pkg_check_modules(FMT REQUIRED IMPORTED_TARGET fmt>=10)
 pkg_check_modules(OXENLOGGING REQUIRED IMPORTED_TARGET liboxen-logging>=1.2.0)
 pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json>=3.7.0)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
@@ -52,26 +54,44 @@ endif()
 include(cmake/submodule_check.cmake)
 include(cmake/system_or_submodule.cmake)
 
-system_or_submodule(LIBPQXX libpqxx libpqxx::pqxx libpqxx>=7.10.0 libpqxx)
+system_or_submodule(LIBPQXX libpqxx libpqxx::pqxx libpqxx>=8 libpqxx)
 
-target_link_libraries(spns PRIVATE
+target_link_libraries(spns-hivemind PRIVATE
     PkgConfig::SODIUM
     PkgConfig::OXENC
     PkgConfig::OXENMQ
-    PkgConfig::OXENLOGGING
+    PkgConfig::LIBQUIC
     PkgConfig::NLOHMANN_JSON
     PkgConfig::SYSTEMD
     PUBLIC
-    libpqxx::pqxx)
+    libpqxx::pqxx
+    PkgConfig::OXENLOGGING
+    PkgConfig::FMT)
 
-set_target_properties(spns PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
+set_target_properties(spns-hivemind PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 
 set(PYBIND11_FINDPYTHON ON CACHE INTERNAL "")
 add_subdirectory(pybind11)
 pybind11_add_module(
-    core
+    spns_hivemind
     spns/pybind.cpp)
+target_link_libraries(spns_hivemind PUBLIC spns-hivemind)
 
-target_link_libraries(core PUBLIC spns)
-set_target_properties(core PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/spns)
+add_executable(spns spns/main.cpp)
+target_link_libraries(spns PUBLIC spns-hivemind PRIVATE pybind11::embed)
+set_target_properties(spns PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+    OUTPUT_NAME SPNS)
+
+include(GNUInstallDirs)
+install(TARGETS spns spns-hivemind
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+execute_process(COMMAND ${Python_EXECUTABLE} -m site --user-site
+    OUTPUT_VARIABLE PYTHON_USER_SITE
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+install(TARGETS spns_hivemind DESTINATION ${PYTHON_USER_SITE})
+cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_PREFIX NORMALIZE OUTPUT_VARIABLE install_path)
+set_target_properties(spns_hivemind PROPERTIES INSTALL_RPATH "${install_path}/${CMAKE_INSTALL_LIBDIR}")

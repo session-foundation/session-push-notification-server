@@ -1,8 +1,10 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
 #include <pybind11/stl.h>
 
 #include <memory>
 #include <oxen/log.hpp>
+#include <oxen/log/level.hpp>
 
 #include "bytes.hpp"
 #include "config.hpp"
@@ -41,9 +43,34 @@ struct type_caster<T, std::enable_if_t<spns::is_bytes<T>>> {
         return py::bytes(reinterpret_cast<const char*>(src.data()), src.size());
     }
 };
+
+template <>
+struct type_caster<oxen::quic::Address> {
+    PYBIND11_TYPE_CASTER(oxen::quic::Address, const_name("quic_address"));
+
+    bool load(handle src, bool) {
+        if (py::isinstance<py::str>(src)) {
+            value = oxen::quic::Address::parse(py::cast<std::string>(src));
+            if (value.is_ipv6() && value.is_any_addr())
+                value.dual_stack = true;
+            return true;
+        }
+        return false;
+    }
+
+    static handle cast(
+            const oxen::quic::Address& src, return_value_policy /* policy */, handle /* parent */) {
+        return py::str(fmt::format(
+                "{}{}{}:{}",
+                src.is_ipv6() ? "[" : "",
+                src.host(),
+                src.is_ipv6() ? "]" : "",
+                src.port()));
+    }
+};
 }  // namespace pybind11::detail
 
-PYBIND11_MODULE(core, m) {
+PYBIND11_MODULE(spns_hivemind, m) {
 
     using namespace spns;
 
@@ -78,13 +105,21 @@ PYBIND11_MODULE(core, m) {
                     "set of X25519 pubkeys recognized as admin for incoming `hivemind_curve` "
                     "connections")
             .def_readwrite(
-                    "pubkey",
-                    &Config::pubkey,
+                    "omq_pubkey",
+                    &Config::omq_pubkey,
                     "X25519 server pubkey; must be set (the default value will not work)")
             .def_readwrite(
-                    "privkey",
-                    &Config::privkey,
+                    "omq_privkey",
+                    &Config::omq_privkey,
                     "X25519 server privkey; must be set (the default value will not work)")
+            .def_readwrite(
+                    "quic_keys",
+                    &Config::quic_keys,
+                    "Ed25519 combined secret key + pubkey value (64 bytes), used for QUIC.")
+            .def_readwrite(
+                    "quic_listen",
+                    &Config::quic_listen,
+                    "Optional listen addresses for quic (requires that `quic_key` is set)")
             .def_property(
                     "filter_lifetime",
                     [](Config& self) { return self.filter_lifetime.count(); },
@@ -104,19 +139,6 @@ PYBIND11_MODULE(core, m) {
                     "Set of notification services that we expect; if non-empty then we will stop "
                     "the `notifier_wait` time early once we have registered notifiers for all the "
                     "values set here.")
-            .def_property(
-                    "subs_interval",
-                    [](Config& self) { return self.subs_interval.count(); },
-                    [](Config& self, int64_t seconds) { self.subs_interval = 1s * seconds; },
-                    "how frequently, in seconds, between subscription rechecks (for push renewals, "
-                    "expiries, etc.)")
-            .def_readwrite(
-                    "omq_push_instances",
-                    &Config::omq_push_instances,
-                    "How many dedicated oxenmq instances to use for handle push notifications; if "
-                    "1 or greater then this many separate oxenmq instances will be started to deal "
-                    "with push requests; if 0 then the main oxenmq server will be used for "
-                    "everything.")
             .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,
@@ -127,50 +149,10 @@ PYBIND11_MODULE(core, m) {
     class Logger {};
     py::class_<Logger>{m, "logger"}
             .def_static(
-                    "start",
-                    [](const std::string& out) {
-                        oxen::log::clear_sinks();
-                        if (out == "stdout" || out == "-" || out == "")
-                            oxen::log::add_sink(oxen::log::Type::Print, "stdout");
-                        else if (out == "stderr")
-                            oxen::log::add_sink(oxen::log::Type::Print, "stderr");
-                        else
-                            oxen::log::add_sink(oxen::log::Type::File, out);
-                    })
-            .def_static(
                     "set_level",
-                    [](const std::string& level) {
-                        oxen::log::reset_level(oxen::log::level_from_string(level));
-                    },
-                    "Sets/resets the log level of all spns.core log categories to the given "
-                    "value.\n"
-                    "Can be any of 'trace', 'debug', 'info', 'warn', 'error', 'critical', or "
-                    "'none'.",
-                    "level"_a)
-            .def_static(
-                    "set_level",
-                    [](const std::string& cat, const std::string& level) {
-                        oxen::log::set_level(cat, oxen::log::level_from_string(level));
-                    },
-                    "Sets/resets the log level of a single spns.core log categories to the given "
-                    "value.\n"
-                    "Can be any of 'trace', 'debug', 'info', 'warning', 'error', 'critical', or "
-                    "'none'.",
-                    "category"_a,
-                    "level"_a)
-            .def_static(
-                    "get_level",
-                    [](const std::string& cat) { oxen::log::get_level(cat); },
-                    "Gets the log level of the given spns.core log category")
-            .def_static(
-                    "get_level",
-                    [](const std::string& cat) { oxen::log::get_level(cat); },
-                    "Gets the log level of the given spns.core log category")
-            .def_static(
-                    "get_level",
-                    []() { oxen::log::get_level_default(); },
-                    "Gets the default log level of spns.core categories (those that have not been "
-                    "changed via a category-specific `set_level`)")
+                    [](std::string_view cat_levels) { oxen::log::apply_categories(cat_levels); },
+                    "Sets/resets the log level; can be a global level (e.g. 'info') or individual "
+                    "'cat=debug' level values")
             //
             ;
 

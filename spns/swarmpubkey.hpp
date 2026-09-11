@@ -18,7 +18,7 @@ struct SwarmPubkey {
     mutable uint64_t swarm;
 
     bool operator==(const SwarmPubkey& other) const { return id == other.id; }
-    bool operator!=(const SwarmPubkey& other) const { return !(*this == other); }
+    bool operator!=(const SwarmPubkey& other) const = default;
 
     SwarmPubkey(AccountID account_id, std::optional<Ed25519PK> ed, bool _skip_validation = false);
 

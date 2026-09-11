@@ -1,10 +1,10 @@
 #pragma once
 
 #include <fmt/format.h>
-#include <oxen/log/format.hpp>
 
 #include <charconv>
 #include <chrono>
+#include <oxen/log/format.hpp>
 #include <string>
 #include <vector>
 

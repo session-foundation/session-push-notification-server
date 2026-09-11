@@ -12,7 +12,7 @@ Type=notify
 WatchdogSec=1min
 WorkingDirectory=/home/push/session-push-notification-server
 Restart=always
-RestartSec=5s
+RestartSec=2s
 ExecStart=/usr/bin/python3 -mspns.notifiers.%i
 
 [Install]

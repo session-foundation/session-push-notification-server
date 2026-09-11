@@ -1,15 +1,12 @@
 #pragma once
 
-#include <array>
-#include <charconv>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <limits>
 #include <optional>
+#include <pqxx/array>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "../bytes.hpp"
 #include "../swarmpubkey.hpp"
@@ -40,12 +37,13 @@ class subscribe_error : public std::runtime_error {
 };
 
 struct Subscription {
-    static constexpr std::chrono::seconds SIGNATURE_EXPIRY{14 * 24h};
+    static constexpr auto SIGNATURE_EXPIRY = 14 * 24h;
+    static constexpr auto SIGNATURE_EARLY = 24h;
 
     std::optional<Subaccount> subaccount;
     std::vector<int16_t> namespaces;
     bool want_data;
-    int64_t sig_ts;
+    std::chrono::sys_seconds sig_ts;
     Signature sig;
 
     Subscription(
@@ -53,9 +51,11 @@ struct Subscription {
             std::optional<Subaccount> subaccout_,
             std::vector<int16_t> namespaces_,
             bool want_data_,
-            int64_t sig_ts_,
+            std::chrono::sys_seconds sig_ts_,
             Signature sig_,
-            bool _skip_validation = false);
+            bool _skip_validation = false,
+            std::chrono::sys_seconds now =
+                    std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now()));
 
     // Returns true if `this` and `other` represent the same subscription as far as upstream swarm
     // subscription is concerned.  That is: same subaccount tag, same namespaces, and same want_data
@@ -64,12 +64,16 @@ struct Subscription {
     bool is_same(const Subscription& other) const {
         return is_same(other.subaccount, other.namespaces, other.want_data);
     }
-    // Same as above, but takes the constituent parts.
+
+    // Similar to the above, but takes a pqxx::array for comparison (to allow comparison before
+    // construction of the Subscription object).
     bool is_same(
             const std::optional<Subaccount>& o_subaccount,
             const std::vector<int16_t>& o_namespaces,
             bool o_want_data) const {
-        return Subaccount::is_same(subaccount, o_subaccount) && namespaces == o_namespaces &&
+        return Subaccount::is_same(subaccount, o_subaccount) &&
+               namespaces.size() == o_namespaces.size() &&
+               std::equal(namespaces.cbegin(), namespaces.cend(), o_namespaces.cbegin()) &&
                want_data == o_want_data;
     }
 
@@ -79,7 +83,7 @@ struct Subscription {
     // *only* valid for two Subscriptions referring to the same account!
     bool covers(const Subscription& other) const;
 
-    bool is_expired(int64_t now) const { return sig_ts < now - SIGNATURE_EXPIRY.count(); }
+    bool is_expired(std::chrono::sys_seconds now) const { return now - sig_ts >= SIGNATURE_EXPIRY; }
 
     bool is_newer(const Subscription& other) const { return sig_ts > other.sig_ts; }
 };

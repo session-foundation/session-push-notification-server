@@ -23,6 +23,9 @@
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
+#include <oxen/quic/crypto.hpp>
+#include <oxen/quic/endpoint.hpp>
+#include <oxen/quic/loop.hpp>
 #include <oxenmq/zmq.hpp>
 #include <string>
 #include <tuple>
@@ -40,6 +43,8 @@
 #include "utils.hpp"
 
 namespace spns {
+
+namespace quic = oxen::quic;
 
 // How long until we expire subscriptions (relative to the signature timestamp).  This can be no
 // more than 14 days (because that's the subscription cutoff for storage server), but can also be
@@ -61,7 +66,7 @@ inline constexpr size_t MSG_DATA_MAX_SIZE = 76'800;  // Storage server limit
 inline constexpr auto _get_sns_params = R"({
   "active_only": true,
   "fields": {
-    "pubkey_x25519": true,
+    "pubkey_ed25519": true,
     "public_ip": true,
     "storage_lmq_port": true,
     "swarm_id": true,
@@ -80,34 +85,35 @@ struct startup_request_defer {};
 class ExcWrapper {
   private:
     HiveMind& hivemind;
-    void (HiveMind::*const meth)(oxenmq::Message&);
+    std::variant<
+            void (HiveMind::* const)(oxenmq::Message&),
+            void (HiveMind::* const)(quic::message&)>
+            meth;
     const std::string meth_name;
-    bool is_json_request;
 
   public:
     ExcWrapper(
-            HiveMind& hivemind,
-            void (HiveMind::*meth)(oxenmq::Message&),
-            std::string meth_name,
-            bool is_json_request = false) :
-            hivemind{hivemind},
-            meth{meth},
-            meth_name{std::move(meth_name)},
-            is_json_request{is_json_request} {}
+            HiveMind& hivemind, void (HiveMind::*meth)(oxenmq::Message&), std::string meth_name) :
+            hivemind{hivemind}, meth{meth}, meth_name{std::move(meth_name)} {}
+
+    ExcWrapper(HiveMind& hivemind, void (HiveMind::*meth)(quic::message&), std::string meth_name) :
+            hivemind{hivemind}, meth{meth}, meth_name{std::move(meth_name)} {}
 
     void operator()(oxenmq::Message& m);
+    void operator()(quic::message& m);
 };
 
 // If requests arrive during startup we copy the request here to defer calling until after
 // startup completes.
 struct DeferredRequest {
-    oxenmq::Message message;
+    std::variant<oxenmq::Message, quic::message> message;
     std::vector<std::string> data;
     ExcWrapper& callback;
 
     DeferredRequest(oxenmq::Message&& m, ExcWrapper& callback);
+    DeferredRequest(quic::message&& m, ExcWrapper& callback);
 
-    void operator()() && { callback(message); }
+    void operator()() && { std::visit(callback, message); }
 };
 
 class HiveMind {
@@ -116,15 +122,22 @@ class HiveMind {
     const Config config;
 
   private:
-    std::mutex mutex_;
-    // OxenMQ server for internal communications, proxied subscriptions, etc.
+    // std::mutex mutex_;
+    //  OxenMQ server for internal communications, proxied subscriptions, etc.
     oxenmq::OxenMQ omq_;
-    // OxenMQ *clients* that connect to service nodes, if the omq_push_instances setting is used.
-    std::list<oxenmq::OxenMQ> omq_push_;
-    decltype(omq_push_)::iterator omq_push_next_;
+
+    // QUIC endpoint used to connect to service nodes (for receiving pushes)
+    quic::Loop loop_;
+    std::shared_ptr<quic::TLSCreds> creds_out_, creds_in_;
+    std::list<std::shared_ptr<quic::Endpoint>> quic_in_;
+    std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
+                                                // if there is a suitable one for outbound use.
+
+    std::shared_ptr<quic::Ticker> subs_ticker_;
+
     PGConnPool pool_;
 
-    const int object_id_; // Thread-safe unique id for this HiveMind object
+    const int object_id_;  // Thread-safe unique id for this HiveMind object
     zmq::context_t notification_ctx_{};
     zmq::socket_t notify_pull_{notification_ctx_, zmq::socket_type::pull};
     std::thread notify_proc_thread_;
@@ -133,8 +146,8 @@ class HiveMind {
     zmq::socket_t& notify_push_sock();
     std::atomic<int64_t> pushes_processed_{0};
 
-    // xpk -> SNode
-    std::unordered_map<X25519PK, std::shared_ptr<hive::SNode>> sns_;
+    // edpk -> SNode
+    std::unordered_map<Ed25519PK, std::shared_ptr<hive::SNode>> sns_;
     // swarmid -> {SNode...}
     std::unordered_map<uint64_t, std::unordered_set<std::shared_ptr<hive::SNode>>> swarms_;
 
@@ -167,9 +180,6 @@ class HiveMind {
     // Will be set to true once we are ready to start taking requests
     std::atomic<bool> ready{false};
 
-    // Set to true if we have new subs we need to deal with ASAP
-    std::atomic<bool> have_new_subs_{false};
-
     void ready_or_defer() {
         if (!ready)
             throw startup_request_defer{};
@@ -182,6 +192,7 @@ class HiveMind {
     std::mutex deferred_mutex_;
     std::list<DeferredRequest> deferred_;
     void defer_request(oxenmq::Message&& m, ExcWrapper& callback);
+    void defer_request(quic::message&& m, ExcWrapper& callback);
 
   public:
     HiveMind(Config conf_);
@@ -190,8 +201,6 @@ class HiveMind {
 
   private:
     void on_reg_service(oxenmq::Message& m);
-
-    void on_message_notification(oxenmq::Message& m);
 
     void process_notifications();
 
@@ -211,12 +220,12 @@ class HiveMind {
     /// integer and string values are permitted (+keys only allow integers).
     void on_service_stats(oxenmq::Message& m);
 
-    nlohmann::json get_stats_json();
+    void get_stats_json(std::function<void(nlohmann::json)> when_ready);
 
     void on_get_stats(oxenmq::Message& m);
 
     std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now() - 1h;
-    void log_stats(std::string_view pre_cmd = "WATCHDOG=1"sv);
+    void log_stats(std::string pre_cmd = "WATCHDOG=1"s);
 
     using UnsubData = std::tuple<Signature, std::optional<Subaccount>, int64_t>;
     void on_notifier_validation(
@@ -225,7 +234,7 @@ class HiveMind {
             std::atomic<int>& remaining,
             bool multi,
             bool success,
-            oxenmq::Message::DeferredSend replier,
+            const std::function<void(std::string_view response)>& replier,
             std::string service,
             const SwarmPubkey& pubkey,
             std::shared_ptr<hive::Subscription> sub,
@@ -246,9 +255,16 @@ class HiveMind {
 
     oxenmq::ConnectionID sub_unsub_service_conn(const std::string& service);
 
+    void on_quic_request(quic::message& m);
+    void quic_subscribe(quic::message& m);
+    void quic_unsubscribe(quic::message& m);
+    ExcWrapper handle_quic_subscribe{*this, &HiveMind::quic_subscribe, "quic_subscribe"};
+    ExcWrapper handle_quic_unsubscribe{*this, &HiveMind::quic_unsubscribe, "quic_unsubscribe"};
+
     void on_subscribe(oxenmq::Message& m);
     void on_unsubscribe(oxenmq::Message& m);
-    void on_sub_unsub_impl(oxenmq::Message& m, bool subscribe);
+    template <typename Message>
+    void on_sub_unsub_impl(Message& m, bool subscribe);
 
     void db_cleanup();
 
@@ -257,12 +273,11 @@ class HiveMind {
 
     void on_sns_response(std::vector<std::string> data);
 
-    // Re-checks all SN subscriptions; the mutex must be held externally.  `fast` is whether this is
-    // a quick, only-new-subs check or a regular check.
-    void check_subs(bool fast = false);
+    // Re-checks all SN subscriptions for and new subscriptions or needed resubscriptions; must be
+    // called on the loop_ thread.
+    void check_subs();
 
-    void subs_slow();
-    void subs_fast();
+    void make_conns();
 
   public:
     /// Called when initiating a connection: if this returns a evaluates-as-true object then the
@@ -273,9 +288,22 @@ class HiveMind {
     bool allow_connect();
     void finished_connect();
 
-    // Called *without* the mutex to check the subs of a single snode; this is typically called from
-    // within hive::SNode after first connecting.
-    void check_my_subs(hive::SNode& snode, bool initial);
+    // Accesses the quic endpoint used to connect to SNodes
+    quic::Endpoint& quic_out() { return *quic_out_; }
+
+    bool has_quic_out() { return (bool)quic_out_; }
+
+    // Accesses the quic loop governing SNode connections (and various internals)
+    quic::Loop& loop() { return loop_; }
+
+    // Returns the creds object for establishing outbound connections.  TODO: This isn't needed once
+    // all nodes are running an updated libquic, but older libquic doesn't allow no-creds
+    // connections.
+    const std::shared_ptr<quic::TLSCreds>& creds_out() { return creds_out_; }
+
+    // Internal helper called by SNode with itself to dispatch a call back into itself with a
+    // reference to the HiveMind's master subscriber container.
+    void check_my_subs(hive::SNode& snode);
 
     void load_saved_subscriptions();
 
@@ -337,6 +365,12 @@ class HiveMind {
             std::string service_id,
             const Signature& sig,
             int64_t sig_ts);
+
+    // Called from SNode when we get a message notification
+    void on_message_notification(quic::message m);
 };
+
+extern template void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe);
+extern template void HiveMind::on_sub_unsub_impl(quic::message& m, bool subscribe);
 
 }  // namespace spns

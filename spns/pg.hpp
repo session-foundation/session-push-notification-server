@@ -3,6 +3,7 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
+#include <oxen/log.hpp>
 #include <pqxx/pqxx>
 
 #include "bytes.hpp"
@@ -53,7 +54,7 @@ class PGConnPool {
     /// timer: connections get killed off only when retrieving or releasing a connection).  0 or
     /// negative mean there is no idle timeout.  After changing this you may want to call
     /// `clear_idle_conns()` to apply the new setting to currently idle connections.
-    std::chrono::milliseconds max_idle_time = 10min;
+    std::chrono::milliseconds max_idle_time = 30s;
 
     /// Maximum number of idle connections we will keep alive.  If 0 then we never keep any idle
     /// connections at all and each call to `get()` will have to reconnect.
@@ -99,83 +100,4 @@ class PGConnPool {
     std::unique_ptr<pqxx::connection> make_conn();
 };
 
-// Helper for extracting namespaces from a pg array
-struct Int16ArrayLoader {
-    std::vector<int16_t> a;
-};
-
 }  // namespace spns
-
-namespace pqxx {
-
-template <>
-inline const std::string type_name<spns::AccountID>{"spns::AccountID"};
-template <>
-inline const std::string type_name<spns::Ed25519PK>{"spns::Ed25519PK"};
-template <>
-inline const std::string type_name<spns::SubaccountTag>{"spns::SubaccountTag"};
-template <>
-inline const std::string type_name<spns::Signature>{"spns::Signature"};
-template <>
-inline const std::string type_name<spns::EncKey>{"spns::EncKey"};
-
-template <spns::bytes_subtype T>
-struct spns_byte_helper {
-    static constexpr size_t SIZE = T::SIZE;
-    static T from_string(std::string_view text) {
-        const auto size = internal::size_unesc_bin(text.size());
-        if (size != SIZE)
-            throw conversion_error{
-                    "Invalid byte length (" + std::to_string(size) + ") for spns::bytes<" +
-                    std::to_string(SIZE) + ">-derived object\n"
-#ifndef NDEBUG
-                    + std::string{text}
-#endif
-            };
-        T val;
-        internal::unesc_bin(text, val.data());
-        return val;
-    }
-
-    using BSV_traits = string_traits<std::basic_string_view<std::byte>>;
-
-    static zview to_buf(char* begin, char* end, const T& val) {
-        return BSV_traits::to_buf(begin, end, {val.data(), val.size()});
-    }
-    static char* into_buf(char* begin, char* end, const T& val) {
-        return BSV_traits::into_buf(begin, end, {val.data(), val.size()});
-    }
-    static std::size_t size_buffer(const T&) noexcept { return internal::size_esc_bin(SIZE); }
-};
-
-template <>
-struct string_traits<spns::AccountID> : spns_byte_helper<spns::AccountID> {};
-template <>
-struct string_traits<spns::Ed25519PK> : spns_byte_helper<spns::Ed25519PK> {};
-template <>
-struct string_traits<spns::SubaccountTag> : spns_byte_helper<spns::SubaccountTag> {};
-template <>
-struct string_traits<spns::Signature> : spns_byte_helper<spns::Signature> {};
-template <>
-struct string_traits<spns::EncKey> : spns_byte_helper<spns::EncKey> {};
-
-template <>
-struct string_traits<spns::Int16ArrayLoader> {
-    static spns::Int16ArrayLoader from_string(std::string_view in);
-};
-
-template <>
-struct nullness<spns::AccountID> : pqxx::no_null<spns::AccountID> {};
-template <>
-struct nullness<spns::Ed25519PK> : pqxx::no_null<spns::Ed25519PK> {};
-template <>
-struct nullness<spns::SubaccountTag> : pqxx::no_null<spns::SubaccountTag> {};
-template <>
-struct nullness<spns::Signature> : pqxx::no_null<spns::Signature> {};
-template <>
-struct nullness<spns::EncKey> : pqxx::no_null<spns::EncKey> {};
-
-template <>
-struct nullness<spns::Int16ArrayLoader> : pqxx::no_null<spns::Int16ArrayLoader> {};
-
-}  // namespace pqxx

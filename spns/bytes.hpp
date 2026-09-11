@@ -2,6 +2,7 @@
 
 #include <fmt/format.h>
 #include <oxenc/base64.h>
+#include <oxenc/common.h>
 #include <oxenc/hex.h>
 
 #include <array>
@@ -19,11 +20,13 @@ struct bytes : std::array<std::byte, N> {
     static constexpr size_t SIZE = N;
 
     using std::array<std::byte, N>::data;
-    std::basic_string_view<std::byte> view() const { return {data(), SIZE}; }
-    std::string_view sv() const { return {reinterpret_cast<const char*>(data()), SIZE}; }
-    std::basic_string_view<unsigned char> usv() const {
-        return {reinterpret_cast<const unsigned char*>(data()), SIZE};
+    constexpr std::span<const std::byte, N> span() const { return {data(), SIZE}; }
+    template <oxenc::basic_char Char>
+    std::span<const Char, N> span() const {
+        return std::span<const Char, N>{reinterpret_cast<const Char*>(data()), SIZE};
     }
+
+    std::string_view sv() const { return {reinterpret_cast<const char*>(data()), SIZE}; }
 
     std::string hex() const { return oxenc::to_hex(this->begin(), this->end()); }
 
@@ -52,6 +55,7 @@ concept bytes_subtype = is_bytes<T>;
 
 struct AccountID : bytes<33> {};
 struct Ed25519PK : bytes<32> {};
+struct Ed25519Secret : bytes<64> {};
 struct X25519PK : bytes<32> {};
 struct X25519SK : bytes<32> {};
 struct SubaccountTag : bytes<36> {};
@@ -77,16 +81,6 @@ struct Subaccount {
         return a->is_same(*b);
     }
 };
-
-template <typename T, std::enable_if_t<is_bytes<T>, int> = 0>
-inline std::basic_string_view<std::byte> as_bsv(const T& v) {
-    return {reinterpret_cast<const std::byte*>(v.data()), T::SIZE};
-}
-
-template <typename T, std::enable_if_t<is_bytes<T>, int> = 0>
-inline std::basic_string_view<unsigned char> as_usv(const T& v) {
-    return {reinterpret_cast<const unsigned char*>(v.data()), v.size()};
-}
 
 // std::hash-implementing class that "hashes" by just reading the size_t-size bytes starting at the
 // 16th byte.
