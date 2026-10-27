@@ -23,6 +23,7 @@ CREATE INDEX subscriptions_service_idx ON subscriptions(service);
 CREATE TABLE sub_namespaces (
     subscription BIGINT NOT NULL REFERENCES subscriptions ON DELETE CASCADE,
     namespace SMALLINT NOT NULL,
+    want_data BOOLEAN NOT NULL DEFAULT TRUE, -- false if the subscription's data_namespaces omits it
 
     PRIMARY KEY(subscription, namespace)
 );

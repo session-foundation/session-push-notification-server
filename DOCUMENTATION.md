@@ -34,6 +34,10 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
       ascending order.
     - `data` -- if provided and true then notifications will include the body of the message (as long
       as it isn't too large); if false then the body will not be included in notifications.
+    - `data_namespaces` -- optional list of the namespaces whose notifications include the body,
+      when only some should: a subset of `namespaces`, sorted the same way.  The others'
+      notifications leave it out.  Requires `data` to be true; omitted, every namespace includes it.
+      It is not part of the signature, which signs `data` alone.
     - `sig_ts` -- the signature unix timestamp (seconds, not ms); see below.
     - `signature` -- the 64-byte Ed25519 signature; see below.
     - `service` -- the string identifying the notification service, such as "apns" or "firebase".
@@ -121,7 +125,7 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
           notification, omitted otherwise.
 
     Both "l" and "B" will be omitted if the subscription opted out of data (i.e. if it passed
-    `"data": false).
+    `"data": false`, or left the namespace out of `data_namespaces`).
 
   - Assuming the user subscribed to message data and the data is not too long (2.5kB, since we also
     have to go through base64 encoding after encryption and still end up <4kB), the message data

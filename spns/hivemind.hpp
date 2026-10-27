@@ -239,6 +239,7 @@ class HiveMind {
             const SwarmPubkey& pubkey,
             std::shared_ptr<hive::Subscription> sub,
             const std::optional<EncKey>& enc_key,
+            std::vector<int16_t> no_data_namespaces,
             std::vector<std::string> data,
             const std::optional<UnsubData>& unsub = std::nullopt);
 
@@ -331,13 +332,16 @@ class HiveMind {
     ///   service handler to send the notification to the device.
     /// - enc_key this user's 32-byte encryption key for pushed notifications
     /// - sub -- the subscription to add
+    /// - no_data_namespaces -- the subscribed namespaces, sorted, whose notifications leave out the
+    ///   message body even though `sub.want_data` is set
     bool add_subscription(
             SwarmPubkey pubkey,
             std::string service,
             std::string service_id,
             std::optional<std::string> service_data,
             EncKey enc_key,
-            hive::Subscription sub);
+            hive::Subscription sub,
+            std::vector<int16_t> no_data_namespaces);
 
     /// Removes a subscription for monitoring.  Returns true if the given pubkey was
     /// found and removed; false if not found.
