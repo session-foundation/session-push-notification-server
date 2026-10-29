@@ -20,7 +20,6 @@
 #include <oxen/quic/format.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
 #include <oxen/quic/opt.hpp>
-#include <oxenmq/zmq.hpp>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -36,16 +35,13 @@ namespace log = oxen::log;
 static auto cat = log::Cat("hivemind");
 static auto stats = log::Cat("stats");
 
-std::atomic<int> next_hivemind_id{1};
-
 HiveMind::HiveMind(Config conf_in) :
         config{std::move(conf_in)},
         pool_{config.pg_connect},
         omq_{std::string{config.omq_pubkey.sv()},
              std::string{config.omq_privkey.sv()},
              false,
-             nullptr},
-        object_id_{next_hivemind_id++} {
+             nullptr} {
 
     // fiddle_rlimit_nofile();
 
@@ -339,8 +335,9 @@ HiveMind::HiveMind(Config conf_in) :
                 cat,
                 "Waiting for notifiers to register (max {})",
                 wait_until - steady_clock::now());
-        while (!loop_.call_get([this, wait_until] { return notifier_startup_done(wait_until); }))
+        while (!notifier_startup_done(wait_until))
             std::this_thread::sleep_for(25ms);
+        std::lock_guard lock{services_mutex_};
         log::info(cat, "Done waiting for notifiers; {} registered", services_.size());
     }
 
@@ -363,7 +360,11 @@ HiveMind::HiveMind(Config conf_in) :
 
 HiveMind::~HiveMind() {
     if (notify_proc_thread_.joinable()) {
-        notify_push_sock().send(zmq::message_t{"QUIT"sv}, zmq::send_flags::none);
+        {
+            std::lock_guard lock{notify_mutex_};
+            notify_quit_ = true;
+        }
+        notify_cv_.notify_one();
         notify_proc_thread_.join();
     }
     loop_.call_get([this] {
@@ -387,26 +388,8 @@ HiveMind::~HiveMind() {
     });
 }
 
-zmq::socket_t& HiveMind::notify_push_sock() {
-    static thread_local int last_id = -1;
-    static thread_local zmq::socket_t* last_socket = nullptr;
-    if (last_id != object_id_) {
-        std::lock_guard lock{notify_push_mutex_};
-
-        auto& socket = notify_push_[std::this_thread::get_id()];
-        if (!socket) {
-            socket = std::make_unique<zmq::socket_t>(notification_ctx_, zmq::socket_type::push);
-            socket->set(zmq::sockopt::linger, 0);
-            socket->connect("inproc://notify_handler");
-        }
-        last_id = last_id;
-        last_socket = socket.get();
-    }
-    return *last_socket;
-}
-
 bool HiveMind::notifier_startup_done(const steady_time& wait_until) {
-    // NB: lock is held by the caller
+    std::lock_guard lock{services_mutex_};
 
     // If we were told which notifiers to wait for then check to see if they are all present, and if
     // so return early:
@@ -539,17 +522,15 @@ void HiveMind::on_reg_service(oxenmq::Message& m) {
         return;
     }
 
-    loop_.call([this, cid = m.conn, service = std::move(service)] {
-        bool added = false, replaced = false;
-        auto [it, ins] = services_.emplace(service, cid);
-        if (ins)
-            log::info(cat, "'{}' notification service registered", service);
-        else if (cid != it->second) {
-            it->second = cid;
-            log::info(cat, "'{}' notification service reconnected/reregistered", service);
-        } else
-            log::trace(cat, "'{}' notification service confirmed (already registered)", service);
-    });
+    std::lock_guard lock{services_mutex_};
+    auto [it, ins] = services_.emplace(service, m.conn);
+    if (ins)
+        log::info(cat, "'{}' notification service registered", service);
+    else if (m.conn != it->second) {
+        it->second = m.conn;
+        log::info(cat, "'{}' notification service reconnected/reregistered", service);
+    } else
+        log::trace(cat, "'{}' notification service confirmed (already registered)", service);
 }
 
 static void set_stat(
@@ -582,236 +563,274 @@ ON CONFLICT (service, name) DO UPDATE
             .no_rows();
 }
 
-extern "C" inline void message_buffer_destroy(void*, void* hint) {
-    delete static_cast<std::string*>(hint);
+void HiveMind::on_message_notification(quic::message m) {
+    {
+        std::lock_guard lock{notify_mutex_};
+        notify_queue_.push_back(std::move(m));
+    }
+    notify_cv_.notify_one();
 }
 
-void HiveMind::on_message_notification(quic::message m) {
-    // Put the message into a new object, then transfer ownership to the notification processer
-    // by sending the pointer value: the processor then picks up the pointer and takes ownership.
-    auto* push = new quic::message{std::move(m)};
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(push);
-    std::string cmd = "PUSH";
-    cmd += std::string_view{reinterpret_cast<const char*>(&ptr), sizeof(ptr)};
+void HiveMind::set_push_target(const AccountID& account, PushTarget target) {
+    std::unique_lock lock{push_targets_mutex_};
+    auto& targets = push_targets_[account];
+    for (auto& t : targets) {
+        if (t.service == target.service && t.svcid == target.svcid) {
+            t = std::move(target);
+            return;
+        }
+    }
+    targets.push_back(std::move(target));
+}
 
-    notify_push_sock().send(zmq::message_t{cmd}, zmq::send_flags::none);
+void HiveMind::drop_push_target(
+        const AccountID& account, std::string_view service, std::string_view svcid) {
+    std::unique_lock lock{push_targets_mutex_};
+    auto it = push_targets_.find(account);
+    if (it == push_targets_.end())
+        return;
+    std::erase_if(
+            it->second, [&](const auto& t) { return t.service == service && t.svcid == svcid; });
+    if (it->second.empty())
+        push_targets_.erase(it);
+}
+
+void HiveMind::send_push(oxenmq::ConnectionID conn, std::string_view push) {
+    // Bounds what waits for a notifier that has stopped reading.
+    constexpr size_t MAX_RETRY_QUEUE = 100'000;
+
+    omq_.send(
+            conn,
+            "notifier.push",
+            push,
+            oxenmq::send_option::queue_full{[this, conn, push = std::string{push}]() mutable {
+                {
+                    std::lock_guard lock{notify_mutex_};
+                    if (push_retry_.size() >= MAX_RETRY_QUEUE) {
+                        pushes_dropped_++;
+                        return;
+                    }
+                    push_retry_.emplace_back(std::move(conn), std::move(push));
+                }
+                notify_cv_.notify_one();
+            }});
 }
 
 void HiveMind::process_notifications() {
-    notify_pull_.bind("inproc://notify_handler");
-    std::vector<std::unique_ptr<quic::message>> process;
-    zmq::message_t msg;
+    // At most this many pushes are resent per 10ms while the notifier queue is full.
+    constexpr size_t RETRY_BATCH = 500;
 
-    constexpr size_t MAX_BATCH = 100;
+    std::vector<quic::message> process;
+    std::vector<std::pair<oxenmq::ConnectionID, std::string>> retry;
+    std::string buf;
+    int64_t dropped_logged = 0;
 
-    auto flags = zmq::recv_flags::dontwait;
     while (true) {
-        if (notify_pull_.recv(msg, flags)) {
-            auto cmd = msg.to_string_view();
-            if (cmd == "QUIT") {
-                notify_pull_.close();
+        {
+            std::unique_lock lock{notify_mutex_};
+            notify_cv_.wait(lock, [this] {
+                return notify_quit_ || !notify_queue_.empty() || !push_retry_.empty();
+            });
+            if (notify_quit_)
                 return;
-            } else if (cmd.size() == 4 + sizeof(uintptr_t) && cmd.substr(0, 4) == "PUSH"sv) {
-                // Read back the pointer and take back ownership
-                uintptr_t ptr;
-                std::memcpy(&ptr, cmd.data() + 4, sizeof(uintptr_t));
-                process.emplace_back().reset(reinterpret_cast<quic::message*>(ptr));
-            } else {
-                log::error(cat, "Error: received unexpected internal proc command {}", cmd);
-            }
-            // We got something, so let's keep trying for more until we drain the queue
-            flags = zmq::recv_flags::dontwait;
-        } else {
-            // There was nothing more waiting, so go back to synchronous for the next recv
-            flags = zmq::recv_flags::none;
+            process.clear();
+            if (!push_retry_.empty()) {
+                auto end = push_retry_.begin() + std::min(push_retry_.size(), RETRY_BATCH);
+                retry.assign(
+                        std::make_move_iterator(push_retry_.begin()), std::make_move_iterator(end));
+                push_retry_.erase(push_retry_.begin(), end);
+            } else
+                process.swap(notify_queue_);
         }
 
-        // Keep going until we either would block, or hit MAX_BATCH
-        if (process.empty() || (flags == zmq::recv_flags::dontwait && process.size() < MAX_BATCH))
+        if (!retry.empty()) {
+            log::debug(cat, "Resending {} pushes the notifier had no room for", retry.size());
+            for (auto& [conn, push] : retry)
+                send_push(std::move(conn), push);
+            retry.clear();
+            std::this_thread::sleep_for(10ms);
             continue;
+        }
+
+        if (auto dropped = pushes_dropped_.load(); dropped != dropped_logged) {
+            log::warning(
+                    cat,
+                    "Dropped {} pushes: the notifier is not keeping up with those already waiting",
+                    dropped - dropped_logged);
+            dropped_logged = dropped;
+        }
 
         log::debug(cat, "Processing {} network message notifications", process.size());
 
-        loop_.call_get([&] {
-            if (auto now = steady_clock::now(); now >= filter_rotate_time_) {
-                filter_rotate_ = std::move(filter_);
-                filter_.clear();
-                filter_rotate_time_ = now + config.filter_lifetime;
-            }
+        if (auto now = steady_clock::now(); now >= filter_rotate_time_) {
+            filter_rotate_ = std::move(filter_);
+            filter_.clear();
+            filter_rotate_time_ = now + config.filter_lifetime;
+        }
 
-            std::string buf;
-            size_t notify_count = 0;
+        decltype(services_) services;
+        {
+            std::lock_guard lock{services_mutex_};
+            services = services_;
+        }
 
-            auto conn = pool_.get();
-            pqxx::work tx{conn};
+        size_t notify_count = 0, duplicates = 0;
 
-            for (const auto& msg : process) {
-                try {
-                    oxenc::bt_dict_consumer dict{msg->body()};
+        for (const auto& msg : process) {
+            try {
+                oxenc::bt_dict_consumer dict{msg.body()};
 
-                    // Parse oxen-storage-server notification:
-                    if (!dict.skip_until("@")) {
-                        log::warning(cat, "Unexpected notification: missing account (@)");
-                        continue;
-                    }
-                    auto account_str = dict.consume_string_view();
-                    AccountID account;
-                    if (account_str.size() != account.SIZE) {
-                        log::warning(cat, "Unexpected notification: wrong account size (@)");
-                        continue;
-                    }
-                    std::memcpy(account.data(), account_str.data(), account.size());
-
-                    if (!dict.skip_until("h")) {
-                        log::warning(cat, "Unexpected notification: missing msg hash (h)");
-                        continue;
-                    }
-                    auto hash = dict.consume_string_view();
-                    if (bool too_small = hash.size() < MSG_HASH_MIN_SIZE;
-                        too_small || hash.size() > MSG_HASH_MAX_SIZE) {
-                        log::warning(cat, "Unexpected notification: msg hash too small");
-                        continue;
-                    }
-
-                    if (!dict.skip_until("n")) {
-                        log::warning(cat, "Unexpected notification: missing namespace (n)");
-                        continue;
-                    }
-                    auto ns = dict.consume_integer<int16_t>();
-
-                    if (!dict.skip_until("t")) {
-                        log::warning(cat, "Unexpected notification: missing message timestamp (t)");
-                        continue;
-                    }
-                    auto timestamp_ms = dict.consume_integer<int64_t>();
-
-                    if (!dict.skip_until("z")) {
-                        log::warning(cat, "Unexpected notification: missing message expiry (z)");
-                        continue;
-                    }
-                    auto expiry_ms = dict.consume_integer<int64_t>();
-
-                    auto maybe_data = dict.maybe<std::string_view>("~");
-
-                    log::trace(
-                            cat,
-                            "Got a notification for {}, msg hash {}, namespace {}, timestamp {}, "
-                            "exp {}, data {}B",
-                            account.hex(),
-                            hash,
-                            ns,
-                            timestamp_ms,
-                            expiry_ms,
-                            maybe_data ? fmt::to_string(maybe_data->size()) : "(N/A)");
-
-                    // [(want_data, enc_key, service, svcid, svcdata), ...]
-                    std::vector<std::tuple<
-                            bool,
-                            EncKey,
-                            std::string,
-                            std::string,
-                            std::vector<std::byte>>>
-                            notifies;
-                    std::vector<Blake2B_32> filter_vals;
-
-                    auto result = tx.exec(
-                            R"(
-SELECT want_data, enc_key, service, svcid, svcdata FROM subscriptions
-WHERE account = $1
-    AND EXISTS(SELECT 1 FROM sub_namespaces WHERE subscription = id AND namespace = $2))",
-                            {account, ns});
-                    notifies.reserve(result.size());
-                    filter_vals.reserve(result.size());
-                    for (auto row : result) {
-                        row.to(notifies.emplace_back());
-                        auto& [_wd, _ek, service, svcid, _sd] = notifies.back();
-                        filter_vals.push_back(blake2b(service, svcid, hash));
-                    }
-
-                    if (notifies.empty()) {
-                        log::debug(cat, "No active notifications match, ignoring notification");
-                        continue;
-                    }
-
-                    assert(filter_vals.size() == notifies.size());
-                    auto filter_it = filter_vals.begin();
-                    for (auto& [want_data, enc_key, service, svcid, svcdata] : notifies) {
-                        auto& filt_hash = *filter_it++;
-
-                        if (filter_rotate_.count(filt_hash) || !filter_.insert(filt_hash).second) {
-                            log::trace(cat, "Ignoring duplicate notification");
-                            continue;
-                        } else {
-                            log::trace(cat, "Not filtered: {}", filt_hash.hex());
-                        }
-
-                        oxenmq::ConnectionID conn;
-                        if (auto it = services_.find(service); it != services_.end())
-                            conn = it->second;
-                        else {
-                            log::warning(
-                                    cat,
-                                    "Notification depends on unregistered service {}, ignoring",
-                                    service);
-                            continue;
-                        }
-
-                        // We overestimate a little here (e.g. allowing for 20 spaces for string
-                        // lengths) because a few extra bytes of allocation doesn't really matter.
-                        size_t size_needed =
-                                2 + 35 +                 // 0: 32:service (or shorter)
-                                3 + 21 + svcid.size() +  // 1:& N:svcid
-                                3 + 35 +                 // 1:^ 32:enckey
-                                3 + 21 + hash.size() +   // 1:# N:hash
-                                3 + 36 +                 // 1:@ 33:account
-                                3 + 8 +                  // 1:n i-32768e
-                                3 + 15 +                 // 1:t i1695078498534e (timestamp)
-                                3 + 15 +                 // 1:t i1695078498534e (expiry)
-                                (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
-                                (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
-
-                        if (buf.size() < size_needed)
-                            buf.resize(size_needed);
-
-                        oxenc::bt_dict_producer dict{buf.data(), buf.data() + buf.size()};
-
-                        try {
-                            // NB: ascii sorted keys
-                            dict.append("", service);
-                            if (!svcdata.empty())
-                                dict.append("!", svcdata);
-                            dict.append("#", hash);
-                            dict.append("&", svcid);
-                            dict.append("@", account.sv());
-                            dict.append("^", enc_key.sv());
-                            dict.append("n", ns);
-                            dict.append("t", timestamp_ms);
-                            dict.append("z", expiry_ms);
-                            if (want_data && maybe_data)
-                                dict.append("~", *maybe_data);
-                        } catch (const std::exception& e) {
-                            log::critical(
-                                    cat, "failed to build notifier message: bad size estimation?");
-                            continue;
-                        }
-
-                        log::debug(cat, "Sending push via {} notifier", service);
-                        omq_.send(conn, "notifier.push", dict.view());
-                        notify_count++;
-                    }
-                } catch (const std::exception& e) {
-                    log::warning(cat, "Failed to process incoming notification: {}", e.what());
+                // Parse oxen-storage-server notification:
+                if (!dict.skip_until("@")) {
+                    log::warning(cat, "Unexpected notification: missing account (@)");
                     continue;
                 }
-            }
+                auto account_str = dict.consume_string_view();
+                AccountID account;
+                if (account_str.size() != account.SIZE) {
+                    log::warning(cat, "Unexpected notification: wrong account size (@)");
+                    continue;
+                }
+                std::memcpy(account.data(), account_str.data(), account.size());
 
+                if (!dict.skip_until("h")) {
+                    log::warning(cat, "Unexpected notification: missing msg hash (h)");
+                    continue;
+                }
+                auto hash = dict.consume_string_view();
+                if (bool too_small = hash.size() < MSG_HASH_MIN_SIZE;
+                    too_small || hash.size() > MSG_HASH_MAX_SIZE) {
+                    log::warning(cat, "Unexpected notification: msg hash too small");
+                    continue;
+                }
+
+                if (!dict.skip_until("n")) {
+                    log::warning(cat, "Unexpected notification: missing namespace (n)");
+                    continue;
+                }
+                auto ns = dict.consume_integer<int16_t>();
+
+                if (!dict.skip_until("t")) {
+                    log::warning(cat, "Unexpected notification: missing message timestamp (t)");
+                    continue;
+                }
+                auto timestamp_ms = dict.consume_integer<int64_t>();
+
+                if (!dict.skip_until("z")) {
+                    log::warning(cat, "Unexpected notification: missing message expiry (z)");
+                    continue;
+                }
+                auto expiry_ms = dict.consume_integer<int64_t>();
+
+                auto maybe_data = dict.maybe<std::string_view>("~");
+
+                log::trace(
+                        cat,
+                        "Got a notification for {}, msg hash {}, namespace {}, timestamp {}, "
+                        "exp {}, data {}B",
+                        account.hex(),
+                        hash,
+                        ns,
+                        timestamp_ms,
+                        expiry_ms,
+                        maybe_data ? fmt::to_string(maybe_data->size()) : "(N/A)");
+
+                auto filt_hash = blake2b(account, hash);
+                if (filter_rotate_.count(filt_hash) || !filter_.insert(filt_hash).second) {
+                    log::trace(cat, "Ignoring duplicate notification");
+                    duplicates++;
+                    continue;
+                }
+
+                std::shared_lock lock{push_targets_mutex_};
+                auto it = push_targets_.find(account);
+                if (it == push_targets_.end()) {
+                    log::debug(cat, "No active notifications match, ignoring notification");
+                    continue;
+                }
+
+                for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces] :
+                     it->second) {
+                    if (!std::binary_search(namespaces.begin(), namespaces.end(), ns))
+                        continue;
+
+                    oxenmq::ConnectionID conn;
+                    if (auto it = services.find(service); it != services.end())
+                        conn = it->second;
+                    else {
+                        log::warning(
+                                cat,
+                                "Notification depends on unregistered service {}, ignoring",
+                                service);
+                        continue;
+                    }
+
+                    // We overestimate a little here (e.g. allowing for 20 spaces for string
+                    // lengths) because a few extra bytes of allocation doesn't really matter.
+                    size_t size_needed =
+                            2 + 35 +                 // 0: 32:service (or shorter)
+                            3 + 21 + svcid.size() +  // 1:& N:svcid
+                            3 + 35 +                 // 1:^ 32:enckey
+                            3 + 21 + hash.size() +   // 1:# N:hash
+                            3 + 36 +                 // 1:@ 33:account
+                            3 + 8 +                  // 1:n i-32768e
+                            3 + 15 +                 // 1:t i1695078498534e (timestamp)
+                            3 + 15 +                 // 1:t i1695078498534e (expiry)
+                            (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
+                            (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
+
+                    if (buf.size() < size_needed)
+                        buf.resize(size_needed);
+
+                    oxenc::bt_dict_producer dict{buf.data(), buf.data() + buf.size()};
+
+                    try {
+                        // NB: ascii sorted keys
+                        dict.append("", service);
+                        if (!svcdata.empty())
+                            dict.append("!", svcdata);
+                        dict.append("#", hash);
+                        dict.append("&", svcid);
+                        dict.append("@", account.sv());
+                        dict.append("^", enc_key.sv());
+                        dict.append("n", ns);
+                        dict.append("t", timestamp_ms);
+                        dict.append("z", expiry_ms);
+                        if (want_data && maybe_data)
+                            dict.append("~", *maybe_data);
+                    } catch (const std::exception& e) {
+                        log::critical(
+                                cat, "failed to build notifier message: bad size estimation?");
+                        continue;
+                    }
+
+                    log::debug(cat, "Sending push via {} notifier", service);
+                    send_push(conn, dict.view());
+                    notify_count++;
+                }
+            } catch (const std::exception& e) {
+                log::warning(cat, "Failed to process incoming notification: {}", e.what());
+                continue;
+            }
+        }
+
+        log::debug(
+                cat,
+                "Processed {} notifications ({} duplicates): {} pushes sent",
+                process.size(),
+                duplicates,
+                notify_count);
+
+        try {
+            auto conn = pool_.get();
+            pqxx::work tx{conn};
             increment_stat(tx, "", "notifications", notify_count);
             increment_stat(tx, "", "pushes", process.size());
             tx.commit();
-            pushes_processed_ += process.size();
-
-            process.clear();
-        });
+        } catch (const std::exception& e) {
+            log::warning(cat, "Failed to update notification stats: {}", e.what());
+        }
+        pushes_processed_ += process.size();
     }
 }
 
@@ -992,17 +1011,21 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
     }
     auto conn = pool_.get();
     int reqed = 0, deleted = 0, matched = 0;
+    std::vector<std::pair<AccountID, std::string>> dropped;
     try {
         pqxx::work tx{conn};
         while (!drops.is_finished()) {
             reqed++;
-            auto del = tx.exec("DELETE FROM subscriptions WHERE service = $1 AND svcid = $2",
-                               {service, drops.consume_string_view()})
-                               .no_rows()
-                               .affected_rows();
-            deleted += del;
-            if (del)
+            std::string svcid{drops.consume_string_view()};
+            auto del =
+                    tx.exec("DELETE FROM subscriptions WHERE service = $1 AND svcid = $2 RETURNING "
+                            "account",
+                            {service, svcid});
+            deleted += del.size();
+            if (!del.empty())
                 matched++;
+            for (auto row : del)
+                dropped.emplace_back(row[0].as<AccountID>(), svcid);
         }
         tx.commit();
     } catch (const oxenc::bt_deserialize_invalid_type&) {
@@ -1011,6 +1034,8 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
                 "invalid admin.on_drop_registration request: expected list of service id strings");
         return;
     }
+    for (const auto& [account, svcid] : dropped)
+        drop_push_target(account, service, svcid);
 
     log::info(
             cat,
@@ -1177,13 +1202,12 @@ HiveMind::sub_unsub_args(nlohmann::json& args) {
 }
 
 oxenmq::ConnectionID HiveMind::sub_unsub_service_conn(const std::string& service) {
-    return loop_.call_get([&] {
-        if (auto it = services_.find(service); it != services_.end())
-            return it->second;
-        throw hive::subscribe_error{
-                hive::SUBSCRIBE::SERVICE_NOT_AVAILABLE,
-                service + " notification service not currently available"};
-    });
+    std::lock_guard lock{services_mutex_};
+    if (auto it = services_.find(service); it != services_.end())
+        return it->second;
+    throw hive::subscribe_error{
+            hive::SUBSCRIBE::SERVICE_NOT_AVAILABLE,
+            service + " notification service not currently available"};
 }
 
 namespace {
@@ -1434,10 +1458,14 @@ void HiveMind::on_unsubscribe(oxenmq::Message& m) {
 void HiveMind::db_cleanup() {
     auto conn = pool_.get();
     pqxx::work tx{conn};
-    tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1",
-            {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)})
-            .no_rows();
+    auto expired =
+            tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1 RETURNING account, "
+                    "service, svcid",
+                    {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)});
     tx.commit();
+    for (auto row : expired)
+        drop_push_target(
+                row[0].as<AccountID>(), row[1].as<std::string>(), row[2].as<std::string>());
 }
 
 void HiveMind::refresh_sns() {
@@ -1738,7 +1766,8 @@ void HiveMind::load_saved_subscriptions() {
                     Signature,
                     std::chrono::sys_seconds,
                     bool,
-                    std::vector<int16_t>>>>>
+                    std::vector<int16_t>,
+                    PushTarget>>>>
             threads;
 
     threads.resize(n);
@@ -1752,22 +1781,37 @@ void HiveMind::load_saved_subscriptions() {
             auto conn = pool.get();
             pqxx::work txn{conn};
 
-            for (auto [acc, ed, sub_tag, sub_sig, sig_in, sigts_in, wd_in, ns_arr_in] :
-                 txn
-                         .stream<AccountID,
-                                 std::optional<Ed25519PK>,
-                                 std::optional<SubaccountTag>,
-                                 std::optional<Signature>,
-                                 Signature,
-                                 int64_t,
-                                 bool,
-                                 pqxx::array<int16_t>>(R"(
+            for (auto [acc,
+                       ed,
+                       sub_tag,
+                       sub_sig,
+                       sig_in,
+                       sigts_in,
+                       wd_in,
+                       ns_arr_in,
+                       enc_key,
+                       service,
+                       svcid,
+                       svcdata] : txn
+                                          .stream<AccountID,
+                                                  std::optional<Ed25519PK>,
+                                                  std::optional<SubaccountTag>,
+                                                  std::optional<Signature>,
+                                                  Signature,
+                                                  int64_t,
+                                                  bool,
+                                                  pqxx::array<int16_t>,
+                                                  EncKey,
+                                                  std::string,
+                                                  std::string,
+                                                  std::optional<std::vector<std::byte>>>(R"(
 SELECT account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data,
-    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
+    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace),
+    enc_key, service, svcid, svcdata
 FROM subscriptions
 WHERE id % {0} = {1})"_format(n, i))) {
 
-                auto& [swpk, subaccount, sig, sigts, wd, ns_arr] = rows.emplace_back();
+                auto& [swpk, subaccount, sig, sigts, wd, ns_arr, target] = rows.emplace_back();
                 swpk.emplace(acc, ed, /*skip_validation=*/true);
                 if (sub_tag && sub_sig) {
                     subaccount.emplace();
@@ -1778,6 +1822,13 @@ WHERE id % {0} = {1})"_format(n, i))) {
                 sigts = std::chrono::sys_seconds{std::chrono::seconds{sigts_in}};
                 wd = wd_in;
                 ns_arr = std::vector<int16_t>{ns_arr_in.begin(), ns_arr_in.end()};
+                target = PushTarget{
+                        std::move(service),
+                        std::move(svcid),
+                        svcdata ? std::move(*svcdata) : std::vector<std::byte>{},
+                        enc_key,
+                        wd,
+                        ns_arr};
             }
         }};
     }
@@ -1805,8 +1856,12 @@ WHERE id % {0} = {1})"_format(n, i))) {
 
     int64_t raw_count = 0, count = 0, unique = 0;
     for (auto& [t, rows] : threads) {
-        for (auto& [swpk, subaccount, sig, sigts, wd, ns_arr] : rows) {
+        for (auto& [swpk, subaccount, sig, sigts, wd, ns_arr, target] : rows) {
             raw_count++;
+
+            // Pushes go to every stored subscription until db_cleanup() removes it, so this takes
+            // the rows skipped below for being about to expire too.
+            push_targets_[swpk->id].push_back(std::move(target));
 
             if (sigts <= sigts_cutoff.first || sigts >= sigts_cutoff.second)
                 // Don't try loading entries that are about to expire
@@ -1864,9 +1919,11 @@ WHERE id % {0} = {1})"_format(n, i))) {
 
     log::info(
             cat,
-            "Done loading saved subscriptions; {} unique subscriptions to {} accounts",
+            "Done loading saved subscriptions; {} unique subscriptions to {} accounts; push "
+            "targets for {} accounts",
             unique,
-            subscribers_.size());
+            subscribers_.size(),
+            push_targets_.size());
 }
 
 bool HiveMind::add_subscription(
@@ -1956,6 +2013,21 @@ RETURNING id
 
     tx.commit();
 
+    std::vector<std::byte> svcdata;
+    if (service_data) {
+        auto b = as_bytes(*service_data);
+        svcdata.assign(b.begin(), b.end());
+    }
+    set_push_target(
+            pubkey.id,
+            PushTarget{
+                    std::move(service),
+                    std::move(service_id),
+                    std::move(svcdata),
+                    enc_key,
+                    sub.want_data,
+                    sub.namespaces});
+
     return loop_.call_get([&] {
         pubkey.update_swarm(swarm_ids_);
 
@@ -2035,6 +2107,9 @@ bool HiveMind::remove_subscription(
                     .no_rows();
 
     tx.commit();
+
+    if (result.affected_rows() > 0)
+        drop_push_target(pubkey.id, service, service_id);
 
     // We don't remove the subscription from internal data structures: other devices
     // (with the exact subcription) may be still using it, and so we may still want
