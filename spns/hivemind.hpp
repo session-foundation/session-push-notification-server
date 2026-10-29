@@ -140,14 +140,25 @@ class HiveMind {
     std::atomic<int64_t> notifications_dropped_{0};
     bool notify_quit_ = false;
 
-    // Pushes oxenmq had no room for in its queue to the notifier (it drops a message rather than
-    // wait): process_notifications() resends these before taking new notifications, so that a
-    // burst waits for the notifier instead of being lost.  Guarded by notify_mutex_.  These are
-    // declared before omq_ so that they outlive its proxy thread, which runs send_push()'s
-    // queue_full callback.
-    std::deque<std::pair<oxenmq::ConnectionID, std::string>> push_retry_;
+    // Pushes waiting for their notifier, per service: those oxenmq had no room for in the
+    // notifier's queue (it drops a message rather than wait), and those for a notifier whose
+    // connection went away, until it registers again.  process_notifications() resends them to
+    // whichever connection the service is on by then, and sends a service's new pushes after them,
+    // so one slow notifier holds up only its own pushes.  Guarded by notify_mutex_.  Declared
+    // before omq_ so that they outlive its worker threads, which run send_push()'s failure
+    // callback.
+    struct PushRetry {
+        std::deque<std::string> pushes;
+        // Doubles while resends make no headway, so a notifier that stops reading costs little.
+        std::chrono::milliseconds wait{10};
+        steady_time next{};
+        size_t last_size = 0;
+    };
+    std::unordered_map<std::string, PushRetry> push_retry_;
+    size_t push_retry_count_ = 0;
     std::atomic<int64_t> pushes_dropped_{0};
-    void send_push(oxenmq::ConnectionID conn, std::string_view push);
+    void send_push(const std::string& service, oxenmq::ConnectionID conn, std::string_view push);
+    void queue_retry(const std::string& service, std::string push);
 
     // std::mutex mutex_;
     //  OxenMQ server for internal communications, proxied subscriptions, etc.
@@ -213,7 +224,11 @@ class HiveMind {
 
     // Registered push services: servicename => omq Connectionid to talk to the service
     std::unordered_map<std::string, oxenmq::ConnectionID> services_;
+    // Services whose connection failed, and since when: their pushes wait in push_retry_ for the
+    // notifier to register again.
+    std::unordered_map<std::string, steady_time> services_gone_;
     std::mutex services_mutex_;
+    void service_gone(const std::string& service, oxenmq::ConnectionID conn);
 
     // Our connection to a local oxend for block and SN info
     oxenmq::ConnectionID oxend_;
