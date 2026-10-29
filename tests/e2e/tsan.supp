@@ -1,18 +1,21 @@
+# A race: pattern matches a function in any frame of either stack, so each line below also hides
+# any race in the hivemind's own code whose stack passes through that function.
+
 # libstdc++'s std::future synchronises through futex code in the uninstrumented libstdc++.so, which
 # TSan cannot see, so every hand-off through a future (oxen::quic's call_get) reads as a race.
 race:std::__future_base
 race:std::__basic_future
 race:std::future
 
-# oxenmq hands a send's options (the queue_full callback) and its message buffers to its proxy
+# oxenmq hands a send's options (the queue_failure callback) and its message buffers to its proxy
 # thread through zmq, which is not instrumented, so their creation and destruction read as a race.
 race:oxenmq::detail::serialize_object
 race:oxenmq::detail::build_send
 race:oxenmq::create_message
 race:message_buffer_destroy
 
-# oxenmq runs a queue_full callback on one of its threads and destroys it on another, handing it
-# over through zmq; this matches only callbacks destroyed inside liboxenmq.
+# oxenmq runs a job on one of its threads and destroys it on another, handing it over through zmq.
+# This hides every race on destroying a std::function<void()>, the hivemind's included.
 race:std::function<void ()>::~function()
 
 # The same hand-off for request reply callbacks, which oxenmq copies and destroys on its proxy

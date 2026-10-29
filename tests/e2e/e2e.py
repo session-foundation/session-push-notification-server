@@ -142,16 +142,25 @@ def fresh_db():
 ACCOUNT = "decode('03','hex') || sha256(int4send({}))"
 
 
-def seed(first, count, devices="1", namespaces="0", sig_ts=None, svcdata="NULL"):
-    """Subscribes accounts #first.. directly in the database.  `devices` is an SQL expression in
-    `i` giving account #i's number of devices, whose service ids are "dev-<i>-<d>"."""
+def seed(
+    first,
+    count,
+    devices="1",
+    namespaces="0",
+    sig_ts=None,
+    svcdata="NULL",
+    service="dummy",
+):
+    """Subscribes accounts #first.. to `service` directly in the database.  `devices` is an SQL
+    expression in `i` giving account #i's number of devices, whose service ids are
+    "dev-<i>-<d>"."""
     sig_ts = sig_ts or int(time.time())
     psql(
         f"""
 WITH s AS (
     INSERT INTO subscriptions (account, signature, signature_ts, want_data, enc_key, service, svcid, svcdata)
     SELECT {ACCOUNT.format('i')}, decode(repeat('cd', 64), 'hex'), {sig_ts}, true,
-           decode(repeat('ab', 32), 'hex'), 'dummy', 'dev-' || i || '-' || d, {svcdata}
+           decode(repeat('ab', 32), 'hex'), '{service}', 'dev-' || i || '-' || d, {svcdata}
     FROM generate_series({first}, {first + count - 1}) i, LATERAL generate_series(1, {devices}) d
     RETURNING id)
 INSERT INTO sub_namespaces SELECT s.id, n FROM s, unnest(ARRAY[{namespaces}]::smallint[]) n"""
@@ -332,19 +341,19 @@ class Setup:
             self.client = Proc("client", [f"{BUILD}/fakes/fake_client", HIVEMIND_SOCK])
         return self.client
 
-    def counts(self):
+    def counts(self, notifier=None):
         import json
 
-        return json.loads(self.notifier.cmd("count"))
+        return json.loads((notifier or self.notifier).cmd("count"))
 
-    def wait_pushes(self, expected, timeout, settle=1.5):
+    def wait_pushes(self, expected, timeout, settle=1.5, notifier=None):
         """Waits for `expected` pushes, then `settle` more seconds to catch extras."""
         deadline = time.time() + timeout * TIME_SCALE
         while True:
-            c = self.counts()
+            c = self.counts(notifier)
             if c["pushes"] >= expected:
                 time.sleep(settle)
-                return self.counts()
+                return self.counts(notifier)
             if time.time() > deadline:
                 return c
             time.sleep(0.25)
@@ -500,6 +509,89 @@ def scenario_resend(build_dir):
     check_log(s.hivemind)
 
 
+def scenario_notifier_restart(build_dir):
+    """A notifier that dies with pushes waiting for it, and starts again: the hivemind keeps
+    processing, and the waiting pushes go to the new notifier."""
+    fresh_db()
+    seed(0, 20_000)
+    s = Setup(build_dir, nodes=3, log_level="info,hivemind=debug")
+    try:
+        s.notifier.p.send_signal(signal.SIGSTOP)
+        s.network.cmd("burst 0 30000 20000 0 200")
+        time.sleep(3)
+        check(
+            "Resending" in s.hivemind.log(),
+            "no resends were pending before the restart",
+        )
+        s.notifier.stop(sig=signal.SIGKILL)
+        # Long enough for resends to find the connection gone before the new one registers.
+        time.sleep(3)
+        s.notifier = Proc("notifier2", [f"{BUILD}/fakes/fake_notifier", HIVEMIND_SOCK])
+        check(s.notifier.readline(120) == "registered", "new notifier did not register")
+        # Only what zmq had already queued to the dead notifier is lost: up to its 1000-message
+        # high-water mark.
+        c = s.wait_pushes(29_000, 60, settle=3)
+        print(f"    {c['pushes']} of 30000 pushes reached the new notifier")
+        check(
+            c["pushes"] >= 29_000 and c["duplicates"] == 0,
+            f"waiting pushes did not reach the new notifier: {c}",
+        )
+        check(
+            "connection lost" in s.hivemind.log(),
+            "the hivemind never noticed the notifier had gone",
+        )
+        before = c["pushes"]
+        s.network.cmd("send #7 after-the-restart-aaaaaaaaaaaaaaaaaaaaaaaaaa 0 100")
+        c = s.wait_pushes(before + 1, 30)
+        check(
+            c["pushes"] == before + 1,
+            "no push for a notification sent after the restart",
+        )
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
+def scenario_two_notifiers(build_dir):
+    """While one notifier has stopped reading, another service's pushes go out at once, and the
+    stopped one's arrive once it resumes."""
+    fresh_db()
+    seed(0, 20_000)
+    seed(20_000, 20_000, service="other")
+    s = Setup(build_dir, nodes=3, log_level="info,hivemind=debug")
+    other = None
+    try:
+        other = Proc(
+            "notifier-other",
+            [f"{BUILD}/fakes/fake_notifier", HIVEMIND_SOCK, "-1", "other"],
+        )
+        check(other.readline(120) == "registered", "second notifier did not register")
+        s.notifier.p.send_signal(signal.SIGSTOP)
+        s.network.cmd("burst 0 40000 40000 0 200")
+        c = s.wait_pushes(20_000, 30, notifier=other)
+        check(
+            c["pushes"] == 20_000 and c["duplicates"] == 0,
+            f"the running notifier's pushes waited for the stopped one: {c}",
+        )
+        check(
+            "Resending" in s.hivemind.log(),
+            "the stopped notifier never filled up: nothing was resent",
+        )
+        s.notifier.p.send_signal(signal.SIGCONT)
+        c = s.wait_pushes(20_000, 120)
+        check(
+            c["pushes"] == 20_000 and c["duplicates"] == 0,
+            f"expected 20000 unique pushes once resumed, got {c}",
+        )
+    finally:
+        if other:
+            other.stop()
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
 def scenario_backlog(build_dir):
     """While the database or the notifier stalls, the storage nodes' streams to the hivemind do
     not back up: the hivemind keeps reading and holds the notifications itself."""
@@ -625,9 +717,8 @@ def scenario_shutdown(build_dir):
 
 
 def scenario_stalled_notifier(build_dir):
-    """A notifier that stops reading for good costs bounded memory and little CPU: incoming
-    notifications beyond 256 MB and pushes beyond 100,000 waiting are dropped with a warning, and
-    resending backs off."""
+    """A notifier that stops reading for good costs bounded memory and little CPU: pushes beyond
+    100,000 waiting are dropped with a warning, and resending backs off."""
     fresh_db()
     seed(0, 50_000)
     s = Setup(build_dir, nodes=1)
@@ -754,7 +845,16 @@ def scenario_scale(build_dir):
     check_log(s.hivemind)
 
 
-FAST = ["correctness", "burst", "resend", "backlog", "churn", "shutdown"]
+FAST = [
+    "correctness",
+    "burst",
+    "resend",
+    "notifier_restart",
+    "two_notifiers",
+    "backlog",
+    "churn",
+    "shutdown",
+]
 SLOW = ["stalled_notifier", "sustained", "scale"]
 
 

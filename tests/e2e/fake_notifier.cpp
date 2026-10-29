@@ -1,8 +1,9 @@
-// A fake "dummy" notifier: registers with the hivemind and records every notifier.push.
+// A fake notifier: registers with the hivemind and records every notifier.push.
 //
-// usage: fake_notifier HIVEMIND_ADDR [MAX_QUEUE]
+// usage: fake_notifier HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]
 //
-// MAX_QUEUE is the oxenmq queue limit of the "notifier" category (default -1, unlimited).  Answers
+// MAX_QUEUE is the oxenmq queue limit of the "notifier" category (default -1, unlimited); SERVICE
+// is the service name it registers (default "dummy").  Answers
 // notifier.validate by accepting service_info.token as the service id.  Prints "registered", then
 // reads commands on stdin, one per line:
 //
@@ -35,10 +36,11 @@ int64_t now_ms() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "usage: fake_notifier HIVEMIND_ADDR [MAX_QUEUE]\n";
+        std::cerr << "usage: fake_notifier HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]\n";
         return 1;
     }
     int max_queue = argc > 2 ? std::stoi(argv[2]) : -1;
+    std::string service = argc > 3 ? argv[3] : "dummy";
 
     std::mutex m;
     std::unordered_set<std::string> seen;
@@ -95,7 +97,7 @@ int main(int argc, char** argv) {
         std::cerr << "could not connect to " << argv[1] << "\n";
         return 1;
     }
-    omq.send(conn, "admin.register_service", "dummy");
+    omq.send(conn, "admin.register_service", service);
     std::cout << "registered" << std::endl;
 
     std::string line;
