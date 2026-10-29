@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <oxenc/base64.h>
 #include <oxenc/common.h>
 #include <oxenc/hex.h>
@@ -31,11 +32,11 @@ struct bytes : std::array<std::byte, N> {
     std::string hex() const { return oxenc::to_hex(this->begin(), this->end()); }
 
     // Implicit conversion to unsigned char* for easier passing into libsodium functions
-    template <typename T, typename = std::enable_if_t<std::is_same_v<T, unsigned char*>>>
+    template <std::same_as<unsigned char*> T>
     constexpr operator T() noexcept {
         return reinterpret_cast<unsigned char*>(this->data());
     }
-    template <typename T, typename = std::enable_if_t<std::is_same_v<T, const unsigned char*>>>
+    template <std::same_as<const unsigned char*> T>
     constexpr operator T() const noexcept {
         return reinterpret_cast<const unsigned char*>(this->data());
     }
@@ -48,12 +49,20 @@ struct is_bytes_impl {
 };
 
 template <typename T>
-inline constexpr bool is_bytes = decltype(is_bytes_impl::check(static_cast<T*>(nullptr)))::value;
+concept bytes_derived = decltype(is_bytes_impl::check(static_cast<T*>(nullptr)))::value;
 
-template <typename T>
-concept bytes_subtype = is_bytes<T>;
+struct AccountID : bytes<33> {
 
-struct AccountID : bytes<33> {};
+    // Access a span convering just the X25519 pubkey (i.e. subspan skipping the first byte):
+    template <oxenc::basic_char C = std::byte>
+    std::span<C, 32> xpk() {
+        return std::span<C, 32>{reinterpret_cast<C*>(data()), 32};
+    }
+    template <oxenc::basic_char C = std::byte>
+    std::span<const C, 32> xpk() const {
+        return std::span<C, 32>{reinterpret_cast<const C*>(data()), 32};
+    }
+};
 struct Ed25519PK : bytes<32> {};
 struct Ed25519Secret : bytes<64> {};
 struct X25519PK : bytes<32> {};
@@ -84,7 +93,8 @@ struct Subaccount {
 
 // std::hash-implementing class that "hashes" by just reading the size_t-size bytes starting at the
 // 16th byte.
-template <typename T, typename = std::enable_if_t<is_bytes<T> && (T::SIZE >= 32)>>
+template <bytes_derived T>
+    requires(T::SIZE >= 32)
 struct bytes_simple_hasher {
     size_t operator()(const T& x) const {
         size_t hash;
@@ -93,7 +103,7 @@ struct bytes_simple_hasher {
     }
 };
 
-template <typename T, typename = std::enable_if_t<is_bytes<T>>>
+template <bytes_derived T>
 void from_hex_or_b64(T& val, std::string_view input) {
     if (input.size() == T::SIZE) {
         std::memcpy(val.data(), input.data(), T::SIZE);
@@ -113,7 +123,7 @@ void from_hex_or_b64(T& val, std::string_view input) {
     throw std::invalid_argument{"Invalid value: expected bytes, hex, or base64"};
 }
 
-template <typename T, typename = std::enable_if_t<is_bytes<T>>>
+template <bytes_derived T>
 T from_hex_or_b64(std::string_view input) {
     T val;
     from_hex_or_b64(val, input);
@@ -137,12 +147,24 @@ struct hash<spns::Blake2B_32> : spns::bytes_simple_hasher<spns::Blake2B_32> {};
 
 namespace fmt {
 
-template <typename T, typename Char>
-struct formatter<T, Char, std::enable_if_t<spns::is_bytes<T>>> : fmt::formatter<std::string_view> {
+template <spns::bytes_derived T, typename Char>
+struct formatter<T, Char> : fmt::formatter<std::string_view> {
     template <typename FormatContext>
     auto format(const T& val, FormatContext& ctx) const {
         return formatter<std::string_view>::format(val.hex(), ctx);
     }
 };
+
+// Prevent fmt from seeing these types as ranges:
+
+template <spns::bytes_derived T, typename Char>
+#if FMT_VERSION >= 100000
+struct range_format_kind<T, Char> {
+    static constexpr auto value = range_format::disabled;
+};
+#else  // fmt 9 or earlier:
+struct is_range<T, Char> : std::false_type {
+};
+#endif
 
 }  // namespace fmt

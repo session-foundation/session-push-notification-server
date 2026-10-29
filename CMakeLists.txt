@@ -40,6 +40,7 @@ pkg_check_modules(FMT REQUIRED IMPORTED_TARGET fmt>=10)
 pkg_check_modules(OXENLOGGING REQUIRED IMPORTED_TARGET liboxen-logging>=1.2.0)
 pkg_check_modules(NLOHMANN_JSON REQUIRED IMPORTED_TARGET nlohmann_json>=3.7.0)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
+pkg_check_modules(LIBZMQ REQUIRED IMPORTED_TARGET libzmq>=4.3.4)
 
 if(CMAKE_VERSION VERSION_LESS "3.21")
     # Work around cmake bug 22180 (PkgConfig::THING not set if no flags needed)
@@ -61,6 +62,7 @@ target_link_libraries(spns-hivemind PRIVATE
     PkgConfig::OXENC
     PkgConfig::OXENMQ
     PkgConfig::LIBQUIC
+    PkgConfig::LIBZMQ  # oxenmq no longer links to or provides zmq symbols, but we do some direct zmq
     PkgConfig::NLOHMANN_JSON
     PkgConfig::SYSTEMD
     PUBLIC

@@ -133,8 +133,6 @@ class HiveMind {
     std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
                                                 // if there is a suitable one for outbound use.
 
-    std::shared_ptr<quic::Ticker> subs_ticker_;
-
     PGConnPool pool_;
 
     const int object_id_;  // Thread-safe unique id for this HiveMind object
