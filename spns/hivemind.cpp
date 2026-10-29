@@ -1,6 +1,7 @@
 #include "hivemind.hpp"
 
 #include <fmt/chrono.h>
+#include <fmt/ranges.h>
 #include <fmt/std.h>
 #include <oxenc/base32z.h>
 #include <oxenc/bt_producer.h>
@@ -228,14 +229,22 @@ HiveMind::HiveMind(Config conf_in) :
                 (addr.is_ipv4() || (addr.is_ipv6() && addr.is_any_addr() && addr.dual_stack)))
                 maybe_out_alpn = out_alpn;
 
-            auto ep = quic::Endpoint::endpoint(loop_, addr, in_alpn, maybe_out_alpn);
+            auto ep = quic::Endpoint::endpoint(
+                    loop_,
+                    addr,
+                    in_alpn,
+                    maybe_out_alpn,
+                    quic::opt::allow_gro{},
+                    quic::opt::allow_gso{},
+                    quic::opt::socket_buffers{.recv = 16_Mi, .send = 2_Mi});
 
             ep->listen(
                     creds_in_,
                     [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                         return e.loop.make_shared<quic::BTRequestStream>(
                                 c, e, [this](quic::message m) { on_quic_request(m); });
-                    });
+                    },
+                    quic::opt::congestion_control::cubic);
 
             if (maybe_out_alpn)
                 quic_out_ = ep;
@@ -344,7 +353,7 @@ HiveMind::HiveMind(Config conf_in) :
 
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
     // timer because nothing in here is time critical:
-    subs_ticker_ = loop_.call_every(10s, [this] { check_subs(); });
+    loop_.add_timer(10s, [this] { check_subs(); });
 
     // For updating systemd Status line
     omq_.add_timer([this] { log_stats(); }, 15s);
@@ -701,7 +710,7 @@ void HiveMind::process_notifications() {
                             EncKey,
                             std::string,
                             std::string,
-                            std::optional<bstring>>>
+                            std::vector<std::byte>>>
                             notifies;
                     std::vector<Blake2B_32> filter_vals;
 
@@ -758,7 +767,7 @@ WHERE account = $1
                                 3 + 8 +                  // 1:n i-32768e
                                 3 + 15 +                 // 1:t i1695078498534e (timestamp)
                                 3 + 15 +                 // 1:t i1695078498534e (expiry)
-                                (svcdata ? 3 + 21 + svcdata->size() : 0) +
+                                (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
                                 (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
 
                         if (buf.size() < size_needed)
@@ -769,8 +778,8 @@ WHERE account = $1
                         try {
                             // NB: ascii sorted keys
                             dict.append("", service);
-                            if (svcdata)
-                                dict.append("!", as_sv(*svcdata));
+                            if (!svcdata.empty())
+                                dict.append("!", svcdata);
                             dict.append("#", hash);
                             dict.append("&", svcid);
                             dict.append("@", account.sv());

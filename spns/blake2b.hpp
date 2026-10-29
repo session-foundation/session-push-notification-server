@@ -1,9 +1,12 @@
 #pragma once
 
+#include <oxenc/common.h>
 #include <sodium/crypto_generichash_blake2b.h>
 
 #include <cassert>
 #include <charconv>
+#include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -12,8 +15,13 @@
 
 namespace spns {
 
+template <typename T>
+concept byte_spannable =
+        std::ranges::contiguous_range<T> && oxenc::basic_char<std::ranges::range_value_t<T>>;
+
 namespace detail {
-    template <typename T, std::enable_if_t<std::is_integral_v<T> && (sizeof(T) <= 8), int> = 0>
+    template <std::integral T>
+        requires(sizeof(T) <= 8)
     void blake2b_update(crypto_generichash_blake2b_state& s, const T& val) {
         char buf[20];
         auto [end, ec] = std::to_chars(std::begin(buf), std::end(buf), val);
@@ -22,49 +30,32 @@ namespace detail {
                 &s, reinterpret_cast<const unsigned char*>(buf), end - buf);
     }
 
-    template <typename Char, std::enable_if_t<sizeof(Char) == 1, int> = 0>
-    void blake2b_update(
-            crypto_generichash_blake2b_state& s, const std::basic_string_view<Char>& val) {
-        crypto_generichash_blake2b_update(
-                &s, reinterpret_cast<const unsigned char*>(val.data()), val.size());
-    }
-
-    template <typename Char, std::enable_if_t<sizeof(Char) == 1, int> = 0>
-    void blake2b_update(crypto_generichash_blake2b_state& s, const std::basic_string<Char>& val) {
-        crypto_generichash_blake2b_update(
-                &s, reinterpret_cast<const unsigned char*>(val.data()), val.size());
-    }
-
-    template <typename T, std::enable_if_t<is_bytes<T>, int> = 0>
+    template <byte_spannable T>
     void blake2b_update(crypto_generichash_blake2b_state& s, const T& val) {
         crypto_generichash_blake2b_update(
-                &s, reinterpret_cast<const unsigned char*>(val.data()), val.SIZE);
+                &s,
+                reinterpret_cast<const unsigned char*>(std::ranges::data(val)),
+                std::ranges::size(val));
     }
 }  // namespace detail
 
-template <typename Hash, typename... T, std::enable_if_t<is_bytes<Hash>, int> = 0>
-void blake2b_keyed(Hash& result, ustring_view key, const T&... args) {
+template <bytes_derived Hash, byte_spannable K, typename... T>
+void blake2b_keyed(Hash& result, const K& key, const T&... args) {
     crypto_generichash_blake2b_state s;
-    crypto_generichash_blake2b_init(&s, key.data(), key.size(), result.SIZE);
+    crypto_generichash_blake2b_init(
+            &s,
+            reinterpret_cast<const unsigned char*>(std::ranges::data(key)),
+            std::ranges::size(key),
+            result.SIZE);
     (detail::blake2b_update(s, args), ...);
     crypto_generichash_blake2b_final(&s, result, result.SIZE);
 }
 
-template <typename Hash = Blake2B_32, typename... T, std::enable_if_t<is_bytes<Hash>, int> = 0>
-Hash blake2b_keyed(ustring_view key, const T&... args) {
+template <bytes_derived Hash = Blake2B_32, byte_spannable K, typename... T>
+Hash blake2b_keyed(const K& key, const T&... args) {
     Hash result;
     blake2b_keyed(result, key, args...);
     return result;
-}
-
-template <typename Hash = Blake2B_32, typename... T>
-Hash blake2b_keyed(std::string_view key, const T&... args) {
-    return blake2b_keyed<Hash>(as_usv(key), args...);
-}
-
-template <typename Hash = Blake2B_32, typename... T>
-Hash blake2b_keyed(bstring_view key, const T&... args) {
-    return blake2b_keyed<Hash>(as_usv(key), args...);
 }
 
 template <typename Hash = Blake2B_32, typename... T>
