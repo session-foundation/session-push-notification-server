@@ -229,14 +229,22 @@ HiveMind::HiveMind(Config conf_in) :
                 (addr.is_ipv4() || (addr.is_ipv6() && addr.is_any_addr() && addr.dual_stack)))
                 maybe_out_alpn = out_alpn;
 
-            auto ep = quic::Endpoint::endpoint(loop_, addr, in_alpn, maybe_out_alpn);
+            auto ep = quic::Endpoint::endpoint(
+                    loop_,
+                    addr,
+                    in_alpn,
+                    maybe_out_alpn,
+                    quic::opt::allow_gro{},
+                    quic::opt::allow_gso{},
+                    quic::opt::socket_buffers{.recv = 16_Mi, .send = 2_Mi});
 
             ep->listen(
                     creds_in_,
                     [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                         return e.loop.make_shared<quic::BTRequestStream>(
                                 c, e, [this](quic::message m) { on_quic_request(m); });
-                    });
+                    },
+                    quic::opt::congestion_control::cubic);
 
             if (maybe_out_alpn)
                 quic_out_ = ep;
