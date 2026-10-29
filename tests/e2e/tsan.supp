@@ -1,0 +1,24 @@
+# libstdc++'s std::future synchronises through futex code in the uninstrumented libstdc++.so, which
+# TSan cannot see, so every hand-off through a future (oxen::quic's call_get) reads as a race.
+race:std::__future_base
+race:std::__basic_future
+race:std::future
+
+# oxenmq hands a send's options (the queue_full callback) and its message buffers to its proxy
+# thread through zmq, which is not instrumented, so their creation and destruction read as a race.
+race:oxenmq::detail::serialize_object
+race:oxenmq::detail::build_send
+race:oxenmq::create_message
+race:message_buffer_destroy
+
+# oxenmq runs a queue_full callback on one of its threads and destroys it on another, handing it
+# over through zmq; this matches only callbacks destroyed inside liboxenmq.
+race:std::function<void ()>::~function()
+
+# The same hand-off for request reply callbacks, which oxenmq copies and destroys on its proxy
+# thread; this type is oxenmq's reply callback.
+race:std::function<void (bool, std::vector<*>)>::function
+race:std::function<void (bool, std::vector<*>)>::~function
+
+# oxenmq's proxy loading a job into a worker's slot; the worker picks it up through zmq.
+race:oxenmq::OxenMQ::run_info::load
