@@ -184,6 +184,7 @@ class HiveMind {
         EncKey enc_key;
         bool want_data;
         std::vector<int16_t> namespaces;  // Sorted
+        int64_t sig_ts;
     };
 
     // {account: [PushTarget...]}: an in-memory copy of the subscriptions table, so that a
@@ -192,8 +193,16 @@ class HiveMind {
     std::unordered_map<AccountID, std::vector<PushTarget>> push_targets_;
     std::shared_mutex push_targets_mutex_;
     void set_push_target(const AccountID& account, PushTarget target);
-    void drop_push_target(
-            const AccountID& account, std::string_view service, std::string_view svcid);
+    // A subscriptions row a writer deleted.
+    struct DroppedTarget {
+        AccountID account;
+        std::string service;
+        std::string svcid;
+        int64_t sig_ts;
+    };
+    // Leaves a target renewed since its row was deleted: the renewal can commit and reach
+    // set_push_target() before the deleting writer gets here.
+    void drop_push_targets(const std::vector<DroppedTarget>& dropped);
 
     // edpk -> SNode
     std::unordered_map<Ed25519PK, std::shared_ptr<hive::SNode>> sns_;

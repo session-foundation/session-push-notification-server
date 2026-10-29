@@ -614,16 +614,18 @@ void HiveMind::set_push_target(const AccountID& account, PushTarget target) {
     targets.push_back(std::move(target));
 }
 
-void HiveMind::drop_push_target(
-        const AccountID& account, std::string_view service, std::string_view svcid) {
+void HiveMind::drop_push_targets(const std::vector<DroppedTarget>& dropped) {
     std::unique_lock lock{push_targets_mutex_};
-    auto it = push_targets_.find(account);
-    if (it == push_targets_.end())
-        return;
-    std::erase_if(
-            it->second, [&](const auto& t) { return t.service == service && t.svcid == svcid; });
-    if (it->second.empty())
-        push_targets_.erase(it);
+    for (const auto& d : dropped) {
+        auto it = push_targets_.find(d.account);
+        if (it == push_targets_.end())
+            continue;
+        std::erase_if(it->second, [&](const auto& t) {
+            return t.service == d.service && t.svcid == d.svcid && t.sig_ts <= d.sig_ts;
+        });
+        if (it->second.empty())
+            push_targets_.erase(it);
+    }
 }
 
 void HiveMind::send_push(
@@ -868,7 +870,7 @@ void HiveMind::process_notifications() {
                     continue;
                 }
 
-                for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces] :
+                for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces, sig_ts] :
                      it->second) {
                     if (!std::binary_search(namespaces.begin(), namespaces.end(), ns))
                         continue;
@@ -1132,7 +1134,7 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
     }
     auto conn = pool_.get();
     int reqed = 0, deleted = 0, matched = 0;
-    std::vector<std::pair<AccountID, std::string>> dropped;
+    std::vector<DroppedTarget> dropped;
     try {
         pqxx::work tx{conn};
         while (!drops.is_finished()) {
@@ -1140,13 +1142,17 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
             std::string svcid{drops.consume_string_view()};
             auto del =
                     tx.exec("DELETE FROM subscriptions WHERE service = $1 AND svcid = $2 RETURNING "
-                            "account",
+                            "account, signature_ts",
                             {service, svcid});
             deleted += del.size();
             if (!del.empty())
                 matched++;
             for (auto row : del)
-                dropped.emplace_back(row[0].as<AccountID>(), svcid);
+                dropped.push_back(
+                        {row[0].as<AccountID>(),
+                         std::string{service},
+                         svcid,
+                         row[1].as<int64_t>()});
         }
         tx.commit();
     } catch (const oxenc::bt_deserialize_invalid_type&) {
@@ -1155,8 +1161,7 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
                 "invalid admin.on_drop_registration request: expected list of service id strings");
         return;
     }
-    for (const auto& [account, svcid] : dropped)
-        drop_push_target(account, service, svcid);
+    drop_push_targets(dropped);
 
     log::info(
             cat,
@@ -1574,12 +1579,18 @@ void HiveMind::db_cleanup() {
     pqxx::work tx{conn};
     auto expired =
             tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1 RETURNING account, "
-                    "service, svcid",
+                    "service, svcid, signature_ts",
                     {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)});
     tx.commit();
+    std::vector<DroppedTarget> dropped;
+    dropped.reserve(expired.size());
     for (auto row : expired)
-        drop_push_target(
-                row[0].as<AccountID>(), row[1].as<std::string>(), row[2].as<std::string>());
+        dropped.push_back(
+                {row[0].as<AccountID>(),
+                 row[1].as<std::string>(),
+                 row[2].as<std::string>(),
+                 row[3].as<int64_t>()});
+    drop_push_targets(dropped);
 }
 
 void HiveMind::refresh_sns() {
@@ -1942,7 +1953,8 @@ WHERE id % {0} = {1})"_format(n, i))) {
                         svcdata ? std::move(*svcdata) : std::vector<std::byte>{},
                         enc_key,
                         wd,
-                        ns_arr};
+                        ns_arr,
+                        sigts_in};
             }
         }};
     }
@@ -1975,7 +1987,7 @@ WHERE id % {0} = {1})"_format(n, i))) {
 
             // Pushes go to every stored subscription until db_cleanup() removes it, so this takes
             // the rows skipped below for being about to expire too.
-            push_targets_[swpk->id].push_back(std::move(target));
+            set_push_target(swpk->id, std::move(target));
 
             if (sigts <= sigts_cutoff.first || sigts >= sigts_cutoff.second)
                 // Don't try loading entries that are about to expire
@@ -2063,33 +2075,38 @@ FROM subscriptions
 WHERE
     account = $1 AND service = $2 AND svcid = $3)",
             {pubkey.id, service, service_id});
-    int64_t id;
+    std::optional<int64_t> id;
     if (result) {
         auto& [row_id, sig_ts, ns_arr_in] = *result;
         std::vector<int16_t> ns_arr{ns_arr_in.cbegin(), ns_arr_in.cend()};
-        id = row_id;
 
-        insert_ns = ns_arr != sub.namespaces;
         log::trace(cat, "updating subscription for {}", pubkey.id.hex());
-        tx.exec(
-                  R"(
+        auto updated =
+                tx.exec(
+                          R"(
 UPDATE subscriptions
 SET session_ed25519 = $2, subaccount_tag = $3, subaccount_sig = $4, signature = $5, signature_ts = $6, want_data = $7, enc_key = $8, svcdata = $9
 WHERE id = $1
                     )",
-                  {id,
-                   pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
-                   sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
-                   sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
-                   sub.sig,
-                   sub.sig_ts.time_since_epoch().count(),
-                   sub.want_data,
-                   enc_key,
-                   service_data})
-                .no_rows();
-        if (insert_ns)
-            tx.exec("DELETE FROM sub_namespaces WHERE subscription = $1", {id}).no_rows();
-    } else {
+                          {row_id,
+                           pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
+                           sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
+                           sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
+                           sub.sig,
+                           sub.sig_ts.time_since_epoch().count(),
+                           sub.want_data,
+                           enc_key,
+                           service_data})
+                        .no_rows();
+        // db_cleanup() can delete the row after the SELECT, leaving nothing to update.
+        if (updated.affected_rows() > 0) {
+            id = row_id;
+            insert_ns = ns_arr != sub.namespaces;
+            if (insert_ns)
+                tx.exec("DELETE FROM sub_namespaces WHERE subscription = $1", {*id}).no_rows();
+        }
+    }
+    if (!id) {
         new_sub = true;
         log::trace(cat, "inserting new subscription for {}", pubkey.id.hex());
         auto row = tx.exec(
@@ -2119,7 +2136,7 @@ RETURNING id
     if (insert_ns)
         for (auto n : sub.namespaces)
             tx.exec(R"(INSERT INTO sub_namespaces (subscription, namespace) VALUES ($1, $2))",
-                    {id, n})
+                    {*id, n})
                     .no_rows();
 
     for (const auto& s : {""s, service})
@@ -2140,7 +2157,8 @@ RETURNING id
                     std::move(svcdata),
                     enc_key,
                     sub.want_data,
-                    sub.namespaces});
+                    sub.namespaces,
+                    sub.sig_ts.time_since_epoch().count()});
 
     return loop_.call_get([&] {
         pubkey.update_swarm(swarm_ids_);
@@ -2215,21 +2233,20 @@ bool HiveMind::remove_subscription(
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result =
-            tx.exec(R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3)",
-                    {pubkey.id, service, service_id})
-                    .no_rows();
+    auto result = tx.exec(
+            R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3 RETURNING signature_ts)",
+            {pubkey.id, service, service_id});
 
     tx.commit();
 
-    if (result.affected_rows() > 0)
-        drop_push_target(pubkey.id, service, service_id);
+    if (!result.empty())
+        drop_push_targets({{pubkey.id, service, service_id, result[0][0].as<int64_t>()}});
 
     // We don't remove the subscription from internal data structures: other devices
     // (with the exact subcription) may be still using it, and so we may still want
     // the notifications; but as long as the row is removed (above) we won't be
     // sending notifications to the device anymore.
-    return result.affected_rows() > 0;
+    return !result.empty();
 }
 
 }  // namespace spns
