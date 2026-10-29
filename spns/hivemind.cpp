@@ -564,8 +564,16 @@ ON CONFLICT (service, name) DO UPDATE
 }
 
 void HiveMind::on_message_notification(quic::message m) {
+    // Bounds what waits while processing is held up, e.g. by a notifier that has stopped reading.
+    constexpr size_t MAX_QUEUED_BYTES = 256 << 20;
+
     {
         std::lock_guard lock{notify_mutex_};
+        if (notify_queue_bytes_ >= MAX_QUEUED_BYTES) {
+            notifications_dropped_++;
+            return;
+        }
+        notify_queue_bytes_ += m.body().size();
         notify_queue_.push_back(std::move(m));
     }
     notify_cv_.notify_one();
@@ -623,7 +631,10 @@ void HiveMind::process_notifications() {
     std::vector<quic::message> process;
     std::vector<std::pair<oxenmq::ConnectionID, std::string>> retry;
     std::string buf;
-    int64_t dropped_logged = 0;
+    int64_t dropped_logged = 0, notifications_dropped_logged = 0;
+    // Doubles while resends make no headway, so a stopped notifier costs little.
+    auto retry_wait = 10ms;
+    size_t retry_waiting = 0;
 
     while (true) {
         {
@@ -635,21 +646,19 @@ void HiveMind::process_notifications() {
                 return;
             process.clear();
             if (!push_retry_.empty()) {
+                retry_wait = push_retry_.size() < retry_waiting ? 10ms
+                                                                : std::min(retry_wait * 2, 1000ms);
+                retry_waiting = push_retry_.size();
                 auto end = push_retry_.begin() + std::min(push_retry_.size(), RETRY_BATCH);
                 retry.assign(
                         std::make_move_iterator(push_retry_.begin()), std::make_move_iterator(end));
                 push_retry_.erase(push_retry_.begin(), end);
-            } else
+            } else {
+                retry_wait = 10ms;
+                retry_waiting = 0;
                 process.swap(notify_queue_);
-        }
-
-        if (!retry.empty()) {
-            log::debug(cat, "Resending {} pushes the notifier had no room for", retry.size());
-            for (auto& [conn, push] : retry)
-                send_push(std::move(conn), push);
-            retry.clear();
-            std::this_thread::sleep_for(10ms);
-            continue;
+                notify_queue_bytes_ = 0;
+            }
         }
 
         if (auto dropped = pushes_dropped_.load(); dropped != dropped_logged) {
@@ -658,6 +667,22 @@ void HiveMind::process_notifications() {
                     "Dropped {} pushes: the notifier is not keeping up with those already waiting",
                     dropped - dropped_logged);
             dropped_logged = dropped;
+        }
+        if (auto dropped = notifications_dropped_.load(); dropped != notifications_dropped_logged) {
+            log::warning(
+                    cat,
+                    "Dropped {} incoming notifications: too many are waiting to be processed",
+                    dropped - notifications_dropped_logged);
+            notifications_dropped_logged = dropped;
+        }
+
+        if (!retry.empty()) {
+            log::debug(cat, "Resending {} pushes the notifier had no room for", retry.size());
+            for (auto& [conn, push] : retry)
+                send_push(std::move(conn), push);
+            retry.clear();
+            std::this_thread::sleep_for(retry_wait);
+            continue;
         }
 
         log::debug(cat, "Processing {} network message notifications", process.size());
