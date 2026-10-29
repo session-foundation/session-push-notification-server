@@ -603,14 +603,14 @@ void HiveMind::send_push(oxenmq::ConnectionID conn, std::string_view push) {
             conn,
             "notifier.push",
             push,
-            oxenmq::send_option::queue_full{[this, conn, push = std::string{push}]() mutable {
+            oxenmq::send_option::queue_full{[this, conn, push = std::string{push}] {
                 {
                     std::lock_guard lock{notify_mutex_};
                     if (push_retry_.size() >= MAX_RETRY_QUEUE) {
                         pushes_dropped_++;
                         return;
                     }
-                    push_retry_.emplace_back(std::move(conn), std::move(push));
+                    push_retry_.emplace_back(conn, push);
                 }
                 notify_cv_.notify_one();
             }});
