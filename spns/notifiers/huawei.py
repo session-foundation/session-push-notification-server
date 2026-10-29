@@ -127,7 +127,7 @@ def start():
 
     omq = OxenMQ(pubkey=key.public_key.encode(), privkey=key.encode())
 
-    cat = omq.add_category("notifier", AuthLevel.basic)
+    cat = omq.add_category("notifier", AuthLevel.basic, max_queue=-1)
     cat.add_request_command("validate", validate)
     cat.add_command("push", push_notification)
 

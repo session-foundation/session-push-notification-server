@@ -56,11 +56,11 @@ struct AccountID : bytes<33> {
     // Access a span convering just the X25519 pubkey (i.e. subspan skipping the first byte):
     template <oxenc::basic_char C = std::byte>
     std::span<C, 32> xpk() {
-        return std::span<C, 32>{reinterpret_cast<C*>(data()), 32};
+        return std::span<C, 32>{reinterpret_cast<C*>(data()) + 1, 32};
     }
     template <oxenc::basic_char C = std::byte>
     std::span<const C, 32> xpk() const {
-        return std::span<C, 32>{reinterpret_cast<const C*>(data()), 32};
+        return std::span<const C, 32>{reinterpret_cast<const C*>(data()) + 1, 32};
     }
 };
 struct Ed25519PK : bytes<32> {};
