@@ -136,6 +136,8 @@ class HiveMind {
     std::mutex notify_mutex_;
     std::condition_variable notify_cv_;
     std::vector<quic::message> notify_queue_;
+    size_t notify_queue_bytes_ = 0;
+    std::atomic<int64_t> notifications_dropped_{0};
     bool notify_quit_ = false;
 
     // Pushes oxenmq had no room for in its queue to the notifier (it drops a message rather than
