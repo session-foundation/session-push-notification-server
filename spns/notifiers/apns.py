@@ -85,7 +85,7 @@ class APNSHandler:
 
         self.omq = OxenMQ(pubkey=key.public_key.encode(), privkey=key.encode())
 
-        cat = self.omq.add_category("notifier", AuthLevel.basic)
+        cat = self.omq.add_category("notifier", AuthLevel.basic, max_queue=-1)
         cat.add_request_command("validate", self.validate)
         cat.add_command("push", self.push_notification)
 
