@@ -1098,7 +1098,7 @@ void HiveMind::on_notifier_validation(
                 std::optional<std::string> service_data;
                 if (data.size() > 2)
                     service_data = std::move(data[2]);
-                if (service_data->size() > SERVICE_DATA_MAX_SIZE)
+                if (service_data && service_data->size() > SERVICE_DATA_MAX_SIZE)
                     throw std::invalid_argument{
                             "service data too long ({})"_format(service_data->size())};
                 log::trace(cat, "Adding {} subscription for {}", service, pubkey.id.hex());
@@ -1326,15 +1326,6 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(enc_key),
                             std::move(data));
                 };
-
-                // We handle everything else (including the response) in `_on_notifier_validation`
-                // when/if the notifier service comes back to us with the unique identifier:
-                omq_.request(
-                        conn,
-                        "notifier.validate",
-                        std::move(reply_handler),
-                        service,
-                        service_info.dump());
             } else {
                 // unsubscribe
 
@@ -1363,6 +1354,8 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                 };
             }
 
+            // Everything else (including the response) is handled in on_notifier_validation
+            // when/if the notifier service comes back to us with the unique identifier.
             omq_.request(
                     conn,
                     "notifier.validate",
@@ -1420,7 +1413,7 @@ void HiveMind::quic_subscribe(quic::message& m) {
 }
 
 void HiveMind::quic_unsubscribe(quic::message& m) {
-    on_sub_unsub_impl(m, true);
+    on_sub_unsub_impl(m, false);
 }
 
 void HiveMind::on_subscribe(oxenmq::Message& m) {
