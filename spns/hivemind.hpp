@@ -16,18 +16,23 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
+#include <oxen/quic/btstream.hpp>
 #include <oxen/quic/crypto.hpp>
 #include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/loop.hpp>
-#include <oxenmq/zmq.hpp>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -125,6 +130,23 @@ class HiveMind {
     const Config config;
 
   private:
+    // Message notifications waiting for process_notifications().  The loop thread only appends
+    // here: a notification is parsed, looked up and sent on the processing thread, so that the
+    // loop keeps reading from every service node however long that takes.
+    std::mutex notify_mutex_;
+    std::condition_variable notify_cv_;
+    std::vector<quic::message> notify_queue_;
+    bool notify_quit_ = false;
+
+    // Pushes oxenmq had no room for in its queue to the notifier (it drops a message rather than
+    // wait): process_notifications() resends these before taking new notifications, so that a
+    // burst waits for the notifier instead of being lost.  Guarded by notify_mutex_.  These are
+    // declared before omq_ so that they outlive its proxy thread, which runs send_push()'s
+    // queue_full callback.
+    std::deque<std::pair<oxenmq::ConnectionID, std::string>> push_retry_;
+    std::atomic<int64_t> pushes_dropped_{0};
+    void send_push(oxenmq::ConnectionID conn, std::string_view push);
+
     // std::mutex mutex_;
     //  OxenMQ server for internal communications, proxied subscriptions, etc.
     oxenmq::OxenMQ omq_;
@@ -138,14 +160,27 @@ class HiveMind {
 
     PGConnPool pool_;
 
-    const int object_id_;  // Thread-safe unique id for this HiveMind object
-    zmq::context_t notification_ctx_{};
-    zmq::socket_t notify_pull_{notification_ctx_, zmq::socket_type::pull};
     std::thread notify_proc_thread_;
-    std::unordered_map<std::thread::id, std::unique_ptr<zmq::socket_t>> notify_push_;
-    std::mutex notify_push_mutex_;
-    zmq::socket_t& notify_push_sock();
     std::atomic<int64_t> pushes_processed_{0};
+
+    // Everything needed to send a push to one subscribed device.
+    struct PushTarget {
+        std::string service;
+        std::string svcid;
+        std::vector<std::byte> svcdata;  // Empty if the notifier gave none
+        EncKey enc_key;
+        bool want_data;
+        std::vector<int16_t> namespaces;  // Sorted
+    };
+
+    // {account: [PushTarget...]}: an in-memory copy of the subscriptions table, so that a
+    // notification is a lookup here rather than a database query.  Every write to that table
+    // updates this once committed.
+    std::unordered_map<AccountID, std::vector<PushTarget>> push_targets_;
+    std::shared_mutex push_targets_mutex_;
+    void set_push_target(const AccountID& account, PushTarget target);
+    void drop_push_target(
+            const AccountID& account, std::string_view service, std::string_view svcid);
 
     // edpk -> SNode
     std::unordered_map<Ed25519PK, std::shared_ptr<hive::SNode>> sns_;
@@ -166,14 +201,17 @@ class HiveMind {
 
     const std::chrono::system_clock::time_point startup_time = std::chrono::system_clock::now();
 
-    // contains Blake2B(service || svcid || msghash) for sent notification de-duping.  Every 10
-    // minutes, we replace filter_rotate_ with filter_, and check both filters for de-duping (so
-    // that hashes expire after 10-20 minutes).  (The 10 mins value is configurable).
+    // contains Blake2B(account || msghash) of the notifications already handled: every member of
+    // the account's swarm sends us the same one, and only the first is looked up and pushed.
+    // Every 10 minutes, we replace filter_rotate_ with filter_, and check both filters for
+    // de-duping (so that hashes expire after 10-20 minutes).  (The 10 mins value is configurable).
+    // Only used on the notification processing thread.
     std::unordered_set<Blake2B_32> filter_, filter_rotate_;
     steady_time filter_rotate_time_ = steady_clock::now() + config.filter_lifetime;
 
     // Registered push services: servicename => omq Connectionid to talk to the service
     std::unordered_map<std::string, oxenmq::ConnectionID> services_;
+    std::mutex services_mutex_;
 
     // Our connection to a local oxend for block and SN info
     oxenmq::ConnectionID oxend_;
