@@ -674,13 +674,16 @@ void HiveMind::process_notifications() {
     // ignored as for any unregistered service.
     constexpr auto GONE_LIMIT = 5min;
 
-    std::vector<quic::message> process;
     std::vector<std::pair<std::string, std::string>> retry;
     std::unordered_set<std::string> held, expired;
+    std::vector<PushTarget> targets;
     std::string buf;
     int64_t notifications_dropped_logged = 0;
 
     while (true) {
+        // Declared per pass so that its messages are freed here, outside the lock, rather than in
+        // the next pass's critical section while the loop thread waits to queue more.
+        std::vector<quic::message> process;
         {
             std::unique_lock lock{notify_mutex_};
             auto ready = [this] {
@@ -702,7 +705,6 @@ void HiveMind::process_notifications() {
             }
             if (notify_quit_)
                 return;
-            process.clear();
             process.swap(notify_queue_);
             notify_queue_bytes_ = 0;
         }
@@ -871,15 +873,20 @@ void HiveMind::process_notifications() {
                     continue;
                 }
 
-                std::shared_lock lock{push_targets_mutex_};
-                auto it = push_targets_.find(account);
-                if (it == push_targets_.end()) {
-                    log::debug(cat, "No active notifications match, ignoring notification");
-                    continue;
+                // Copied out so that the lock is not held across the sends below, which can block
+                // on oxenmq's proxy and would hold up every subscription writer meanwhile.
+                {
+                    std::shared_lock lock{push_targets_mutex_};
+                    auto it = push_targets_.find(account);
+                    if (it == push_targets_.end()) {
+                        log::debug(cat, "No active notifications match, ignoring notification");
+                        continue;
+                    }
+                    targets = it->second;
                 }
 
                 for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces, sig_ts] :
-                     it->second) {
+                     targets) {
                     if (!std::binary_search(namespaces.begin(), namespaces.end(), ns))
                         continue;
 
