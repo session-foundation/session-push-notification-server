@@ -144,9 +144,7 @@ class HiveMind {
     // notifier's queue (it drops a message rather than wait), and those for a notifier whose
     // connection went away, until it registers again.  process_notifications() resends them to
     // whichever connection the service is on by then, and sends a service's new pushes after them,
-    // so one slow notifier holds up only its own pushes.  Guarded by notify_mutex_.  Declared
-    // before omq_ so that they outlive its worker threads, which run send_push()'s failure
-    // callback.
+    // so one slow notifier holds up only its own pushes.  Guarded by notify_mutex_.
     struct PushRetry {
         std::deque<std::string> pushes;
         // Doubles while resends make no headway, so a notifier that stops reading costs little.
@@ -160,9 +158,11 @@ class HiveMind {
     void send_push(const std::string& service, oxenmq::ConnectionID conn, std::string_view push);
     void queue_retry(const std::string& service, std::string push);
 
-    // std::mutex mutex_;
-    //  OxenMQ server for internal communications, proxied subscriptions, etc.
-    oxenmq::OxenMQ omq_;
+    // OxenMQ server for internal communications, proxied subscriptions, etc.  Held in an optional
+    // so that the destructor can tear it down first: its worker threads run request handlers and
+    // send_push()'s failure callback, which touch members declared after it.
+    std::optional<oxenmq::OxenMQ> omq_impl_;
+    oxenmq::OxenMQ& omq_ = *omq_impl_;
 
     // QUIC endpoint used to connect to service nodes (for receiving pushes)
     quic::Loop loop_;

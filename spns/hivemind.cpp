@@ -38,10 +38,12 @@ static auto stats = log::Cat("stats");
 HiveMind::HiveMind(Config conf_in) :
         config{std::move(conf_in)},
         pool_{config.pg_connect},
-        omq_{std::string{config.omq_pubkey.sv()},
-             std::string{config.omq_privkey.sv()},
-             false,
-             nullptr} {
+        omq_impl_{
+                std::in_place,
+                std::string{config.omq_pubkey.sv()},
+                std::string{config.omq_privkey.sv()},
+                false,
+                nullptr} {
 
     // fiddle_rlimit_nofile();
 
@@ -372,6 +374,12 @@ HiveMind::~HiveMind() {
         notify_cv_.notify_one();
         notify_proc_thread_.join();
     }
+
+    // Stop OxenMQ before anything else: its workers run request handlers and the push failure
+    // callback, which use members destroyed below, and they call into loop_, which is about to be
+    // torn down.
+    omq_impl_.reset();
+
     loop_.call_get([this] {
         // We destroy the Endpoints first, because during quic_opt_'s destruction it triggers
         // disconnect callbacks which still have captured pointers into the SNode objects living in
