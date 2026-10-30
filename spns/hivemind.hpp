@@ -70,6 +70,28 @@ inline constexpr size_t SERVICE_ID_MAX_SIZE = 999;
 inline constexpr size_t SERVICE_DATA_MAX_SIZE = 99'999;
 inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 
+// Maximum bytes of incoming message notifications waiting for the processing thread; beyond this
+// they are dropped.  Bounds what waits while processing is held up, e.g. by a stalled notifier.
+inline constexpr size_t NOTIFY_QUEUE_MAX_BYTES = 256_Mi;
+
+// Maximum pushes held per service for a notifier that is not taking them (its oxenmq queue is
+// full, or its connection is gone); beyond this the service's new pushes are dropped.
+inline constexpr size_t PUSH_RETRY_MAX = 50_k;
+
+// At most this many of a service's waiting pushes are resent per processing pass.
+inline constexpr size_t PUSH_RETRY_BATCH = 500;
+
+// The wait between resends starts at the minimum, doubles up to the maximum while they make no
+// headway, and returns to the minimum once the notifier drains.
+inline constexpr std::chrono::milliseconds PUSH_RETRY_MIN_WAIT = 10ms;
+inline constexpr std::chrono::milliseconds PUSH_RETRY_MAX_WAIT = 1s;
+
+// A notifier whose connection failed has this long to register again before its waiting pushes
+// are dropped and it is treated as any unregistered service.  While waiting, its queue is
+// rechecked at this interval.
+inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
+inline constexpr auto NOTIFIER_GONE_RECHECK = 1s;
+
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
   "active_only": true,
@@ -148,7 +170,7 @@ class HiveMind {
     struct PushRetry {
         std::deque<std::string> pushes;
         // Doubles while resends make no headway, so a notifier that stops reading costs little.
-        std::chrono::milliseconds wait{10};
+        std::chrono::milliseconds wait = PUSH_RETRY_MIN_WAIT;
         steady_time next{};
         size_t last_size = 0;
         // Dropped for exceeding the per-service limit, since last logged.

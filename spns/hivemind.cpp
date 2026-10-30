@@ -595,12 +595,9 @@ ON CONFLICT (service, name) DO UPDATE
 }
 
 void HiveMind::on_message_notification(quic::message m) {
-    // Bounds what waits while processing is held up, e.g. by a notifier that has stopped reading.
-    constexpr size_t MAX_QUEUED_BYTES = 256 << 20;
-
     {
         std::lock_guard lock{notify_mutex_};
-        if (notify_queue_bytes_ >= MAX_QUEUED_BYTES) {
+        if (notify_queue_bytes_ >= NOTIFY_QUEUE_MAX_BYTES) {
             notifications_dropped_++;
             return;
         }
@@ -652,13 +649,10 @@ void HiveMind::send_push(
 }
 
 void HiveMind::queue_retry(const std::string& service, std::string push) {
-    // Bounds what waits for a notifier that is not taking pushes, without affecting the others.
-    constexpr size_t MAX_RETRY_QUEUE = 50'000;
-
     {
         std::lock_guard lock{notify_mutex_};
         auto& r = push_retry_[service];
-        if (r.pushes.size() >= MAX_RETRY_QUEUE) {
+        if (r.pushes.size() >= PUSH_RETRY_MAX) {
             r.dropped++;
             return;
         }
@@ -668,12 +662,6 @@ void HiveMind::queue_retry(const std::string& service, std::string push) {
 }
 
 void HiveMind::process_notifications() {
-    // At most this many of a service's waiting pushes are resent per pass.
-    constexpr size_t RETRY_BATCH = 500;
-    // A notifier gone this long is not a restart: its waiting pushes are dropped, and new ones are
-    // ignored as for any unregistered service.
-    constexpr auto GONE_LIMIT = 5min;
-
     std::vector<std::pair<std::string, std::string>> retry;
     std::unordered_set<std::string> held, expired;
     std::vector<PushTarget> targets;
@@ -717,7 +705,7 @@ void HiveMind::process_notifications() {
             services = services_;
             auto now = steady_clock::now();
             for (auto it = services_gone_.begin(); it != services_gone_.end();) {
-                if (now - it->second >= GONE_LIMIT) {
+                if (now - it->second >= NOTIFIER_GONE_LIMIT) {
                     expired.insert(it->first);
                     it = services_gone_.erase(it);
                 } else {
@@ -754,7 +742,7 @@ void HiveMind::process_notifications() {
                 if (r.next > now || !services.count(service)) {
                     if (r.next <= now)
                         // Gone: wait for it to register again, which wakes us sooner.
-                        r.next = now + 1s;
+                        r.next = now + NOTIFIER_GONE_RECHECK;
                     if (!r.pushes.empty())
                         held.insert(service);
                     ++it;
@@ -766,10 +754,11 @@ void HiveMind::process_notifications() {
                     it = push_retry_.erase(it);
                     continue;
                 }
-                r.wait = r.pushes.size() < r.last_size ? 10ms : std::min(r.wait * 2, 1000ms);
+                r.wait = r.pushes.size() < r.last_size ? PUSH_RETRY_MIN_WAIT
+                                                       : std::min(r.wait * 2, PUSH_RETRY_MAX_WAIT);
                 r.last_size = r.pushes.size();
                 r.next = now + r.wait;
-                auto n = std::min(r.pushes.size(), RETRY_BATCH);
+                auto n = std::min(r.pushes.size(), PUSH_RETRY_BATCH);
                 for (size_t i = 0; i < n; i++) {
                     retry.emplace_back(service, std::move(r.pushes.front()));
                     r.pushes.pop_front();
