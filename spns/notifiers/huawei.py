@@ -130,6 +130,7 @@ def start():
     cat = omq.add_category("notifier", AuthLevel.basic)
     cat.add_request_command("validate", validate)
     cat.add_command("push", push_notification)
+    cat.add_request_command("ack", lambda msg: msg.reply())
 
     omq.add_timer(ping, datetime.timedelta(seconds=5))
 

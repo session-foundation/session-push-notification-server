@@ -74,23 +74,24 @@ inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 // they are dropped.  Bounds what waits while processing is held up, e.g. by a stalled notifier.
 inline constexpr size_t NOTIFY_QUEUE_MAX_BYTES = 256_Mi;
 
-// Maximum pushes held per service for a notifier that is not taking them (its oxenmq queue is
-// full, or its connection is gone); beyond this the service's new pushes are dropped.
-inline constexpr size_t PUSH_RETRY_MAX = 50_k;
+// Maximum pushes held per service while its notifier cannot take them (the window below is full,
+// or its connection is gone); beyond this the service's new pushes are dropped.
+inline constexpr size_t PUSH_BACKLOG_MAX = 50_k;
 
-// At most this many of a service's waiting pushes are resent per processing pass.
-inline constexpr size_t PUSH_RETRY_BATCH = 500;
+// Push flow control.  Every PUSH_ACK_INTERVAL-th push to a service is followed by a notifier.ack
+// request, which the notifier answers once it has taken everything queued before it, and pushes to
+// the service stop while PUSH_WINDOW are unacknowledged.  The window plus two outstanding acks must
+// fit the notifier's oxenmq queue for its category (200 by default; see register_service), and sits
+// far below zmq's 1000-message send queue so that neither a push nor an ack is ever refused.
+inline constexpr size_t PUSH_ACK_INTERVAL = 95;
+inline constexpr size_t PUSH_WINDOW = 2 * PUSH_ACK_INTERVAL;
 
-// The wait between resends starts at the minimum, doubles up to the maximum while they make no
-// headway, and returns to the minimum once the notifier drains.
-inline constexpr std::chrono::milliseconds PUSH_RETRY_MIN_WAIT = 10ms;
-inline constexpr std::chrono::milliseconds PUSH_RETRY_MAX_WAIT = 1s;
+// How often a service whose window has filled is reported.
+inline constexpr auto PUSH_BLOCKED_REPORT_INTERVAL = 30s;
 
-// A notifier whose connection failed has this long to register again before its waiting pushes
-// are dropped and it is treated as any unregistered service.  While waiting, its queue is
-// rechecked at this interval.
+// A notifier whose connection failed has this long to register again before its backlog is
+// dropped and it is treated as any unregistered service.
 inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
-inline constexpr auto NOTIFIER_GONE_RECHECK = 1s;
 
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
@@ -162,23 +163,30 @@ class HiveMind {
     std::atomic<int64_t> notifications_dropped_{0};
     bool notify_quit_ = false;
 
-    // Pushes waiting for their notifier, per service: those oxenmq had no room for in the
-    // notifier's queue (it drops a message rather than wait), and those for a notifier whose
-    // connection went away, until it registers again.  process_notifications() resends them to
-    // whichever connection the service is on by then, and sends a service's new pushes after them,
-    // so one slow notifier holds up only its own pushes.  Guarded by notify_mutex_.
-    struct PushRetry {
-        std::deque<std::string> pushes;
-        // Doubles while resends make no headway, so a notifier that stops reading costs little.
-        std::chrono::milliseconds wait = PUSH_RETRY_MIN_WAIT;
-        steady_time next{};
-        size_t last_size = 0;
-        // Dropped for exceeding the per-service limit, since last logged.
+    // Per-service push flow control and backlog.  Guarded by notify_mutex_.
+    struct ServicePushes {
+        // The connection the counters refer to; on_reg_service() resets them when it changes.
+        oxenmq::ConnectionID conn;
+        // Pushes sent on conn not yet covered by a notifier.ack reply.
+        size_t unacked = 0;
+        // Pushes waiting to be sent because the window is full or the notifier's connection is
+        // gone.  Sent, in order, ahead of any new push for the service.
+        std::deque<std::string> backlog;
+        // Dropped for exceeding PUSH_BACKLOG_MAX, since last reported.
         int64_t dropped = 0;
+        // Times the window filled since last reported, and since when it has been full.
+        int64_t blocks = 0;
+        std::optional<steady_time> blocked_since;
+        steady_time next_report{};
     };
-    std::unordered_map<std::string, PushRetry> push_retry_;
-    void send_push(const std::string& service, oxenmq::ConnectionID conn, std::string_view push);
-    void queue_retry(const std::string& service, std::string push);
+    std::unordered_map<std::string, ServicePushes> service_pushes_;
+    // Set when a backlog may be sendable again: an ack arrived, or a notifier registered.
+    bool drain_ = false;
+    void send_push(
+            const std::string& service, const oxenmq::ConnectionID& conn, std::string_view push);
+    void request_ack(const std::string& service, const oxenmq::ConnectionID& conn);
+    // Appends to the service's backlog, or drops it if the backlog is at PUSH_BACKLOG_MAX.
+    void backlog_push(const std::string& service, std::string push);
 
     // OxenMQ server for internal communications, proxied subscriptions, etc.  Held in an optional
     // so that the destructor can tear it down first: its worker threads run request handlers and
@@ -255,8 +263,8 @@ class HiveMind {
 
     // Registered push services: servicename => omq Connectionid to talk to the service
     std::unordered_map<std::string, oxenmq::ConnectionID> services_;
-    // Services whose connection failed, and since when: their pushes wait in push_retry_ for the
-    // notifier to register again.
+    // Services whose connection failed, and since when: their pushes wait in service_pushes_ for
+    // the notifier to register again.
     std::unordered_map<std::string, steady_time> services_gone_;
     std::mutex services_mutex_;
     void service_gone(const std::string& service, oxenmq::ConnectionID conn);

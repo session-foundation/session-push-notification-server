@@ -12,6 +12,7 @@
 #include <spdlog/common.h>
 #include <systemd/sd-daemon.h>
 
+#include <algorithm>
 #include <chrono>
 #include <concepts>
 #include <nlohmann/json.hpp>
@@ -186,10 +187,14 @@ HiveMind::HiveMind(Config conf_in) :
             // - '~' -- the encrypted message data; this field will not be present if the
             //   registration did not request data.
             //
-            // The notifier must give its `notifier` category an unlimited queue: by default oxenmq
-            // drops commands beyond 200 waiting for a worker, on the notifier's side, where the
-            // hivemind can neither see nor resend them.  Pushes the hivemind's own side cannot
-            // queue are held and resent, including across a notifier restart.
+            // `notifier.ack` is a request command that must reply (with no data) when reached.
+            // The hivemind sends one after every PUSH_ACK_INTERVAL pushes and stops sending once
+            // PUSH_WINDOW pushes are unacknowledged, so that a notifier is never handed more than
+            // it can hold: the `notifier` category's oxenmq queue must hold at least PUSH_WINDOW +
+            // 2 commands per service the connection registers (the default of 200 suffices for
+            // one).  A notifier without the command never answers, and its pushes stop for good
+            // once the window fills.  Pushes the hivemind cannot send are held, in order, until it
+            // can, including across a notifier restart.
             .add_command(
                     "register_service",
                     ExcWrapper{*this, &HiveMind::on_reg_service, "on_reg_service"})
@@ -544,10 +549,20 @@ void HiveMind::on_reg_service(oxenmq::Message& m) {
         else if (m.conn != it->second) {
             it->second = m.conn;
             log::info(cat, "'{}' notification service reconnected/reregistered", service);
-        } else
+        } else {
             log::trace(cat, "'{}' notification service confirmed (already registered)", service);
+            return;
+        }
     }
-    // Pushes held for the service can go now.
+    {
+        // A new connection has nothing in flight; acks still pending on the old one are ignored.
+        std::lock_guard lock{notify_mutex_};
+        auto& s = service_pushes_[service];
+        s.conn = m.conn;
+        s.unacked = 0;
+        s.blocked_since.reset();
+        drain_ = true;
+    }
     notify_cv_.notify_one();
 }
 
@@ -634,36 +649,75 @@ void HiveMind::drop_push_targets(const std::vector<DroppedTarget>& dropped) {
 }
 
 void HiveMind::send_push(
-        const std::string& service, oxenmq::ConnectionID conn, std::string_view push) {
+        const std::string& service, const oxenmq::ConnectionID& conn, std::string_view push) {
     omq_.send(
             conn,
             "notifier.push",
             push,
-            oxenmq::send_option::queue_failure{
-                    [this, service, conn, push = std::string{push}](const std::exception* e) {
-                        // nullptr is a full queue; anything else means the notifier is gone.
-                        if (e)
-                            service_gone(service, conn);
-                        queue_retry(service, push);
-                    }});
+            oxenmq::send_option::queue_failure{[this, service, conn, push = std::string{push}](
+                                                       const std::exception* e) {
+                if (e)
+                    service_gone(service, conn);
+                else
+                    // nullptr means zmq's send queue was full, which the window keeps far
+                    // below.
+                    log::error(cat, "zmq refused a push to '{}' despite the ack window", service);
+                backlog_push(service, push);
+            }});
 }
 
-void HiveMind::queue_retry(const std::string& service, std::string push) {
-    {
-        std::lock_guard lock{notify_mutex_};
-        auto& r = push_retry_[service];
-        if (r.pushes.size() >= PUSH_RETRY_MAX) {
-            r.dropped++;
-            return;
-        }
-        r.pushes.push_back(std::move(push));
+void HiveMind::request_ack(const std::string& service, const oxenmq::ConnectionID& conn) {
+    omq_.request(
+            conn,
+            "notifier.ack",
+            [this, service, conn](bool ok, std::vector<std::string> data) {
+                if (!ok) {
+                    log::critical(
+                            cat,
+                            "'{}' notifier did not answer notifier.ack ({}); it must provide it "
+                            "(see register_service), or its pushes stop once {} are unacknowledged",
+                            service,
+                            "{}"_format(fmt::join(data, " ")),
+                            PUSH_WINDOW);
+                    return;
+                }
+                bool drain = false;
+                {
+                    std::lock_guard lock{notify_mutex_};
+                    auto it = service_pushes_.find(service);
+                    if (it == service_pushes_.end() || it->second.conn != conn)
+                        return;
+                    auto& s = it->second;
+                    s.unacked -= std::min(s.unacked, PUSH_ACK_INTERVAL);
+                    if (s.unacked < PUSH_WINDOW)
+                        s.blocked_since.reset();
+                    drain = !s.backlog.empty();
+                    if (drain)
+                        drain_ = true;
+                }
+                if (drain)
+                    notify_cv_.notify_one();
+            },
+            // Effectively none: the notifier answers whenever it gets there, and a connection that
+            // dies first is replaced by on_reg_service(), after which the reply is ignored.
+            oxenmq::send_option::request_timeout{24h});
+}
+
+void HiveMind::backlog_push(const std::string& service, std::string push) {
+    std::lock_guard lock{notify_mutex_};
+    auto& s = service_pushes_[service];
+    if (s.backlog.size() >= PUSH_BACKLOG_MAX) {
+        s.dropped++;
+        return;
     }
-    notify_cv_.notify_one();
+    s.backlog.push_back(std::move(push));
 }
 
 void HiveMind::process_notifications() {
-    std::vector<std::pair<std::string, std::string>> retry;
-    std::unordered_set<std::string> held, expired;
+    // Backlogged pushes to send this pass: service, connection, push, and whether an ack request
+    // follows it.
+    std::vector<std::tuple<std::string, oxenmq::ConnectionID, std::string, bool>> drain;
+    std::unordered_set<std::string> gone, expired;
     std::vector<PushTarget> targets;
     std::string buf;
     int64_t notifications_dropped_logged = 0;
@@ -674,31 +728,26 @@ void HiveMind::process_notifications() {
         std::vector<quic::message> process;
         {
             std::unique_lock lock{notify_mutex_};
-            auto ready = [this] {
-                if (notify_quit_ || !notify_queue_.empty())
-                    return true;
-                auto now = steady_clock::now();
-                for (const auto& [service, r] : push_retry_)
-                    if (r.next <= now)
-                        return true;
-                return false;
-            };
-            if (push_retry_.empty())
+            auto ready = [this] { return notify_quit_ || !notify_queue_.empty() || drain_; };
+            bool backlogged =
+                    std::any_of(service_pushes_.begin(), service_pushes_.end(), [](const auto& sp) {
+                        return !sp.second.backlog.empty();
+                    });
+            if (backlogged)
+                // So that a gone notifier's backlog expires and blocking gets reported even if
+                // nothing else wakes us.
+                notify_cv_.wait_for(lock, 1s, ready);
+            else
                 notify_cv_.wait(lock, ready);
-            else {
-                auto next = steady_time::max();
-                for (const auto& [service, r] : push_retry_)
-                    next = std::min(next, r.next);
-                notify_cv_.wait_until(lock, next, ready);
-            }
             if (notify_quit_)
                 return;
+            drain_ = false;
             process.swap(notify_queue_);
             notify_queue_bytes_ = 0;
         }
 
         decltype(services_) services;
-        held.clear();
+        gone.clear();
         expired.clear();
         {
             std::lock_guard lock{services_mutex_};
@@ -709,62 +758,69 @@ void HiveMind::process_notifications() {
                     expired.insert(it->first);
                     it = services_gone_.erase(it);
                 } else {
-                    held.insert(it->first);
+                    gone.insert(it->first);
                     ++it;
                 }
             }
         }
 
-        retry.clear();
+        drain.clear();
         {
             std::lock_guard lock{notify_mutex_};
             auto now = steady_clock::now();
-            for (auto it = push_retry_.begin(); it != push_retry_.end();) {
-                auto& [service, r] = *it;
-                if (r.dropped) {
+            for (auto it = service_pushes_.begin(); it != service_pushes_.end();) {
+                auto& [service, s] = *it;
+                if (s.dropped) {
                     log::warning(
                             cat,
                             "Dropped {} pushes for '{}': too many are already waiting for its "
                             "notifier",
-                            r.dropped,
+                            s.dropped,
                             service);
-                    r.dropped = 0;
+                    s.dropped = 0;
                 }
-                if (expired.count(service)) {
+                if (expired.contains(service)) {
+                    if (!s.backlog.empty())
+                        log::warning(
+                                cat,
+                                "Dropped {} pushes for '{}': its notifier has not registered again",
+                                s.backlog.size(),
+                                service);
+                    it = service_pushes_.erase(it);
+                    continue;
+                }
+                if ((s.blocks || s.blocked_since) && now >= s.next_report) {
                     log::warning(
                             cat,
-                            "Dropped {} pushes for '{}': its notifier has not registered again",
-                            r.pushes.size(),
-                            service);
-                    it = push_retry_.erase(it);
-                    continue;
+                            "'{}' notifier filled the push window {} time(s) since last report{}; "
+                            "{} pushes backlogged",
+                            service,
+                            s.blocks,
+                            s.blocked_since
+                                    ? ", and has not acknowledged for {}"_format(
+                                              std::chrono::duration_cast<std::chrono::seconds>(
+                                                      now - *s.blocked_since))
+                                    : "",
+                            s.backlog.size());
+                    s.blocks = 0;
+                    s.next_report = now + PUSH_BLOCKED_REPORT_INTERVAL;
                 }
-                if (r.next > now || !services.count(service)) {
-                    if (r.next <= now)
-                        // Gone: wait for it to register again, which wakes us sooner.
-                        r.next = now + NOTIFIER_GONE_RECHECK;
-                    if (!r.pushes.empty())
-                        held.insert(service);
-                    ++it;
-                    continue;
+                if (auto conn_it = services.find(service);
+                    conn_it != services.end() && conn_it->second == s.conn) {
+                    while (!s.backlog.empty() && s.unacked < PUSH_WINDOW) {
+                        ++s.unacked;
+                        drain.emplace_back(
+                                service,
+                                s.conn,
+                                std::move(s.backlog.front()),
+                                s.unacked % PUSH_ACK_INTERVAL == 0);
+                        s.backlog.pop_front();
+                    }
+                    if (!s.backlog.empty() && !s.blocked_since) {
+                        s.blocked_since = now;
+                        ++s.blocks;
+                    }
                 }
-                // Kept until a pass finds it empty after its wait, so that pushes refused again
-                // come back to the same back-off.
-                if (r.pushes.empty()) {
-                    it = push_retry_.erase(it);
-                    continue;
-                }
-                r.wait = r.pushes.size() < r.last_size ? PUSH_RETRY_MIN_WAIT
-                                                       : std::min(r.wait * 2, PUSH_RETRY_MAX_WAIT);
-                r.last_size = r.pushes.size();
-                r.next = now + r.wait;
-                auto n = std::min(r.pushes.size(), PUSH_RETRY_BATCH);
-                for (size_t i = 0; i < n; i++) {
-                    retry.emplace_back(service, std::move(r.pushes.front()));
-                    r.pushes.pop_front();
-                }
-                if (!r.pushes.empty())
-                    held.insert(service);
                 ++it;
             }
         }
@@ -777,10 +833,13 @@ void HiveMind::process_notifications() {
             notifications_dropped_logged = dropped;
         }
 
-        if (!retry.empty()) {
-            log::debug(cat, "Resending {} pushes waiting for their notifier", retry.size());
-            for (const auto& [service, push] : retry)
-                send_push(service, services.at(service), push);
+        if (!drain.empty()) {
+            log::debug(cat, "Sending {} backlogged pushes", drain.size());
+            for (const auto& [service, conn, push, ack] : drain) {
+                send_push(service, conn, push);
+                if (ack)
+                    request_ack(service, conn);
+            }
         }
 
         if (process.empty())
@@ -880,7 +939,7 @@ void HiveMind::process_notifications() {
                         continue;
 
                     auto conn_it = services.find(service);
-                    if (conn_it == services.end() && !held.count(service)) {
+                    if (conn_it == services.end() && !gone.contains(service)) {
                         log::warning(
                                 cat,
                                 "Notification depends on unregistered service {}, ignoring",
@@ -927,12 +986,28 @@ void HiveMind::process_notifications() {
                         continue;
                     }
 
-                    if (held.count(service))
-                        queue_retry(service, std::string{dict.view()});
-                    else {
+                    // Decided under the lock; the backlog append itself can happen after it,
+                    // because this thread is the backlog's only consumer.
+                    bool send = false, ack = false;
+                    {
+                        std::lock_guard lock{notify_mutex_};
+                        auto& s = service_pushes_[service];
+                        if (conn_it != services.end() && conn_it->second == s.conn &&
+                            s.backlog.empty() && s.unacked < PUSH_WINDOW) {
+                            send = true;
+                            ack = ++s.unacked % PUSH_ACK_INTERVAL == 0;
+                        } else if (s.unacked >= PUSH_WINDOW && !s.blocked_since) {
+                            s.blocked_since = steady_clock::now();
+                            ++s.blocks;
+                        }
+                    }
+                    if (send) {
                         log::debug(cat, "Sending push via {} notifier", service);
                         send_push(service, conn_it->second, dict.view());
-                    }
+                        if (ack)
+                            request_ack(service, conn_it->second);
+                    } else
+                        backlog_push(service, std::string{dict.view()});
                     notify_count++;
                 }
             } catch (const std::exception& e) {
@@ -1052,6 +1127,14 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         result["subscriptions"]["total"] = total;
 
         tx.commit();
+    }
+
+    {
+        std::lock_guard lock{notify_mutex_};
+        for (const auto& [service, s] : service_pushes_) {
+            result["pushes"][service]["backlog"] = s.backlog.size();
+            result["pushes"][service]["unacked"] = s.unacked;
+        }
     }
 
     loop_.call_soon(
