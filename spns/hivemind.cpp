@@ -652,17 +652,17 @@ void HiveMind::send_push(
 }
 
 void HiveMind::queue_retry(const std::string& service, std::string push) {
-    // Bounds what waits for notifiers that are not taking pushes.
-    constexpr size_t MAX_RETRY_QUEUE = 100'000;
+    // Bounds what waits for a notifier that is not taking pushes, without affecting the others.
+    constexpr size_t MAX_RETRY_QUEUE = 50'000;
 
     {
         std::lock_guard lock{notify_mutex_};
-        if (push_retry_count_ >= MAX_RETRY_QUEUE) {
-            pushes_dropped_++;
+        auto& r = push_retry_[service];
+        if (r.pushes.size() >= MAX_RETRY_QUEUE) {
+            r.dropped++;
             return;
         }
-        push_retry_[service].pushes.push_back(std::move(push));
-        push_retry_count_++;
+        r.pushes.push_back(std::move(push));
     }
     notify_cv_.notify_one();
 }
@@ -678,7 +678,7 @@ void HiveMind::process_notifications() {
     std::vector<std::pair<std::string, std::string>> retry;
     std::unordered_set<std::string> held, expired;
     std::string buf;
-    int64_t dropped_logged = 0, notifications_dropped_logged = 0;
+    int64_t notifications_dropped_logged = 0;
 
     while (true) {
         {
@@ -731,13 +731,21 @@ void HiveMind::process_notifications() {
             auto now = steady_clock::now();
             for (auto it = push_retry_.begin(); it != push_retry_.end();) {
                 auto& [service, r] = *it;
+                if (r.dropped) {
+                    log::warning(
+                            cat,
+                            "Dropped {} pushes for '{}': too many are already waiting for its "
+                            "notifier",
+                            r.dropped,
+                            service);
+                    r.dropped = 0;
+                }
                 if (expired.count(service)) {
                     log::warning(
                             cat,
                             "Dropped {} pushes for '{}': its notifier has not registered again",
                             r.pushes.size(),
                             service);
-                    push_retry_count_ -= r.pushes.size();
                     it = push_retry_.erase(it);
                     continue;
                 }
@@ -764,20 +772,12 @@ void HiveMind::process_notifications() {
                     retry.emplace_back(service, std::move(r.pushes.front()));
                     r.pushes.pop_front();
                 }
-                push_retry_count_ -= n;
                 if (!r.pushes.empty())
                     held.insert(service);
                 ++it;
             }
         }
 
-        if (auto dropped = pushes_dropped_.load(); dropped != dropped_logged) {
-            log::warning(
-                    cat,
-                    "Dropped {} pushes: too many are already waiting for notifiers",
-                    dropped - dropped_logged);
-            dropped_logged = dropped;
-        }
         if (auto dropped = notifications_dropped_.load(); dropped != notifications_dropped_logged) {
             log::warning(
                     cat,

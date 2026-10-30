@@ -151,10 +151,10 @@ class HiveMind {
         std::chrono::milliseconds wait{10};
         steady_time next{};
         size_t last_size = 0;
+        // Dropped for exceeding the per-service limit, since last logged.
+        int64_t dropped = 0;
     };
     std::unordered_map<std::string, PushRetry> push_retry_;
-    size_t push_retry_count_ = 0;
-    std::atomic<int64_t> pushes_dropped_{0};
     void send_push(const std::string& service, oxenmq::ConnectionID conn, std::string_view push);
     void queue_retry(const std::string& service, std::string push);
 
