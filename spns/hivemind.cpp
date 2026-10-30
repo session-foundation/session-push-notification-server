@@ -414,7 +414,7 @@ bool HiveMind::notifier_startup_done(const steady_time& wait_until) {
     std::vector<std::string_view> missing;
     if (!config.notifiers_expected.empty()) {
         for (const auto& service : config.notifiers_expected) {
-            if (!services_.count(service))
+            if (!services_.contains(service))
                 missing.emplace_back(service);
         }
         if (missing.empty()) {
@@ -915,7 +915,7 @@ void HiveMind::process_notifications() {
                         maybe_data ? fmt::to_string(maybe_data->size()) : "(N/A)");
 
                 auto filt_hash = blake2b(account, hash);
-                if (filter_rotate_.count(filt_hash) || !filter_.insert(filt_hash).second) {
+                if (filter_rotate_.contains(filt_hash) || !filter_.insert(filt_hash).second) {
                     log::trace(cat, "Ignoring duplicate notification");
                     duplicates++;
                     continue;
