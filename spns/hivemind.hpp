@@ -16,18 +16,22 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
+#include <oxen/quic/btstream.hpp>
 #include <oxen/quic/crypto.hpp>
 #include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/loop.hpp>
-#include <oxenmq/zmq.hpp>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,6 +68,34 @@ inline constexpr size_t SERVICE_ID_MIN_SIZE = 32;
 inline constexpr size_t SERVICE_ID_MAX_SIZE = 999;
 inline constexpr size_t SERVICE_DATA_MAX_SIZE = 99'999;
 inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
+
+// Maximum bytes of incoming message notifications waiting for the processing thread; beyond this
+// they are dropped.  Bounds what waits while processing is held up, e.g. by a stalled notifier.
+inline constexpr size_t NOTIFY_QUEUE_MAX_BYTES = 256_Mi;
+
+// A batch of notifications looks up its accounts' subscriptions in queries of at most this many
+// accounts each.  If the lookup fails, the batch is tried again after this long.
+inline constexpr size_t SUBSCRIPTION_LOOKUP_BATCH = 1000;
+inline constexpr auto NOTIFY_LOOKUP_RETRY = 1s;
+
+// Maximum pushes held per service while its notifier cannot take them (the window below is full,
+// or its connection is gone); beyond this the service's new pushes are dropped.
+inline constexpr size_t PUSH_BACKLOG_MAX = 50_k;
+
+// Push flow control.  Every PUSH_ACK_INTERVAL-th push to a service is followed by a notifier.ack
+// request, which the notifier answers once it has taken everything queued before it, and pushes to
+// the service stop while PUSH_WINDOW are unacknowledged.  The window plus two outstanding acks must
+// fit the notifier's oxenmq queue for its category (200 by default; see register_service), and sits
+// far below zmq's 1000-message send queue so that neither a push nor an ack is ever refused.
+inline constexpr size_t PUSH_ACK_INTERVAL = 95;
+inline constexpr size_t PUSH_WINDOW = 2 * PUSH_ACK_INTERVAL;
+
+// How often a service whose window has filled is reported.
+inline constexpr auto PUSH_BLOCKED_REPORT_INTERVAL = 30s;
+
+// A notifier whose connection failed has this long to register again before its backlog is
+// dropped and it is treated as any unregistered service.
+inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
 
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
@@ -125,12 +157,53 @@ class HiveMind {
     const Config config;
 
   private:
-    // std::mutex mutex_;
-    //  OxenMQ server for internal communications, proxied subscriptions, etc.
-    oxenmq::OxenMQ omq_;
+    // Message notifications waiting for process_notifications().  The loop thread only appends
+    // here: a notification is parsed, looked up and sent on the processing thread, so that the
+    // loop keeps reading from every service node however long that takes.
+    std::mutex notify_mutex_;
+    std::condition_variable notify_cv_;
+    std::vector<quic::message> notify_queue_;
+    size_t notify_queue_bytes_ = 0;
+    std::atomic<int64_t> notifications_dropped_{0};
+    bool notify_quit_ = false;
+
+    // Per-service push flow control and backlog.  Guarded by notify_mutex_.
+    struct ServicePushes {
+        // The connection the counters refer to; on_reg_service() resets them when it changes.
+        oxenmq::ConnectionID conn;
+        // Pushes sent on conn not yet covered by a notifier.ack reply.
+        size_t unacked = 0;
+        // Pushes waiting to be sent because the window is full or the notifier's connection is
+        // gone.  Sent, in order, ahead of any new push for the service.
+        std::deque<std::string> backlog;
+        // Dropped for exceeding PUSH_BACKLOG_MAX, since last reported.
+        int64_t dropped = 0;
+        // Times the window filled since last reported, and since when it has been full.
+        int64_t blocks = 0;
+        std::optional<steady_time> blocked_since;
+        steady_time next_report{};
+    };
+    std::unordered_map<std::string, ServicePushes> service_pushes_;
+    // Set when a backlog may be sendable again: an ack arrived, or a notifier registered.
+    bool drain_ = false;
+    void send_push(
+            const std::string& service, const oxenmq::ConnectionID& conn, std::string_view push);
+    void request_ack(const std::string& service, const oxenmq::ConnectionID& conn);
+    // Appends to the service's backlog, or drops it if the backlog is at PUSH_BACKLOG_MAX.
+    void backlog_push(const std::string& service, std::string push);
+
+    // OxenMQ server for internal communications, proxied subscriptions, etc.  Held in an optional
+    // so that the destructor can tear it down first: its worker threads run request handlers and
+    // send_push()'s failure callback, which touch members declared after it.
+    std::optional<oxenmq::OxenMQ> omq_impl_;
+    oxenmq::OxenMQ& omq_ = *omq_impl_;
 
     // QUIC endpoint used to connect to service nodes (for receiving pushes)
     quic::Loop loop_;
+    // Everything the hivemind itself schedules on the loop goes through this queue rather than the
+    // loop directly, so that the destructor can stop it, dropping whatever is still queued, before
+    // the members those jobs reference are destroyed.  The loop's own queue only stops in ~Loop.
+    quic::JobQueue jq_{loop_};
     std::shared_ptr<quic::TLSCreds> creds_out_, creds_in_;
     std::list<std::shared_ptr<quic::Endpoint>> quic_in_;
     std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
@@ -138,13 +211,7 @@ class HiveMind {
 
     PGConnPool pool_;
 
-    const int object_id_;  // Thread-safe unique id for this HiveMind object
-    zmq::context_t notification_ctx_{};
-    zmq::socket_t notify_pull_{notification_ctx_, zmq::socket_type::pull};
     std::thread notify_proc_thread_;
-    std::unordered_map<std::thread::id, std::unique_ptr<zmq::socket_t>> notify_push_;
-    std::mutex notify_push_mutex_;
-    zmq::socket_t& notify_push_sock();
     std::atomic<int64_t> pushes_processed_{0};
 
     // edpk -> SNode
@@ -166,14 +233,21 @@ class HiveMind {
 
     const std::chrono::system_clock::time_point startup_time = std::chrono::system_clock::now();
 
-    // contains Blake2B(service || svcid || msghash) for sent notification de-duping.  Every 10
-    // minutes, we replace filter_rotate_ with filter_, and check both filters for de-duping (so
-    // that hashes expire after 10-20 minutes).  (The 10 mins value is configurable).
+    // contains Blake2B(account || msghash) of the notifications already handled: every member of
+    // the account's swarm sends us the same one, and only the first is looked up and pushed.
+    // Every 10 minutes, we replace filter_rotate_ with filter_, and check both filters for
+    // de-duping (so that hashes expire after 10-20 minutes).  (The 10 mins value is configurable).
+    // Only used on the notification processing thread.
     std::unordered_set<Blake2B_32> filter_, filter_rotate_;
     steady_time filter_rotate_time_ = steady_clock::now() + config.filter_lifetime;
 
     // Registered push services: servicename => omq Connectionid to talk to the service
     std::unordered_map<std::string, oxenmq::ConnectionID> services_;
+    // Services whose connection failed, and since when: their pushes wait in service_pushes_ for
+    // the notifier to register again.
+    std::unordered_map<std::string, steady_time> services_gone_;
+    std::mutex services_mutex_;
+    void service_gone(const std::string& service, oxenmq::ConnectionID conn);
 
     // Our connection to a local oxend for block and SN info
     oxenmq::ConnectionID oxend_;
@@ -294,8 +368,8 @@ class HiveMind {
 
     bool has_quic_out() { return (bool)quic_out_; }
 
-    // Accesses the quic loop governing SNode connections (and various internals)
-    quic::Loop& loop() { return loop_; }
+    // Schedules work on the loop governing SNode connections; see jq_.
+    quic::JobQueue& jq() { return jq_; }
 
     // Returns the creds object for establishing outbound connections.  TODO: This isn't needed once
     // all nodes are running an updated libquic, but older libquic doesn't allow no-creds
