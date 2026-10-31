@@ -14,7 +14,10 @@ libpq environment (PGHOST, PGUSER, ...).  Linux only: it reads process memory an
 """
 
 import argparse
+import base64
+import hashlib
 import os
+import struct
 
 import psycopg
 import re
@@ -118,19 +121,40 @@ def seed(
     service="dummy",
 ):
     """Subscribes accounts #first.. to `service` directly in the database.  `devices` is an SQL
-    expression in `i` giving account #i's number of devices, whose service ids are
-    "dev-<i>-<d>"."""
+    expression in `i` giving account #i's number of devices, whose service ids are svcid(i, d)."""
     sig_ts = sig_ts or int(time.time())
     execute(
         f"""
 WITH s AS (
     INSERT INTO subscriptions (account, signature, signature_ts, want_data, enc_key, service, svcid, svcdata)
     SELECT {ACCOUNT.format('i')}, decode(repeat('cd', 64), 'hex'), {sig_ts}, true,
-           decode(repeat('ab', 32), 'hex'), '{service}', 'dev-' || i || '-' || d, {svcdata}
+           decode(repeat('ab', 32), 'hex'), '{service}', {SVCID_SQL}, {svcdata}
     FROM generate_series({first}, {first + count - 1}) i, LATERAL generate_series(1, {devices}) d
     RETURNING id)
 INSERT INTO sub_namespaces SELECT s.id, n FROM s, unnest(ARRAY[{namespaces}]::smallint[]) n"""
     )
+
+
+# Seeded device d of account i gets a service id the size of a real one, since that size matters
+# to what the hivemind holds per subscription: even accounts a 64-hex APNs device token, odd
+# accounts 142 characters of URL-safe base64 like a Firebase token.  Derived from (i, d) the same
+# way here and in SQL so that scenarios can name them.
+SVCID_SQL = """CASE WHEN i % 2 = 0
+    THEN encode(sha256(int4send(i) || int4send(d)), 'hex')
+    ELSE left(translate(encode(
+        sha256(int4send(i) || int4send(d) || int4send(0)) || sha256(int4send(i) || int4send(d) || int4send(1)) ||
+        sha256(int4send(i) || int4send(d) || int4send(2)) || sha256(int4send(i) || int4send(d) || int4send(3)),
+        'base64'), E'+/=\\n', '-_'), 142)
+    END"""
+
+
+def svcid(i, d=1):
+    """The service id seed() gave device d of account i; see SVCID_SQL."""
+    key = struct.pack(">ii", i, d)
+    if i % 2 == 0:
+        return hashlib.sha256(key).hexdigest()
+    raw = b"".join(hashlib.sha256(key + struct.pack(">i", k)).digest() for k in range(4))
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")[:142]
 
 
 # --- processes --------------------------------------------------------------------------------
@@ -394,21 +418,21 @@ def scenario_correctness(build_dir):
         got = sorted(s.dump())
         want = sorted(
             [
-                "dev-1-1 hash-one-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 1 sd1",
-                "dev-2-1 hash-three-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -",
-                "dev-2-2 hash-three-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -",
+                f"{svcid(1)} hash-one-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 1 sd1",
+                f"{svcid(2, 1)} hash-three-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -",
+                f"{svcid(2, 2)} hash-three-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -",
             ]
         )
         check(got == want, f"phase 1 pushes: {got}")
         check(
-            query1("SELECT count(*) FROM subscriptions WHERE svcid = 'dev-3-1'") == 0,
+            query1(f"SELECT count(*) FROM subscriptions WHERE svcid = '{svcid(3)}'") == 0,
             "the expired subscription is still in the database",
         )
 
         client = s.client_proc()
         acct5 = client.cmd("account 5")
         check(client.cmd("sub 5") == "ok", "subscribe failed")
-        check(client.cmd("drop dev-2-1") == "ok", "drop failed")
+        check(client.cmd(f"drop {svcid(2, 1)}") == "ok", "drop failed")
         time.sleep(1)
         net.cmd(f"send {acct5} hash-six-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 200")
         net.cmd("send #2 hash-eight-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0")
@@ -421,8 +445,8 @@ def scenario_correctness(build_dir):
             f"no push for the runtime subscription: {got}",
         )
         check(
-            "dev-2-2 hash-eight-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -" in got
-            and not any(l.startswith("dev-2-1 hash-eight") for l in got),
+            f"{svcid(2, 2)} hash-eight-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -" in got
+            and not any(l.startswith(f"{svcid(2, 1)} hash-eight") for l in got),
             f"dropped device still pushed, or the other one not: {got}",
         )
 
@@ -433,8 +457,8 @@ def scenario_correctness(build_dir):
             c["pushes"] == 5,
             f"phase 3: unsubscribed account still pushed ({c['pushes']})",
         )
-        left = sorted(svcid for (svcid,) in query("SELECT svcid FROM subscriptions"))
-        check(left == ["dev-1-1", "dev-2-2"], f"subscriptions left: {left}")
+        left = sorted(sid for (sid,) in query("SELECT svcid FROM subscriptions"))
+        check(left == sorted([svcid(1), svcid(2, 2)]), f"subscriptions left: {left}")
         check(c["duplicates"] == 0, f"{c['duplicates']} duplicate pushes")
     finally:
         rc = s.stop()
