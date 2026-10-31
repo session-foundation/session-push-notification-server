@@ -290,7 +290,7 @@ HiveMind::HiveMind(Config conf_in) :
 
     notify_proc_thread_ = std::thread{[this] { process_notifications(); }};
 
-    loop_.call_get([this] {
+    jq_.call_get([this] {
         sd_notify(0, "STATUS=Starting OxenMQ");
         log::info(cat, "Starting OxenMQ");
         omq_.start();
@@ -362,7 +362,7 @@ HiveMind::HiveMind(Config conf_in) :
 
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
     // timer because nothing in here is time critical:
-    loop_.add_timer(10s, [this] { check_subs(); });
+    jq_.add_timer(10s, [this] { check_subs(); });
 
     // For updating systemd Status line
     omq_.add_timer([this] { log_stats(); }, 15s);
@@ -403,6 +403,13 @@ HiveMind::~HiveMind() {
 
         swarms_.clear();
         sns_.clear();
+
+        // Last, so that anything the teardown above queued on it (it runs synchronously on the
+        // loop thread, so nothing queued could have run yet) is dropped rather than left to run
+        // against the members destroyed after this, and so that nothing above could hit a stopped
+        // queue.  Nothing can queue more once this returns: oxenmq and the processing thread are
+        // gone, and so are the endpoints and nodes.
+        jq_.stop();
     });
 }
 
@@ -1200,24 +1207,23 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         }
     }
 
-    loop_.call_soon(
-            [when_ready = std::move(when_ready), result = std::move(result), this]() mutable {
-                size_t n_conns = 0;
-                for (auto& sn : sns_)
-                    n_conns += sn.second->connected();
+    jq_.call_soon([when_ready = std::move(when_ready), result = std::move(result), this]() mutable {
+        size_t n_conns = 0;
+        for (auto& sn : sns_)
+            n_conns += sn.second->connected();
 
-                result["block_hash"] = last_block_.first;
-                result["block_height"] = last_block_.second;
-                result["swarms"] = swarms_.size();
-                result["snodes"] = sns_.size();
-                result["accounts_monitored"] = subscribers_.size();
-                result["connections"] = n_conns;
-                result["pending_connections"] = pending_connects_.load();
-                result["uptime"] =
-                        std::chrono::duration<double>(system_clock::now() - startup_time).count();
+        result["block_hash"] = last_block_.first;
+        result["block_height"] = last_block_.second;
+        result["swarms"] = swarms_.size();
+        result["snodes"] = sns_.size();
+        result["accounts_monitored"] = subscribers_.size();
+        result["connections"] = n_conns;
+        result["pending_connections"] = pending_connects_.load();
+        result["uptime"] =
+                std::chrono::duration<double>(system_clock::now() - startup_time).count();
 
-                when_ready(std::move(result));
-            });
+        when_ready(std::move(result));
+    });
 }
 
 void HiveMind::on_get_stats(oxenmq::Message& m) {
@@ -1730,7 +1736,7 @@ void HiveMind::refresh_sns() {
             "rpc.get_service_nodes",
             [this](bool success, std::vector<std::string> data) {
                 if (success)
-                    loop_.call_get([&] { on_sns_response(std::move(data)); });
+                    jq_.call_get([&] { on_sns_response(std::move(data)); });
                 else
                     log::warning(
                             cat,
@@ -2245,7 +2251,7 @@ RETURNING id
 
     tx.commit();
 
-    return loop_.call_get([&] {
+    return jq_.call_get([&] {
         pubkey.update_swarm(swarm_ids_);
 
         auto& subscriptions = subscribers_[pubkey];
