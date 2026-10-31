@@ -39,7 +39,7 @@ SNode::SNode(HiveMind& hivemind, quic::RemoteAddress addr, uint64_t swarm) :
 }
 
 void SNode::connect() {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
     if (conn_)
         return;
     if (cooldown_until_) {
@@ -64,7 +64,7 @@ void SNode::connect() {
 }
 
 void SNode::connect(quic::RemoteAddress addr) {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
     if (addr != addr_) {
         log::debug(cat, "disconnecting; addr changing from {} to {}", addr_, addr);
         disconnect();
@@ -75,7 +75,7 @@ void SNode::connect(quic::RemoteAddress addr) {
 }
 
 void SNode::disconnect() {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
     connected_ = false;
     if (conn_) {
         log::debug(cat, "disconnecting from {}", addr_);
@@ -86,7 +86,7 @@ void SNode::disconnect() {
 }
 
 void SNode::on_connected(quic::Connection& c) {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
     bool no_conn = false;
     log::debug(cat, "Connection established to {}", addr_);
     cooldown_fails_ = 0;
@@ -113,7 +113,7 @@ void SNode::on_connected(quic::Connection& c) {
 }
 
 void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
     bool is_failed_connect = !connected_.exchange(false);
 
     if (hivemind_.has_quic_out()) {
@@ -162,7 +162,7 @@ void SNode::add_account(const SwarmPubkey& account, bool force_now) {
     // This isn't *always* called from directly inside: we also call it in multithreaded batch jobs
     // where we *have* blocked the loop, but do work in threads (and don't touch different SNodes
     // from different worker threads).
-    // assert(hivemind_.loop().inside());
+    // assert(hivemind_.jq().inside());
 
     auto [it, inserted] = subs_.insert(account);
     if (inserted)
@@ -181,7 +181,7 @@ void SNode::add_account(const SwarmPubkey& account, bool force_now) {
 }
 
 void SNode::reset_swarm(uint64_t new_swarm) {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
 
     next_.clear();
     subs_.clear();
@@ -191,7 +191,7 @@ void SNode::reset_swarm(uint64_t new_swarm) {
 void SNode::remove_stale_swarm_members(const std::vector<uint64_t>& swarm_ids) {
     // We *aren't* actually directly inside the loop when this is called: we are called from a
     // multithreaded batch job where the loop is blocked pending completion of the jobs.
-    // assert(hivemind_.loop().inside());
+    // assert(hivemind_.jq().inside());
 
     for (auto& s : subs_)
         s.update_swarm(swarm_ids);
@@ -205,7 +205,7 @@ void SNode::remove_stale_swarm_members(const std::vector<uint64_t>& swarm_ids) {
 
 void SNode::check_subs(
         const std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>>& all_subs) {
-    assert(hivemind_.loop().inside());
+    assert(hivemind_.jq().inside());
     // log::trace(cat, "check subs");
     if (!connected_) {
         if (conn_)
@@ -288,7 +288,7 @@ void SNode::check_subs(
                     // because we had nothing more to send) then check again to queue more
                     // immediately:
                     if (rate_limited)
-                        hivemind_.loop().call_soon([this] { hivemind_.check_my_subs(*this); });
+                        hivemind_.jq().call_soon([this] { hivemind_.check_my_subs(*this); });
                 });
         // There's currently no exposed way to clear the internal string in a bt producer, so just
         // reset it.  In theory if this is allocation bottlenecked we could revisit this to reuse an

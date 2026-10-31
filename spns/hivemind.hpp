@@ -200,6 +200,10 @@ class HiveMind {
 
     // QUIC endpoint used to connect to service nodes (for receiving pushes)
     quic::Loop loop_;
+    // Everything the hivemind itself schedules on the loop goes through this queue rather than the
+    // loop directly, so that the destructor can stop it, dropping whatever is still queued, before
+    // the members those jobs reference are destroyed.  The loop's own queue only stops in ~Loop.
+    quic::JobQueue jq_{loop_};
     std::shared_ptr<quic::TLSCreds> creds_out_, creds_in_;
     std::list<std::shared_ptr<quic::Endpoint>> quic_in_;
     std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
@@ -364,8 +368,8 @@ class HiveMind {
 
     bool has_quic_out() { return (bool)quic_out_; }
 
-    // Accesses the quic loop governing SNode connections (and various internals)
-    quic::Loop& loop() { return loop_; }
+    // Schedules work on the loop governing SNode connections; see jq_.
+    quic::JobQueue& jq() { return jq_; }
 
     // Returns the creds object for establishing outbound connections.  TODO: This isn't needed once
     // all nodes are running an updated libquic, but older libquic doesn't allow no-creds
