@@ -12,6 +12,7 @@
 #include <spdlog/common.h>
 #include <systemd/sd-daemon.h>
 
+#include <algorithm>
 #include <chrono>
 #include <concepts>
 #include <nlohmann/json.hpp>
@@ -102,6 +103,7 @@ HiveMind::HiveMind(Config conf_in) :
             //     "subaccount_sig": "14c7b71f...",
             //     "namespaces": [-400,0,1,2,17],
             //     "data": true,
+            //     "data_namespaces": [-400,0,1], (optional; every namespace if omitted)
             //     "sig_ts": 1677520760,
             //     "signature": "f8efdd120007...",
             //     "service": "apns",
@@ -716,9 +718,9 @@ void HiveMind::process_notifications() {
 
                     auto result = tx.exec(
                             R"(
-SELECT want_data, enc_key, service, svcid, svcdata FROM subscriptions
-WHERE account = $1
-    AND EXISTS(SELECT 1 FROM sub_namespaces WHERE subscription = id AND namespace = $2))",
+SELECT s.want_data AND n.want_data, s.enc_key, s.service, s.svcid, s.svcdata
+FROM subscriptions s JOIN sub_namespaces n ON n.subscription = s.id
+WHERE s.account = $1 AND n.namespace = $2)",
                             {account, ns});
                     notifies.reserve(result.size());
                     filter_vals.reserve(result.size());
@@ -1051,6 +1053,7 @@ void HiveMind::on_notifier_validation(
         const SwarmPubkey& pubkey,
         std::shared_ptr<hive::Subscription> sub,
         const std::optional<EncKey>& enc_key,
+        std::vector<int16_t> no_data_namespaces,
         std::vector<std::string> data,
         const std::optional<UnsubData>& unsub) {
 
@@ -1108,7 +1111,8 @@ void HiveMind::on_notifier_validation(
                         std::move(service_id),
                         std::move(service_data),
                         *enc_key,
-                        std::move(*sub));
+                        std::move(*sub),
+                        std::move(no_data_namespaces));
 
                 response[newsub ? "added" : "updated"] = true;
                 message = newsub ? "Subscription successful" : "Resubscription successful";
@@ -1234,6 +1238,36 @@ namespace {
         }
     }
 
+    // The subscribed namespaces whose notifications leave the message body out: those missing from
+    // the optional `data_namespaces`.  It is not signed, and needs no signature: the storage server
+    // is asked for bodies by the signed `data` flag alone, and this can only withhold them.
+    std::vector<int16_t> namespaces_without_data(
+            const nlohmann::json& args, const std::vector<int16_t>& namespaces, bool want_data) {
+        auto it = args.find("data_namespaces");
+        if (it == args.end() || it->is_null())
+            return {};
+        if (!want_data)
+            throw hive::subscribe_error{
+                    hive::SUBSCRIBE::BAD_INPUT, "data_namespaces requires \"data\": true"};
+
+        auto with_data = it->get<std::vector<int16_t>>();
+        if (with_data.empty())
+            throw hive::subscribe_error{
+                    hive::SUBSCRIBE::BAD_INPUT,
+                    "data_namespaces cannot be empty; use \"data\": false instead"};
+        if (std::ranges::adjacent_find(with_data, std::greater_equal{}) != with_data.end())
+            throw hive::subscribe_error{
+                    hive::SUBSCRIBE::BAD_INPUT,
+                    "data_namespaces must be sorted numerically, without duplicates"};
+        if (!std::ranges::includes(namespaces, with_data))
+            throw hive::subscribe_error{
+                    hive::SUBSCRIBE::BAD_INPUT, "data_namespaces must be a subset of namespaces"};
+
+        std::vector<int16_t> without;
+        std::ranges::set_difference(namespaces, with_data, std::back_inserter(without));
+        return without;
+    }
+
 }  // namespace
 
 template <typename Message>
@@ -1294,7 +1328,16 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
 
             if (subscribe) {
                 auto enc_key = from_hex_or_b64<EncKey>(at(e, "enc_key").get<std::string_view>());
-                auto namespaces = at(e, "namespaces").get<std::vector<int16_t>>();
+                auto sub = std::make_shared<hive::Subscription>(  // Throws on bad sig
+                        pubkey,
+                        std::move(subaccount),
+                        at(e, "namespaces").get<std::vector<int16_t>>(),
+                        at(e, "data").get<bool>(),
+                        std::chrono::sys_seconds{
+                                std::chrono::seconds{at(e, "sig_ts").get<int64_t>()}},
+                        std::move(sig));
+                // After the Subscription, which has checked that the namespaces are sorted.
+                auto no_data = namespaces_without_data(e, sub->namespaces, sub->want_data);
 
                 reply_handler = [this,
                                  response,
@@ -1302,14 +1345,8 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                                  remaining,
                                  multi,
                                  service = service,
-                                 sub = std::make_shared<hive::Subscription>(  // Throws on bad sig
-                                         pubkey,
-                                         std::move(subaccount),
-                                         at(e, "namespaces").get<std::vector<int16_t>>(),
-                                         at(e, "data").get<bool>(),
-                                         std::chrono::sys_seconds{std::chrono::seconds{
-                                                 at(e, "sig_ts").get<int64_t>()}},
-                                         std::move(sig)),
+                                 sub = std::move(sub),
+                                 no_data = std::move(no_data),
                                  pubkey = pubkey,
                                  enc_key = std::move(enc_key),
                                  replier](bool success, std::vector<std::string> data) mutable {
@@ -1324,6 +1361,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(pubkey),
                             std::move(sub),
                             std::move(enc_key),
+                            std::move(no_data),
                             std::move(data));
                 };
             } else {
@@ -1349,6 +1387,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(pubkey),
                             nullptr,
                             std::nullopt,
+                            {},
                             std::move(data),
                             std::move(unsub));
                 };
@@ -1868,30 +1907,34 @@ bool HiveMind::add_subscription(
         std::string service_id,
         std::optional<std::string> service_data,
         EncKey enc_key,
-        hive::Subscription sub) {
+        hive::Subscription sub,
+        std::vector<int16_t> no_data_namespaces) {
 
     bool new_sub = false, insert_ns = false;
 
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result = tx.query01<int64_t, int64_t, pqxx::array<int16_t>>(
+    auto result = tx.query01<int64_t, int64_t, pqxx::array<int16_t>, pqxx::array<int16_t>>(
             R"(
 SELECT
     id,
     signature_ts,
-    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
+    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace),
+    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id AND NOT want_data
+        ORDER BY namespace)
 FROM subscriptions
 WHERE
     account = $1 AND service = $2 AND svcid = $3)",
             {pubkey.id, service, service_id});
     int64_t id;
     if (result) {
-        auto& [row_id, sig_ts, ns_arr_in] = *result;
+        auto& [row_id, sig_ts, ns_arr_in, no_data_arr_in] = *result;
         std::vector<int16_t> ns_arr{ns_arr_in.cbegin(), ns_arr_in.cend()};
+        std::vector<int16_t> no_data_arr{no_data_arr_in.cbegin(), no_data_arr_in.cend()};
         id = row_id;
 
-        insert_ns = ns_arr != sub.namespaces;
+        insert_ns = ns_arr != sub.namespaces || no_data_arr != no_data_namespaces;
         log::trace(cat, "updating subscription for {}", pubkey.id.hex());
         tx.exec(
                   R"(
@@ -1940,8 +1983,9 @@ RETURNING id
 
     if (insert_ns)
         for (auto n : sub.namespaces)
-            tx.exec(R"(INSERT INTO sub_namespaces (subscription, namespace) VALUES ($1, $2))",
-                    {id, n})
+            tx.exec(R"(
+INSERT INTO sub_namespaces (subscription, namespace, want_data) VALUES ($1, $2, $3))",
+                    {id, n, !std::ranges::binary_search(no_data_namespaces, n)})
                     .no_rows();
 
     for (const auto& s : {""s, service})
