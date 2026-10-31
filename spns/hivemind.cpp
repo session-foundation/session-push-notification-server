@@ -622,32 +622,6 @@ void HiveMind::on_message_notification(quic::message m) {
     notify_cv_.notify_one();
 }
 
-void HiveMind::set_push_target(const AccountID& account, PushTarget target) {
-    std::unique_lock lock{push_targets_mutex_};
-    auto& targets = push_targets_[account];
-    for (auto& t : targets) {
-        if (t.service == target.service && t.svcid == target.svcid) {
-            t = std::move(target);
-            return;
-        }
-    }
-    targets.push_back(std::move(target));
-}
-
-void HiveMind::drop_push_targets(const std::vector<DroppedTarget>& dropped) {
-    std::unique_lock lock{push_targets_mutex_};
-    for (const auto& d : dropped) {
-        auto it = push_targets_.find(d.account);
-        if (it == push_targets_.end())
-            continue;
-        std::erase_if(it->second, [&](const auto& t) {
-            return t.service == d.service && t.svcid == d.svcid && t.sig_ts <= d.sig_ts;
-        });
-        if (it->second.empty())
-            push_targets_.erase(it);
-    }
-}
-
 void HiveMind::send_push(
         const std::string& service, const oxenmq::ConnectionID& conn, std::string_view push) {
     omq_.send(
@@ -718,7 +692,6 @@ void HiveMind::process_notifications() {
     // follows it.
     std::vector<std::tuple<std::string, oxenmq::ConnectionID, std::string, bool>> drain;
     std::unordered_set<std::string> gone, expired;
-    std::vector<PushTarget> targets;
     std::string buf;
     int64_t notifications_dropped_logged = 0;
 
@@ -853,7 +826,22 @@ void HiveMind::process_notifications() {
             filter_rotate_time_ = now + config.filter_lifetime;
         }
 
-        size_t notify_count = 0, duplicates = 0;
+        // Parse everything first, dropping duplicates, so that one query can look up every account
+        // in the batch.  The views point into the message bodies, which `process` keeps alive.
+        struct Parsed {
+            AccountID account;
+            std::string_view hash;
+            int16_t ns;
+            int64_t timestamp_ms, expiry_ms;
+            std::optional<std::string_view> data;
+            Blake2B_32 filt_hash;
+        };
+        std::vector<Parsed> parsed;
+        parsed.reserve(process.size());
+        // Duplicates within the batch; the filters are only updated once the lookup has succeeded,
+        // so that a batch put back after a database failure is not then dropped as already seen.
+        std::unordered_set<Blake2B_32> seen;
+        size_t duplicates = 0;
 
         for (const auto& msg : process) {
             try {
@@ -915,104 +903,179 @@ void HiveMind::process_notifications() {
                         maybe_data ? fmt::to_string(maybe_data->size()) : "(N/A)");
 
                 auto filt_hash = blake2b(account, hash);
-                if (filter_rotate_.contains(filt_hash) || !filter_.insert(filt_hash).second) {
+                if (filter_rotate_.contains(filt_hash) || filter_.contains(filt_hash) ||
+                    !seen.insert(filt_hash).second) {
                     log::trace(cat, "Ignoring duplicate notification");
                     duplicates++;
                     continue;
                 }
 
-                // Copied out so that the lock is not held across the sends below, which can block
-                // on oxenmq's proxy and would hold up every subscription writer meanwhile.
-                {
-                    std::shared_lock lock{push_targets_mutex_};
-                    auto it = push_targets_.find(account);
-                    if (it == push_targets_.end()) {
-                        log::debug(cat, "No active notifications match, ignoring notification");
-                        continue;
-                    }
-                    targets = it->second;
-                }
-
-                for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces, sig_ts] :
-                     targets) {
-                    if (!std::binary_search(namespaces.begin(), namespaces.end(), ns))
-                        continue;
-
-                    auto conn_it = services.find(service);
-                    if (conn_it == services.end() && !gone.contains(service)) {
-                        log::warning(
-                                cat,
-                                "Notification depends on unregistered service {}, ignoring",
-                                service);
-                        continue;
-                    }
-
-                    // We overestimate a little here (e.g. allowing for 20 spaces for string
-                    // lengths) because a few extra bytes of allocation doesn't really matter.
-                    size_t size_needed =
-                            2 + 35 +                 // 0: 32:service (or shorter)
-                            3 + 21 + svcid.size() +  // 1:& N:svcid
-                            3 + 35 +                 // 1:^ 32:enckey
-                            3 + 21 + hash.size() +   // 1:# N:hash
-                            3 + 36 +                 // 1:@ 33:account
-                            3 + 8 +                  // 1:n i-32768e
-                            3 + 15 +                 // 1:t i1695078498534e (timestamp)
-                            3 + 15 +                 // 1:t i1695078498534e (expiry)
-                            (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
-                            (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
-
-                    if (buf.size() < size_needed)
-                        buf.resize(size_needed);
-
-                    oxenc::bt_dict_producer dict{buf.data(), buf.data() + buf.size()};
-
-                    try {
-                        // NB: ascii sorted keys
-                        dict.append("", service);
-                        if (!svcdata.empty())
-                            dict.append("!", svcdata);
-                        dict.append("#", hash);
-                        dict.append("&", svcid);
-                        dict.append("@", account.sv());
-                        dict.append("^", enc_key.sv());
-                        dict.append("n", ns);
-                        dict.append("t", timestamp_ms);
-                        dict.append("z", expiry_ms);
-                        if (want_data && maybe_data)
-                            dict.append("~", *maybe_data);
-                    } catch (const std::exception& e) {
-                        log::critical(
-                                cat, "failed to build notifier message: bad size estimation?");
-                        continue;
-                    }
-
-                    // Decided under the lock; the backlog append itself can happen after it,
-                    // because this thread is the backlog's only consumer.
-                    bool send = false, ack = false;
-                    {
-                        std::lock_guard lock{notify_mutex_};
-                        auto& s = service_pushes_[service];
-                        if (conn_it != services.end() && conn_it->second == s.conn &&
-                            s.backlog.empty() && s.unacked < PUSH_WINDOW) {
-                            send = true;
-                            ack = ++s.unacked % PUSH_ACK_INTERVAL == 0;
-                        } else if (s.unacked >= PUSH_WINDOW && !s.blocked_since) {
-                            s.blocked_since = steady_clock::now();
-                            ++s.blocks;
-                        }
-                    }
-                    if (send) {
-                        log::debug(cat, "Sending push via {} notifier", service);
-                        send_push(service, conn_it->second, dict.view());
-                        if (ack)
-                            request_ack(service, conn_it->second);
-                    } else
-                        backlog_push(service, std::string{dict.view()});
-                    notify_count++;
-                }
+                parsed.push_back(
+                        {account, hash, ns, timestamp_ms, expiry_ms, maybe_data, filt_hash});
             } catch (const std::exception& e) {
                 log::warning(cat, "Failed to process incoming notification: {}", e.what());
                 continue;
+            }
+        }
+
+        // {account: [(service, svcid, svcdata, enc_key, want_data, namespaces)...]} for every
+        // account in the batch, from one query per SUBSCRIPTION_LOOKUP_BATCH accounts.
+        std::unordered_map<
+                AccountID,
+                std::vector<std::tuple<
+                        std::string,
+                        std::string,
+                        std::vector<std::byte>,
+                        EncKey,
+                        bool,
+                        std::vector<int16_t>>>>
+                subs;
+        try {
+            std::vector<AccountID> accounts;
+            for (const auto& p : parsed)
+                if (subs.try_emplace(p.account).second)
+                    accounts.push_back(p.account);
+
+            auto conn = pool_.get();
+            pqxx::nontransaction tx{conn};
+            for (size_t i = 0; i < accounts.size(); i += SUBSCRIPTION_LOOKUP_BATCH) {
+                auto end = std::min(accounts.size(), i + SUBSCRIPTION_LOOKUP_BATCH);
+                pqxx::params params;
+                std::string placeholders;
+                for (size_t j = i; j < end; j++) {
+                    params.append(accounts[j]);
+                    placeholders += "{}${}"_format(j == i ? "" : ",", j - i + 1);
+                }
+                for (auto row : tx.exec(
+                             R"(
+SELECT account, service, svcid, svcdata, enc_key, want_data,
+    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
+FROM subscriptions
+WHERE account IN ({}))"_format(placeholders),
+                             params)) {
+                    auto [account, service, svcid, svcdata, enc_key, want_data, ns_arr] =
+                            row.as<AccountID,
+                                   std::string,
+                                   std::string,
+                                   std::optional<std::vector<std::byte>>,
+                                   EncKey,
+                                   bool,
+                                   pqxx::array<int16_t>>();
+                    subs[account].emplace_back(
+                            std::move(service),
+                            std::move(svcid),
+                            svcdata ? std::move(*svcdata) : std::vector<std::byte>{},
+                            enc_key,
+                            want_data,
+                            std::vector<int16_t>{ns_arr.begin(), ns_arr.end()});
+                }
+            }
+        } catch (const std::exception& e) {
+            // Nothing has been marked seen or sent, so the whole batch can go back, ahead of
+            // whatever arrived since, to be tried again once the database is back.
+            log::warning(
+                    cat,
+                    "Failed to look up subscriptions for {} notifications: {}; retrying in {}",
+                    parsed.size(),
+                    e.what(),
+                    NOTIFY_LOOKUP_RETRY);
+            std::unique_lock lock{notify_mutex_};
+            for (auto& m : notify_queue_)
+                process.push_back(std::move(m));
+            notify_queue_ = std::move(process);
+            for (const auto& m : notify_queue_)
+                notify_queue_bytes_ += m.body().size();
+            notify_cv_.wait_for(lock, NOTIFY_LOOKUP_RETRY, [this] { return notify_quit_; });
+            continue;
+        }
+
+        for (const auto& p : parsed)
+            filter_.insert(p.filt_hash);
+
+        size_t notify_count = 0;
+
+        for (const auto& [account, hash, ns, timestamp_ms, expiry_ms, maybe_data, filt_hash] :
+             parsed) {
+            auto subs_it = subs.find(account);
+            if (subs_it == subs.end() || subs_it->second.empty()) {
+                log::debug(cat, "No active notifications match, ignoring notification");
+                continue;
+            }
+
+            for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces] :
+                 subs_it->second) {
+                if (!std::binary_search(namespaces.begin(), namespaces.end(), ns))
+                    continue;
+
+                auto conn_it = services.find(service);
+                if (conn_it == services.end() && !gone.contains(service)) {
+                    log::warning(
+                            cat,
+                            "Notification depends on unregistered service {}, ignoring",
+                            service);
+                    continue;
+                }
+
+                // We overestimate a little here (e.g. allowing for 20 spaces for string
+                // lengths) because a few extra bytes of allocation doesn't really matter.
+                size_t size_needed = 2 + 35 +                 // 0: 32:service (or shorter)
+                                     3 + 21 + svcid.size() +  // 1:& N:svcid
+                                     3 + 35 +                 // 1:^ 32:enckey
+                                     3 + 21 + hash.size() +   // 1:# N:hash
+                                     3 + 36 +                 // 1:@ 33:account
+                                     3 + 8 +                  // 1:n i-32768e
+                                     3 + 15 +                 // 1:t i1695078498534e (timestamp)
+                                     3 + 15 +                 // 1:t i1695078498534e (expiry)
+                                     (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
+                                     (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
+
+                if (buf.size() < size_needed)
+                    buf.resize(size_needed);
+
+                oxenc::bt_dict_producer dict{buf.data(), buf.data() + buf.size()};
+
+                try {
+                    // NB: ascii sorted keys
+                    dict.append("", service);
+                    if (!svcdata.empty())
+                        dict.append("!", svcdata);
+                    dict.append("#", hash);
+                    dict.append("&", svcid);
+                    dict.append("@", account.sv());
+                    dict.append("^", enc_key.sv());
+                    dict.append("n", ns);
+                    dict.append("t", timestamp_ms);
+                    dict.append("z", expiry_ms);
+                    if (want_data && maybe_data)
+                        dict.append("~", *maybe_data);
+                } catch (const std::exception& e) {
+                    log::critical(cat, "failed to build notifier message: bad size estimation?");
+                    continue;
+                }
+
+                // Decided under the lock; the backlog append itself can happen after it, because
+                // this thread is the backlog's only consumer.
+                bool send = false, ack = false;
+                {
+                    std::lock_guard lock{notify_mutex_};
+                    auto& s = service_pushes_[service];
+                    if (conn_it != services.end() && conn_it->second == s.conn &&
+                        s.backlog.empty() && s.unacked < PUSH_WINDOW) {
+                        send = true;
+                        ack = ++s.unacked % PUSH_ACK_INTERVAL == 0;
+                    } else if (s.unacked >= PUSH_WINDOW && !s.blocked_since) {
+                        s.blocked_since = steady_clock::now();
+                        ++s.blocks;
+                    }
+                }
+                if (send) {
+                    log::debug(cat, "Sending push via {} notifier", service);
+                    send_push(service, conn_it->second, dict.view());
+                    if (ack)
+                        request_ack(service, conn_it->second);
+                } else
+                    backlog_push(service, std::string{dict.view()});
+                notify_count++;
             }
         }
 
@@ -1221,25 +1284,17 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
     }
     auto conn = pool_.get();
     int reqed = 0, deleted = 0, matched = 0;
-    std::vector<DroppedTarget> dropped;
     try {
         pqxx::work tx{conn};
         while (!drops.is_finished()) {
             reqed++;
-            std::string svcid{drops.consume_string_view()};
-            auto del =
-                    tx.exec("DELETE FROM subscriptions WHERE service = $1 AND svcid = $2 RETURNING "
-                            "account, signature_ts",
-                            {service, svcid});
-            deleted += del.size();
-            if (!del.empty())
+            auto del = tx.exec("DELETE FROM subscriptions WHERE service = $1 AND svcid = $2",
+                               {service, drops.consume_string_view()})
+                               .no_rows()
+                               .affected_rows();
+            deleted += del;
+            if (del)
                 matched++;
-            for (auto row : del)
-                dropped.push_back(
-                        {row[0].as<AccountID>(),
-                         std::string{service},
-                         svcid,
-                         row[1].as<int64_t>()});
         }
         tx.commit();
     } catch (const oxenc::bt_deserialize_invalid_type&) {
@@ -1248,7 +1303,6 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
                 "invalid admin.on_drop_registration request: expected list of service id strings");
         return;
     }
-    drop_push_targets(dropped);
 
     log::info(
             cat,
@@ -1664,20 +1718,10 @@ void HiveMind::on_unsubscribe(oxenmq::Message& m) {
 void HiveMind::db_cleanup() {
     auto conn = pool_.get();
     pqxx::work tx{conn};
-    auto expired =
-            tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1 RETURNING account, "
-                    "service, svcid, signature_ts",
-                    {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)});
+    tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1",
+            {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)})
+            .no_rows();
     tx.commit();
-    std::vector<DroppedTarget> dropped;
-    dropped.reserve(expired.size());
-    for (auto row : expired)
-        dropped.push_back(
-                {row[0].as<AccountID>(),
-                 row[1].as<std::string>(),
-                 row[2].as<std::string>(),
-                 row[3].as<int64_t>()});
-    drop_push_targets(dropped);
 }
 
 void HiveMind::refresh_sns() {
@@ -1978,8 +2022,7 @@ void HiveMind::load_saved_subscriptions() {
                     Signature,
                     std::chrono::sys_seconds,
                     bool,
-                    std::vector<int16_t>,
-                    PushTarget>>>>
+                    std::vector<int16_t>>>>>
             threads;
 
     threads.resize(n);
@@ -1993,37 +2036,22 @@ void HiveMind::load_saved_subscriptions() {
             auto conn = pool.get();
             pqxx::work txn{conn};
 
-            for (auto [acc,
-                       ed,
-                       sub_tag,
-                       sub_sig,
-                       sig_in,
-                       sigts_in,
-                       wd_in,
-                       ns_arr_in,
-                       enc_key,
-                       service,
-                       svcid,
-                       svcdata] : txn
-                                          .stream<AccountID,
-                                                  std::optional<Ed25519PK>,
-                                                  std::optional<SubaccountTag>,
-                                                  std::optional<Signature>,
-                                                  Signature,
-                                                  int64_t,
-                                                  bool,
-                                                  pqxx::array<int16_t>,
-                                                  EncKey,
-                                                  std::string,
-                                                  std::string,
-                                                  std::optional<std::vector<std::byte>>>(R"(
+            for (auto [acc, ed, sub_tag, sub_sig, sig_in, sigts_in, wd_in, ns_arr_in] :
+                 txn
+                         .stream<AccountID,
+                                 std::optional<Ed25519PK>,
+                                 std::optional<SubaccountTag>,
+                                 std::optional<Signature>,
+                                 Signature,
+                                 int64_t,
+                                 bool,
+                                 pqxx::array<int16_t>>(R"(
 SELECT account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data,
-    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace),
-    enc_key, service, svcid, svcdata
+    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
 FROM subscriptions
 WHERE id % {0} = {1})"_format(n, i))) {
 
-                auto& [swpk, subaccount, sig, sigts, wd, ns_arr, target] = rows.emplace_back();
+                auto& [swpk, subaccount, sig, sigts, wd, ns_arr] = rows.emplace_back();
                 swpk.emplace(acc, ed, /*skip_validation=*/true);
                 if (sub_tag && sub_sig) {
                     subaccount.emplace();
@@ -2034,14 +2062,6 @@ WHERE id % {0} = {1})"_format(n, i))) {
                 sigts = std::chrono::sys_seconds{std::chrono::seconds{sigts_in}};
                 wd = wd_in;
                 ns_arr = std::vector<int16_t>{ns_arr_in.begin(), ns_arr_in.end()};
-                target = PushTarget{
-                        std::move(service),
-                        std::move(svcid),
-                        svcdata ? std::move(*svcdata) : std::vector<std::byte>{},
-                        enc_key,
-                        wd,
-                        ns_arr,
-                        sigts_in};
             }
         }};
     }
@@ -2069,12 +2089,8 @@ WHERE id % {0} = {1})"_format(n, i))) {
 
     int64_t raw_count = 0, count = 0, unique = 0;
     for (auto& [t, rows] : threads) {
-        for (auto& [swpk, subaccount, sig, sigts, wd, ns_arr, target] : rows) {
+        for (auto& [swpk, subaccount, sig, sigts, wd, ns_arr] : rows) {
             raw_count++;
-
-            // Pushes go to every stored subscription until db_cleanup() removes it, so this takes
-            // the rows skipped below for being about to expire too.
-            set_push_target(swpk->id, std::move(target));
 
             if (sigts <= sigts_cutoff.first || sigts >= sigts_cutoff.second)
                 // Don't try loading entries that are about to expire
@@ -2132,11 +2148,9 @@ WHERE id % {0} = {1})"_format(n, i))) {
 
     log::info(
             cat,
-            "Done loading saved subscriptions; {} unique subscriptions to {} accounts; push "
-            "targets for {} accounts",
+            "Done loading saved subscriptions; {} unique subscriptions to {} accounts",
             unique,
-            subscribers_.size(),
-            push_targets_.size());
+            subscribers_.size());
 }
 
 bool HiveMind::add_subscription(
@@ -2231,22 +2245,6 @@ RETURNING id
 
     tx.commit();
 
-    std::vector<std::byte> svcdata;
-    if (service_data) {
-        auto b = as_bytes(*service_data);
-        svcdata.assign(b.begin(), b.end());
-    }
-    set_push_target(
-            pubkey.id,
-            PushTarget{
-                    std::move(service),
-                    std::move(service_id),
-                    std::move(svcdata),
-                    enc_key,
-                    sub.want_data,
-                    sub.namespaces,
-                    sub.sig_ts.time_since_epoch().count()});
-
     return loop_.call_get([&] {
         pubkey.update_swarm(swarm_ids_);
 
@@ -2320,20 +2318,18 @@ bool HiveMind::remove_subscription(
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result = tx.exec(
-            R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3 RETURNING signature_ts)",
-            {pubkey.id, service, service_id});
+    auto result =
+            tx.exec(R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3)",
+                    {pubkey.id, service, service_id})
+                    .no_rows();
 
     tx.commit();
-
-    if (!result.empty())
-        drop_push_targets({{pubkey.id, service, service_id, result[0][0].as<int64_t>()}});
 
     // We don't remove the subscription from internal data structures: other devices
     // (with the exact subcription) may be still using it, and so we may still want
     // the notifications; but as long as the row is removed (above) we won't be
     // sending notifications to the device anymore.
-    return !result.empty();
+    return result.affected_rows() > 0;
 }
 
 }  // namespace spns
