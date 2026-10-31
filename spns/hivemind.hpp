@@ -29,7 +29,6 @@
 #include <oxen/quic/crypto.hpp>
 #include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/loop.hpp>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -73,6 +72,11 @@ inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 // Maximum bytes of incoming message notifications waiting for the processing thread; beyond this
 // they are dropped.  Bounds what waits while processing is held up, e.g. by a stalled notifier.
 inline constexpr size_t NOTIFY_QUEUE_MAX_BYTES = 256_Mi;
+
+// A batch of notifications looks up its accounts' subscriptions in queries of at most this many
+// accounts each.  If the lookup fails, the batch is tried again after this long.
+inline constexpr size_t SUBSCRIPTION_LOOKUP_BATCH = 1000;
+inline constexpr auto NOTIFY_LOOKUP_RETRY = 1s;
 
 // Maximum pushes held per service while its notifier cannot take them (the window below is full,
 // or its connection is gone); beyond this the service's new pushes are dropped.
@@ -205,34 +209,6 @@ class HiveMind {
 
     std::thread notify_proc_thread_;
     std::atomic<int64_t> pushes_processed_{0};
-
-    // Everything needed to send a push to one subscribed device.
-    struct PushTarget {
-        std::string service;
-        std::string svcid;
-        std::vector<std::byte> svcdata;  // Empty if the notifier gave none
-        EncKey enc_key;
-        bool want_data;
-        std::vector<int16_t> namespaces;  // Sorted
-        int64_t sig_ts;
-    };
-
-    // {account: [PushTarget...]}: an in-memory copy of the subscriptions table, so that a
-    // notification is a lookup here rather than a database query.  Every write to that table
-    // updates this once committed.
-    std::unordered_map<AccountID, std::vector<PushTarget>> push_targets_;
-    std::shared_mutex push_targets_mutex_;
-    void set_push_target(const AccountID& account, PushTarget target);
-    // A subscriptions row a writer deleted.
-    struct DroppedTarget {
-        AccountID account;
-        std::string service;
-        std::string svcid;
-        int64_t sig_ts;
-    };
-    // Leaves a target renewed since its row was deleted: the renewal can commit and reach
-    // set_push_target() before the deleting writer gets here.
-    void drop_push_targets(const std::vector<DroppedTarget>& dropped);
 
     // edpk -> SNode
     std::unordered_map<Ed25519PK, std::shared_ptr<hive::SNode>> sns_;
