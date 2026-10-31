@@ -97,3 +97,5 @@ execute_process(COMMAND ${Python_EXECUTABLE} -m site --user-site
 install(TARGETS spns_hivemind DESTINATION ${PYTHON_USER_SITE})
 cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_PREFIX NORMALIZE OUTPUT_VARIABLE install_path)
 set_target_properties(spns_hivemind PROPERTIES INSTALL_RPATH "${install_path}/${CMAKE_INSTALL_LIBDIR}")
+
+add_subdirectory(tests/e2e)

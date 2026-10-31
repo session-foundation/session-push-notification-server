@@ -1,19 +1,42 @@
 # End-to-end scenarios
 
 Runs the real hivemind against Postgres, a fake oxend and a fake swarm of storage nodes, a fake
-notifier and a fake subscribing client, all in one container. Manual only: nothing runs this in CI.
+notifier and a fake subscribing client. CI (`.woodpecker/build.star`) runs the fast scenarios on
+every event and the slow ones on pushes, tags, manual and cron runs.
 
 ```
-tests/e2e/run.sh                          # the fast scenarios, about 2 minutes
-tests/e2e/run.sh --slow                   # also the slow ones, about 15 minutes
-tests/e2e/run.sh burst churn              # just these
-tests/e2e/run.sh --sanitize thread        # under ThreadSanitizer (or: address)
-E2E_SUSTAINED_MINUTES=2 tests/e2e/run.sh sustained
+make e2e-fast                             # the fast scenarios, about 2 minutes
+make e2e                                  # all of them, about 15 minutes
+make e2e-burst                            # one scenario: e2e-<name> for each in the tables below
+make e2e-slow                             # the three slow ones
+E2E_SUSTAINED_MINUTES=2 make e2e-sustained
 ```
 
-Needs Docker. The build lives in the `spns-e2e-build` volume, so a rerun only recompiles what
-changed; `docker volume rm spns-e2e-build` starts from scratch. The exit code is non-zero if any
-scenario fails, and a failing scenario prints the end of each process's log.
+These targets of the project's build build the hivemind and the three fakes (which nothing else
+builds) and run `e2e.py` against them; further `e2e.py` options go through `E2E_ARGS`, e.g.
+`make e2e-fast E2E_ARGS="--db other"`. For a sanitizer run, configure a build with
+`-fsanitize=thread` (or `address`) in `CMAKE_CXX_FLAGS` and the linker flags and run its e2e
+targets: the harness stretches its timeouts, skips the timing limits and fails a scenario on any
+report. It needs `python3-psycopg`, plus the Python modules the hivemind loads (`python3-nacl`,
+`python3-coloredlogs`), and a Postgres database it may empty, reached through the usual libpq
+environment (`PGHOST`, `PGUSER`, ...): `spns_e2e` unless `--db` says otherwise, created once
+beforehand (`createdb spns_e2e`), and emptied before every scenario. It is Linux only, reading the
+hivemind's memory and CPU use from `/proc`. Sockets, config and logs go in a temporary directory
+(`--work-dir`), and the fakes listen on ports 22029 and 23000 upwards (`--oxend-port`,
+`--quic-port`). The exit code is non-zero if any scenario fails, and a failing scenario prints the
+end of each process's log.
+
+## In a container
+
+```
+tests/e2e/run.sh                          # e2e-fast
+E2E_TARGET=e2e-scale tests/e2e/run.sh     # another target
+E2E_SANITIZER=thread tests/e2e/run.sh
+```
+
+For a machine without the dependencies or a Postgres server: builds a Debian image with both,
+configures a build in the `spns-e2e-build` volume (so that a rerun only recompiles what changed;
+`docker volume rm spns-e2e-build` starts from scratch) and runs the chosen e2e target.
 
 ## Scenarios
 
