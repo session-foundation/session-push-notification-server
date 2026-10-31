@@ -1,31 +1,44 @@
 #!/usr/bin/env python3
-"""End-to-end scenarios for the hivemind, run inside the container tests/e2e/run.sh starts.
+"""End-to-end scenarios for the hivemind.
 
 The hivemind runs for real, against Postgres, a fake oxend and a fake swarm of storage nodes
 (fake_network), a fake notifier (fake_notifier) and a fake subscribing client (fake_client).
 
-usage: e2e.py [--slow] [--sanitize thread|address] [SCENARIO...]
+usage: e2e.py [--build-dir DIR] [--slow] [--sanitizer thread|address] [options] [SCENARIO...]
 
-With no SCENARIO, runs every fast scenario, plus the slow ones with --slow.
+Normally run through the build's e2e targets (`make e2e`, `make e2e-burst`, ...), which build the
+hivemind and the fakes and pass the build directory.  With no SCENARIO, runs every fast scenario,
+plus the slow ones with --slow.  Needs an existing Postgres database it may empty (see --db), found through the usual
+libpq environment (PGHOST, PGUSER, ...).  Linux only: it reads process memory and CPU use from
+/proc.  tests/e2e/run.sh does all of this inside a container.
 """
 
 import argparse
 import os
+
+import psycopg
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 
-SRC = "/src"
-BUILD = "/build"
-WORK = "/tmp/e2e"
-OXEND_PORT = 22029
-FIRST_QUIC_PORT = 23000
-HIVEMIND_SOCK = f"ipc://{WORK}/hivemind.sock"
+# Set from the command line in main().
+SRC = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BUILD = None  # The project's build directory: SPNS and the Python module, with the fakes
+FAKES = None  # under tests/e2e of it.
+SANITIZER = None
+WORK = None
+DB = None
+OXEND_PORT = None
+FIRST_QUIC_PORT = None
+# Relative to WORK, which every process runs in: a unix socket path must fit sockaddr_un's 108
+# bytes, and a relative one keeps that from depending on where WORK is.
+HIVEMIND_SOCK = "ipc://hivemind.sock"
 # Sanitized builds run several times slower: their timeouts stretch by this much, and they skip the
 # timing limits (they look for memory and threading errors; every push must still arrive).
 TIME_SCALE = 1
@@ -44,98 +57,51 @@ def check(cond, msg):
         raise Failure(msg)
 
 
-def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, **kw)
-
-
-def run_quiet(cmd):
-    """Runs a build step, showing its output only if it fails."""
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if r.returncode != 0:
-        print(r.stdout[-20000:])
-        raise subprocess.CalledProcessError(r.returncode, cmd)
-
-
-def psql(sql, db="spns"):
-    return run(
-        ["psql", "-qtA", "-v", "ON_ERROR_STOP=1", db, "-c", sql],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-# --- building ---------------------------------------------------------------------------------
-
-
-def build(sanitize):
-    variant = f"spns-{sanitize}" if sanitize else "spns"
-    flags = {
-        None: "-O2 -g",
-        "thread": "-O1 -g -fsanitize=thread",
-        "address": "-O1 -g -fsanitize=address -fno-omit-frame-pointer",
-    }[sanitize]
-    jobs = str(max(1, os.cpu_count() // 2))
-    print(f"building {variant} and the fakes", flush=True)
-    run_quiet(
-        [
-            "cmake",
-            "-S",
-            SRC,
-            "-B",
-            f"{BUILD}/{variant}",
-            "-DCMAKE_BUILD_TYPE=None",
-            f"-DCMAKE_CXX_FLAGS={flags}",
-            f"-DCMAKE_EXE_LINKER_FLAGS={flags}",
-            f"-DCMAKE_SHARED_LINKER_FLAGS={flags}",
-            "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
-        ]
-    )
-    run_quiet(
-        ["make", "-C", f"{BUILD}/{variant}", f"-j{jobs}", "spns", "spns_hivemind"]
-    )
-    run_quiet(
-        [
-            "cmake",
-            "-S",
-            f"{SRC}/tests/e2e",
-            "-B",
-            f"{BUILD}/fakes",
-            "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
-        ]
-    )
-    run_quiet(["make", "-C", f"{BUILD}/fakes", f"-j{jobs}"])
-    return f"{BUILD}/{variant}"
-
-
 # --- database ---------------------------------------------------------------------------------
 
 
-def start_postgres():
-    version = sorted(os.listdir("/usr/lib/postgresql"), key=int)[-1]
-    run(["pg_ctlcluster", version, "main", "start"])
-    subprocess.run(
-        ["su", "postgres", "-c", "psql -q -c 'CREATE ROLE root SUPERUSER LOGIN'"],
-        capture_output=True,
-    )
+def connect():
+    """A connection to DB, through libpq's environment for everything but the database name."""
+    return psycopg.connect(dbname=DB, autocommit=True)
+
+
+def execute(sql):
+    with connect() as conn:
+        conn.execute(sql)
+
+
+def query(sql):
+    """Returns the rows of a query, as tuples."""
+    with connect() as conn:
+        return conn.execute(sql).fetchall()
+
+
+def query1(sql):
+    """Returns the one value of a query with one row and one column."""
+    rows = query(sql)
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise Failure(f"expected one value from {sql!r}, got {rows}")
+    return rows[0][0]
+
+
+def wait_db(timeout=60):
+    """Waits for DB to accept connections, as a server started alongside may not yet."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with connect():
+                return
+        except psycopg.OperationalError as e:
+            if time.time() > deadline:
+                sys.exit(f"cannot connect to database {DB}: {e}")
+            time.sleep(1)
 
 
 def fresh_db():
-    run(
-        ["su", "postgres", "-c", "dropdb --if-exists spns && createdb -O root spns"],
-        capture_output=True,
-    )
-    run(
-        [
-            "psql",
-            "-q",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "spns",
-            "-f",
-            f"{SRC}/spns/schema.pgsql",
-        ],
-        capture_output=True,
-    )
+    """Empties DB, which must exist already, and applies the schema."""
+    execute("DROP TABLE IF EXISTS sub_namespaces, subscriptions, service_stats")
+    with open(f"{SRC}/spns/schema.pgsql") as f:
+        execute(f.read())
 
 
 # Account #i is 03 || SHA256(big-endian i), as in fake_network.
@@ -155,7 +121,7 @@ def seed(
     expression in `i` giving account #i's number of devices, whose service ids are
     "dev-<i>-<d>"."""
     sig_ts = sig_ts or int(time.time())
-    psql(
+    execute(
         f"""
 WITH s AS (
     INSERT INTO subscriptions (account, signature, signature_ts, want_data, enc_key, service, svcid, svcdata)
@@ -168,6 +134,20 @@ INSERT INTO sub_namespaces SELECT s.id, n FROM s, unnest(ARRAY[{namespaces}]::sm
 
 
 # --- processes --------------------------------------------------------------------------------
+
+
+# Every child started, so that whatever a failed scenario leaves behind can be killed before the
+# next one: by pid, never by name, since the machine may be running a real hivemind.
+CHILDREN = []
+
+
+def kill_leftovers():
+    for p in CHILDREN:
+        if p.poll() is None:
+            p.send_signal(signal.SIGCONT)
+            p.kill()
+            p.wait()
+    CHILDREN.clear()
 
 
 class Proc:
@@ -185,6 +165,7 @@ class Proc:
             env=env,
             cwd=WORK,
         )
+        CHILDREN.append(self.p)
         self.lock = threading.Lock()
 
     def readline(self, timeout):
@@ -228,7 +209,7 @@ class Hivemind:
         with open(f"{WORK}/spns.ini", "w") as f:
             f.write(
                 f"""[db]
-url = postgresql:///spns
+url = postgresql:///{DB}
 [log]
 level = {log_level}
 [hivemind]
@@ -257,15 +238,16 @@ hivemind = {key}
         self.start_time = time.time()
         self.logf = open(self.log_path, "w")
         cmd = [f"{build_dir}/SPNS", f"{WORK}/spns.ini"]
-        if build_dir.endswith("-thread"):
+        if SANITIZER == "thread":
             # TSan cannot map its shadow memory under the kernel's full address randomisation.
             cmd = ["setarch", os.uname().machine, "-R"] + cmd
         self.p = subprocess.Popen(
             cmd, stdout=self.logf, stderr=subprocess.STDOUT, env=env, cwd=WORK
         )
+        CHILDREN.append(self.p)
 
     def wait_socket(self, timeout=600):
-        path = HIVEMIND_SOCK[len("ipc://") :]
+        path = os.path.join(WORK, HIVEMIND_SOCK[len("ipc://") :])
         deadline = time.time() + timeout
         while not os.path.exists(path):
             check(self.p.poll() is None, f"hivemind exited early ({self.p.returncode})")
@@ -312,7 +294,7 @@ class Setup:
         self.network = Proc(
             "network",
             [
-                f"{BUILD}/fakes/fake_network",
+                f"{FAKES}/fake_network",
                 str(nodes),
                 str(swarms),
                 str(OXEND_PORT),
@@ -323,7 +305,7 @@ class Setup:
             self.hivemind = Hivemind(build_dir, **hivemind_args)
             self.hivemind.wait_socket()
             self.notifier = Proc(
-                "notifier", [f"{BUILD}/fakes/fake_notifier", HIVEMIND_SOCK]
+                "notifier", [f"{FAKES}/fake_notifier", HIVEMIND_SOCK]
             )
             check(
                 self.notifier.readline(120) == "registered", "notifier did not register"
@@ -338,7 +320,7 @@ class Setup:
 
     def client_proc(self):
         if not self.client:
-            self.client = Proc("client", [f"{BUILD}/fakes/fake_client", HIVEMIND_SOCK])
+            self.client = Proc("client", [f"{FAKES}/fake_client", HIVEMIND_SOCK])
         return self.client
 
     def counts(self, notifier=None):
@@ -419,7 +401,7 @@ def scenario_correctness(build_dir):
         )
         check(got == want, f"phase 1 pushes: {got}")
         check(
-            psql("SELECT count(*) FROM subscriptions WHERE svcid = 'dev-3-1'") == "0",
+            query1("SELECT count(*) FROM subscriptions WHERE svcid = 'dev-3-1'") == 0,
             "the expired subscription is still in the database",
         )
 
@@ -451,7 +433,7 @@ def scenario_correctness(build_dir):
             c["pushes"] == 5,
             f"phase 3: unsubscribed account still pushed ({c['pushes']})",
         )
-        left = sorted(psql("SELECT svcid FROM subscriptions").split())
+        left = sorted(svcid for (svcid,) in query("SELECT svcid FROM subscriptions"))
         check(left == ["dev-1-1", "dev-2-2"], f"subscriptions left: {left}")
         check(c["duplicates"] == 0, f"{c['duplicates']} duplicate pushes")
     finally:
@@ -526,7 +508,7 @@ def scenario_notifier_restart(build_dir):
         s.notifier.stop(sig=signal.SIGKILL)
         # Long enough for resends to find the connection gone before the new one registers.
         time.sleep(3)
-        s.notifier = Proc("notifier2", [f"{BUILD}/fakes/fake_notifier", HIVEMIND_SOCK])
+        s.notifier = Proc("notifier2", [f"{FAKES}/fake_notifier", HIVEMIND_SOCK])
         check(s.notifier.readline(120) == "registered", "new notifier did not register")
         # Only what the dead notifier had taken without acknowledging is lost: under a window.
         c = s.wait_pushes(29_800, 60, settle=3)
@@ -565,7 +547,7 @@ def scenario_two_notifiers(build_dir):
     try:
         other = Proc(
             "notifier-other",
-            [f"{BUILD}/fakes/fake_notifier", HIVEMIND_SOCK, "-1", "other"],
+            [f"{FAKES}/fake_notifier", HIVEMIND_SOCK, "-1", "other"],
         )
         check(other.readline(120) == "registered", "second notifier did not register")
         s.notifier.p.send_signal(signal.SIGSTOP)
@@ -604,10 +586,9 @@ def scenario_backlog(build_dir):
 
         def stall_db():
             time.sleep(2)
-            psql(
-                f"BEGIN; LOCK TABLE service_stats IN ACCESS EXCLUSIVE MODE; "
-                f"SELECT pg_sleep({stall}); COMMIT;"
-            )
+            with psycopg.connect(dbname=DB) as conn:
+                conn.execute("LOCK TABLE service_stats IN ACCESS EXCLUSIVE MODE")
+                conn.execute(f"SELECT pg_sleep({stall})")
 
         s.network.cmd("backlog")
         t = threading.Thread(target=stall_db)
@@ -690,8 +671,8 @@ def scenario_churn(build_dir):
             f"after churn: expected 100 pushes (the even clients), got {c['pushes'] - before}",
         )
         check(c["duplicates"] == 0, f"{c['duplicates']} duplicate pushes")
-        n = psql("SELECT count(*) FROM subscriptions WHERE svcid LIKE 'client-%'")
-        check(n == "100", f"database holds {n} client subscriptions, expected 100")
+        n = query1("SELECT count(*) FROM subscriptions WHERE svcid LIKE 'client-%'")
+        check(n == 100, f"database holds {n} client subscriptions, expected 100")
     finally:
         rc = s.stop()
     check(rc == 0, f"hivemind exit code {rc}")
@@ -818,7 +799,7 @@ def scenario_scale(build_dir):
     fresh_db()
     print("    seeding 1,000,000 accounts", flush=True)
     seed(0, accounts, devices="CASE WHEN i % 10 = 0 THEN 3 ELSE 1 END")
-    rows = int(psql("SELECT count(*) FROM subscriptions"))
+    rows = query1("SELECT count(*) FROM subscriptions")
     start = time.time()
     s = Setup(build_dir, nodes=nodes, swarms=swarms)
     try:
@@ -866,7 +847,39 @@ def main():
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     ap.add_argument("--slow", action="store_true", help="also run " + ", ".join(SLOW))
-    ap.add_argument("--sanitize", choices=["thread", "address"])
+    ap.add_argument(
+        "--build-dir",
+        default=os.path.join(SRC, "build"),
+        help="the project's build directory, holding SPNS, the Python module and, under "
+        "tests/e2e, the fakes; the e2e build targets build them and pass this (default: "
+        "%(default)s)",
+    )
+    ap.add_argument(
+        "--sanitizer",
+        choices=["thread", "address"],
+        help="the build was made with this sanitizer: stretch timeouts, skip timing limits, and "
+        "fail a scenario on any report",
+    )
+    ap.add_argument(
+        "--work-dir",
+        help="scratch directory for sockets, config and logs, emptied before each scenario "
+        "(default: a new temporary directory)",
+    )
+    ap.add_argument(
+        "--db",
+        default="spns_e2e",
+        help="existing Postgres database, emptied before each scenario, on the server the PG* "
+        "environment points at (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--oxend-port", type=int, default=22029, help="fake oxend's port (default: %(default)s)"
+    )
+    ap.add_argument(
+        "--quic-port",
+        type=int,
+        default=23000,
+        help="first of the fake storage nodes' consecutive QUIC ports (default: %(default)s)",
+    )
     ap.add_argument(
         "scenarios",
         nargs="*",
@@ -879,18 +892,25 @@ def main():
         ap.error(f"unknown scenario(s): {', '.join(sorted(unknown))}")
     names = args.scenarios or (FAST + SLOW if args.slow else FAST)
 
-    global TIME_SCALE, SANITIZED
-    TIME_SCALE = {None: 1, "address": 3, "thread": 10}[args.sanitize]
-    SANITIZED = args.sanitize is not None
-    build_dir = build(args.sanitize)
-    start_postgres()
+    global TIME_SCALE, SANITIZED, SANITIZER, BUILD, FAKES, WORK, DB, OXEND_PORT, FIRST_QUIC_PORT
+    SANITIZER = args.sanitizer
+    TIME_SCALE = {None: 1, "address": 3, "thread": 10}[SANITIZER]
+    SANITIZED = SANITIZER is not None
+    BUILD = os.path.abspath(args.build_dir)
+    FAKES = os.path.join(BUILD, "tests", "e2e")
+    for exe in [f"{BUILD}/SPNS"] + [f"{FAKES}/fake_{f}" for f in ("network", "notifier", "client")]:
+        if not os.path.exists(exe):
+            sys.exit(f"{exe} does not exist: run an e2e build target (make e2e), or fix --build-dir")
+    WORK = os.path.abspath(args.work_dir) if args.work_dir else tempfile.mkdtemp(prefix="spns-e2e-")
+    DB = args.db
+    OXEND_PORT = args.oxend_port
+    FIRST_QUIC_PORT = args.quic_port
+    build_dir = BUILD
+    wait_db()
     results = []
     for name in names:
         # A scenario that failed badly can leave a child holding the ports the next one needs.
-        for child in ("SPNS", "fake_network", "fake_notifier", "fake_client"):
-            subprocess.run(["pkill", "-CONT", "-x", child], capture_output=True)
-            subprocess.run(["pkill", "-KILL", "-x", child], capture_output=True)
-        time.sleep(0.5)
+        kill_leftovers()
         shutil.rmtree(WORK, ignore_errors=True)
         os.makedirs(WORK)
         print(f"== {name}", flush=True)
