@@ -710,7 +710,7 @@ void HiveMind::process_notifications() {
                             EncKey,
                             std::string,
                             std::string,
-                            std::vector<std::byte>>>
+                            std::optional<std::vector<std::byte>>>>
                             notifies;
                     std::vector<Blake2B_32> filter_vals;
 
@@ -767,7 +767,7 @@ WHERE account = $1
                                 3 + 8 +                  // 1:n i-32768e
                                 3 + 15 +                 // 1:t i1695078498534e (timestamp)
                                 3 + 15 +                 // 1:t i1695078498534e (expiry)
-                                (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
+                                (svcdata ? 3 + 21 + svcdata->size() : 0) +
                                 (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
 
                         if (buf.size() < size_needed)
@@ -778,8 +778,8 @@ WHERE account = $1
                         try {
                             // NB: ascii sorted keys
                             dict.append("", service);
-                            if (!svcdata.empty())
-                                dict.append("!", svcdata);
+                            if (svcdata)
+                                dict.append("!", *svcdata);
                             dict.append("#", hash);
                             dict.append("&", svcid);
                             dict.append("@", account.sv());
