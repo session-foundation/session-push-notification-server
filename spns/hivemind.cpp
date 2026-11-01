@@ -102,6 +102,7 @@ HiveMind::HiveMind(Config conf_in) :
             //     "subaccount_sig": "14c7b71f...",
             //     "namespaces": [-400,0,1,2,17],
             //     "data": true,
+            //     "coexist": true, (optional; keep the device's subscription with the other "data")
             //     "sig_ts": 1677520760,
             //     "signature": "f8efdd120007...",
             //     "service": "apns",
@@ -714,11 +715,15 @@ void HiveMind::process_notifications() {
                             notifies;
                     std::vector<Blake2B_32> filter_vals;
 
+                    // A device can hold one subscription with data and one without.  If both
+                    // include this namespace, the with-data one must come first: the duplicate
+                    // filter below, keyed by device and message, then drops the other.
                     auto result = tx.exec(
                             R"(
 SELECT want_data, enc_key, service, svcid, svcdata FROM subscriptions
 WHERE account = $1
-    AND EXISTS(SELECT 1 FROM sub_namespaces WHERE subscription = id AND namespace = $2))",
+    AND EXISTS(SELECT 1 FROM sub_namespaces WHERE subscription = id AND namespace = $2)
+ORDER BY want_data DESC)",
                             {account, ns});
                     notifies.reserve(result.size());
                     filter_vals.reserve(result.size());
@@ -1051,6 +1056,7 @@ void HiveMind::on_notifier_validation(
         const SwarmPubkey& pubkey,
         std::shared_ptr<hive::Subscription> sub,
         const std::optional<EncKey>& enc_key,
+        bool coexist,
         std::vector<std::string> data,
         const std::optional<UnsubData>& unsub) {
 
@@ -1108,15 +1114,22 @@ void HiveMind::on_notifier_validation(
                         std::move(service_id),
                         std::move(service_data),
                         *enc_key,
-                        std::move(*sub));
+                        std::move(*sub),
+                        coexist);
 
                 response[newsub ? "added" : "updated"] = true;
                 message = newsub ? "Subscription successful" : "Resubscription successful";
             } else {  // Unsubscribe
                 assert(!sub);
-                auto& [sig, subaccount, sig_ts] = *unsub;
+                auto& [sig, subaccount, sig_ts, want_data] = *unsub;
                 bool removed = remove_subscription(
-                        pubkey, subaccount, std::move(service), std::move(service_id), sig, sig_ts);
+                        pubkey,
+                        subaccount,
+                        std::move(service),
+                        std::move(service_id),
+                        sig,
+                        sig_ts,
+                        want_data);
 
                 response["removed"] = removed;
                 message = removed ? "Device unsubscribed from push notifications"
@@ -1234,6 +1247,17 @@ namespace {
         }
     }
 
+    // An optional boolean parameter: nullopt if absent or null.
+    std::optional<bool> optional_bool(const nlohmann::json& obj, std::string_view key) {
+        auto it = obj.find(key);
+        if (it == obj.end() || it->is_null())
+            return std::nullopt;
+        if (!it->is_boolean())
+            throw hive::subscribe_error{
+                    hive::SUBSCRIBE::BAD_INPUT, "'{}' must be a boolean"_format(key)};
+        return it->get<bool>();
+    }
+
 }  // namespace
 
 template <typename Message>
@@ -1295,6 +1319,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
             if (subscribe) {
                 auto enc_key = from_hex_or_b64<EncKey>(at(e, "enc_key").get<std::string_view>());
                 auto namespaces = at(e, "namespaces").get<std::vector<int16_t>>();
+                bool coexist = optional_bool(e, "coexist").value_or(false);
 
                 reply_handler = [this,
                                  response,
@@ -1312,6 +1337,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                                          std::move(sig)),
                                  pubkey = pubkey,
                                  enc_key = std::move(enc_key),
+                                 coexist,
                                  replier](bool success, std::vector<std::string> data) mutable {
                     on_notifier_validation(
                             *response,
@@ -1324,10 +1350,13 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(pubkey),
                             std::move(sub),
                             std::move(enc_key),
+                            coexist,
                             std::move(data));
                 };
             } else {
                 // unsubscribe
+                UnsubData unsub{
+                        std::move(sig), std::move(subaccount), sig_ts, optional_bool(e, "data")};
 
                 reply_handler = [this,
                                  response,
@@ -1336,7 +1365,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                                  multi,
                                  service = service,
                                  pubkey = pubkey,
-                                 unsub = UnsubData{std::move(sig), std::move(subaccount), sig_ts},
+                                 unsub = std::move(unsub),
                                  replier](bool success, std::vector<std::string> data) mutable {
                     on_notifier_validation(
                             *response,
@@ -1349,6 +1378,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(pubkey),
                             nullptr,
                             std::nullopt,
+                            false,
                             std::move(data),
                             std::move(unsub));
                 };
@@ -1868,13 +1898,16 @@ bool HiveMind::add_subscription(
         std::string service_id,
         std::optional<std::string> service_data,
         EncKey enc_key,
-        hive::Subscription sub) {
+        hive::Subscription sub,
+        bool coexist) {
 
     bool new_sub = false, insert_ns = false;
 
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
+    // The row this replaces: the device's subscription with the same want_data or, without
+    // `coexist`, the one with the other value if that is all it has.
     auto result = tx.query01<int64_t, int64_t, pqxx::array<int16_t>>(
             R"(
 SELECT
@@ -1883,8 +1916,18 @@ SELECT
     ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
 FROM subscriptions
 WHERE
-    account = $1 AND service = $2 AND svcid = $3)",
-            {pubkey.id, service, service_id});
+    account = $1 AND service = $2 AND svcid = $3 AND (want_data = $4 OR NOT $5)
+ORDER BY want_data = $4 DESC
+LIMIT 1)",
+            {pubkey.id, service, service_id, sub.want_data, coexist});
+
+    // Without `coexist` the device keeps only the subscription written here.
+    if (!coexist)
+        tx.exec(R"(
+DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3 AND id <> $4)",
+                {pubkey.id, service, service_id, result ? std::get<0>(*result) : int64_t{-1}})
+                .no_rows();
+
     int64_t id;
     if (result) {
         auto& [row_id, sig_ts, ns_arr_in] = *result;
@@ -1997,13 +2040,17 @@ RETURNING id
 /// - sig_ts -- the integer unix timestamp when the signature was generated; must be
 /// within ±24h
 /// - signature -- the Ed25519 signature of: UNSUBSCRIBE || PUBKEY_HEX || sig_ts
+/// - want_data -- if given, only the device's subscription with this `want_data` is removed;
+///   otherwise all of its subscriptions to the account are.  It needs no signature: the signature
+///   already authorises removing them all.
 bool HiveMind::remove_subscription(
         const SwarmPubkey& pubkey,
         const std::optional<Subaccount>& subaccount,
         std::string service,
         std::string service_id,
         const Signature& sig,
-        int64_t sig_ts) {
+        int64_t sig_ts,
+        std::optional<bool> want_data) {
 
     if (sig_ts < unix_timestamp(system_clock::now() - UNSUBSCRIBE_GRACE) ||
         sig_ts > unix_timestamp(system_clock::now() + UNSUBSCRIBE_GRACE))
@@ -2022,10 +2069,11 @@ bool HiveMind::remove_subscription(
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result =
-            tx.exec(R"(DELETE FROM subscriptions WHERE account = $1 AND service = $2 AND svcid = $3)",
-                    {pubkey.id, service, service_id})
-                    .no_rows();
+    auto result = tx.exec(R"(
+DELETE FROM subscriptions
+WHERE account = $1 AND service = $2 AND svcid = $3 AND ($4::boolean IS NULL OR want_data = $4))",
+                          {pubkey.id, service, service_id, want_data})
+                          .no_rows();
 
     tx.commit();
 

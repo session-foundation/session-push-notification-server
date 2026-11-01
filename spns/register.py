@@ -18,6 +18,7 @@ def subscribe():
         "subaccount_sig": "aGVsbG9...",
         "namespaces": [-400,0,1,2,17],
         "data": true,
+        "coexist": true,
         "sig_ts": 1677520760,
         "signature": "f8efdd120007...",
         "service": "apns",
@@ -40,6 +41,9 @@ def subscribe():
       ascending order.
     - data -- if provided and true then notifications will include the body of the message (as long
       as it isn't too large); if false then the body will not be included in notifications.
+    - coexist -- optional, default false.  If true, this subscription replaces only the device's
+      subscription with the same `data` value, and one with the other value stays in place; see
+      below.
     - sig_ts -- the signature unix timestamp (seconds, not ms); see below.
     - signature -- the 64-byte Ed25519 signature; see below.
     - service -- the string identifying the notification service, such as "apns" or "firebase".
@@ -51,6 +55,13 @@ def subscribe():
     Notification subscriptions are unique per pubkey/service/service_token which means that
     re-subscribing with the same pubkey/service/token renews (or updates, if there are changes in
     other parameters such as the namespaces) an existing subscription.
+
+    With `"coexist": true` they are unique per pubkey/service/service_token/data instead, so a
+    device can hold two subscriptions to one account: one with `"data": true` for the namespaces
+    whose notifications should carry the message body, and one with `"data": false` for the rest.
+    Each is renewed by re-subscribing with the same `data` value (and `"coexist": true`); a
+    subscribe without `coexist` replaces both with the single new subscription.  If both include a
+    namespace, a message there is notified once, through the subscription with data.
 
     Signatures:
 
@@ -138,10 +149,15 @@ def unsubscribe():
         "sig_ts": 1677520760,
         "signature": "f8efdd120007...",
         "service": "apns",
-        "service_info": { ... }
+        "service_info": { ... },
+        "data": false
     }
 
     (or a list of such elements).
+
+    `data` is optional.  If given, only the device's subscription with that `data` value is removed
+    (see `"coexist"` in /subscribe); if omitted, all of the device's subscriptions to the account
+    are removed.  It is not part of the signature.
 
     The signature here is over the value:
 
@@ -153,7 +169,8 @@ def unsubscribe():
 
     { "success": true, "removed": true }
 
-    if a registration for the given pubkey/service info was found and removed; or:
+    if a registration for the given pubkey/service info (and `data`, if given) was found and
+    removed; or:
 
     { "success": true, "removed": false }
 

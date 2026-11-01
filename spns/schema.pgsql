@@ -13,7 +13,8 @@ CREATE TABLE subscriptions (
     svcid VARCHAR NOT NULL,       -- unique device/app identifier
     svcdata BYTEA,                -- arbitrary data for subscription service
 
-    UNIQUE(account, service, svcid)
+    -- A device can hold one subscription with message data and one without
+    UNIQUE(account, service, svcid, want_data)
 );
 
 CREATE INDEX subscriptions_signature_ts_idx ON subscriptions(signature_ts);
