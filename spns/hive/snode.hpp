@@ -49,11 +49,6 @@ inline constexpr std::array CONNECT_COOLDOWN = {10s, 30s, 60s, 120s};
 // fails then we enter the cooldown, above.
 inline constexpr auto RECONNECT_WAIT = 1s;
 
-template <typename T, typename = std::enable_if_t<is_bytes<T>>>
-inline std::string_view as_sv(const T& data) {
-    return {reinterpret_cast<const char*>(data.data()), T::SIZE};
-}
-
 class SNode {
     // Class managing a connection to a single service node
 

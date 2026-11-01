@@ -46,6 +46,9 @@ namespace spns {
 
 namespace quic = oxen::quic;
 
+using namespace quic::literals;
+
+
 // How long until we expire subscriptions (relative to the signature timestamp).  This can be no
 // more than 14 days (because that's the subscription cutoff for storage server), but can also be
 // less.
@@ -60,7 +63,7 @@ inline constexpr size_t SERVICE_NAME_MAX_SIZE = 32;
 inline constexpr size_t SERVICE_ID_MIN_SIZE = 32;
 inline constexpr size_t SERVICE_ID_MAX_SIZE = 999;
 inline constexpr size_t SERVICE_DATA_MAX_SIZE = 99'999;
-inline constexpr size_t MSG_DATA_MAX_SIZE = 76'800;  // Storage server limit
+inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
@@ -132,8 +135,6 @@ class HiveMind {
     std::list<std::shared_ptr<quic::Endpoint>> quic_in_;
     std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
                                                 // if there is a suitable one for outbound use.
-
-    std::shared_ptr<quic::Ticker> subs_ticker_;
 
     PGConnPool pool_;
 

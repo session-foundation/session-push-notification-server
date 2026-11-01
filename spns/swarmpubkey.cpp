@@ -2,11 +2,12 @@
 
 #include <oxenc/endian.h>
 #include <sodium/crypto_sign_ed25519.h>
+#include "utils.hpp"
 
 namespace spns {
 
-static_assert(is_bytes<AccountID>);
-static_assert(!is_bytes<std::array<unsigned char, 32>>);
+static_assert(bytes_derived<AccountID>);
+static_assert(!bytes_derived<std::array<unsigned char, 32>>);
 
 static uint64_t calc_swarm_space(const AccountID& id) {
     uint64_t res = 0;
@@ -28,7 +29,8 @@ SwarmPubkey::SwarmPubkey(AccountID account_id, std::optional<Ed25519PK> ed, bool
             AccountID derived_pk;
             derived_pk[0] = std::byte{0x05};
             int rc = crypto_sign_ed25519_pk_to_curve25519(
-                    static_cast<unsigned char*>(derived_pk) + 1, ed25519);
+                    derived_pk.xpk<unsigned char>().data(),
+                    ed25519);
             if (rc != 0)
                 throw std::invalid_argument{"Failed to convert session_ed25519 to x25519 pubkey"};
             if (derived_pk != id)

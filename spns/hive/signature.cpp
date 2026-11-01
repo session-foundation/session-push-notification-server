@@ -1,16 +1,13 @@
 #include "signature.hpp"
 
 #include <sodium/crypto_core_ed25519.h>
-#include <sodium/crypto_generichash_blake2b.h>
 #include <sodium/crypto_scalarmult_ed25519.h>
 #include <sodium/crypto_sign.h>
-
-#include "../blake2b.hpp"
 
 namespace spns::hive {
 
 void verify_signature(std::string_view sig_msg, const Signature& sig, const Ed25519PK& pubkey, std::string_view descr) {
-    if (0 != crypto_sign_verify_detached(sig, as_usv(sig_msg).data(), sig_msg.size(), pubkey))
+    if (0 != crypto_sign_verify_detached(sig, as_uc(sig_msg).data(), sig_msg.size(), pubkey))
         throw signature_verify_failure{std::string{descr} + " verification failed"};
 }
 

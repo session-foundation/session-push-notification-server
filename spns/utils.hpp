@@ -17,28 +17,28 @@ using system_time = system_clock::time_point;
 
 using namespace std::literals;
 
-using bstring = std::basic_string<std::byte>;
-using bstring_view = std::basic_string_view<std::byte>;
-
-using ustring = std::basic_string<unsigned char>;
-using ustring_view = std::basic_string_view<unsigned char>;
-
-inline std::string_view as_sv(bstring_view s) {
+inline std::string_view as_sv(std::span<const std::byte> s) {
     return {reinterpret_cast<const char*>(s.data()), s.size()};
 }
-inline std::string copy_str(bstring_view s) {
+inline std::string copy_str(std::span<const std::byte> s) {
     return std::string{as_sv(s)};
 }
 
-inline bstring_view as_bsv(std::string_view s) {
+inline std::span<const std::byte> as_bytes(std::string_view s) {
+    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
+}
+inline std::span<const std::byte> as_bytes(std::span<const unsigned char> s) {
     return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
 }
 
-inline ustring_view as_usv(std::string_view s) {
+inline std::span<const unsigned char> as_uc(std::string_view s) {
     return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
 }
-inline ustring_view as_usv(bstring_view s) {
+inline std::span<const unsigned char> as_uc(std::span<const std::byte> s) {
     return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
+}
+inline std::span<unsigned char> as_uc(std::span<std::byte> s) {
+    return {reinterpret_cast<unsigned char*>(s.data()), s.size()};
 }
 
 using namespace oxen::log::literals;

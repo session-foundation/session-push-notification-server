@@ -23,8 +23,8 @@ struct HiveMindController {
 };
 
 namespace pybind11::detail {
-template <typename T>
-struct type_caster<T, std::enable_if_t<spns::is_bytes<T>>> {
+template <spns::bytes_derived T>
+struct type_caster<T> {
 
     PYBIND11_TYPE_CASTER(T, const_name("bytes") + const_name<T::SIZE>());
 

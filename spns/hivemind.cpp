@@ -1,6 +1,7 @@
 #include "hivemind.hpp"
 
 #include <fmt/chrono.h>
+#include <fmt/ranges.h>
 #include <fmt/std.h>
 #include <oxenc/base32z.h>
 #include <oxenc/bt_producer.h>
@@ -228,14 +229,22 @@ HiveMind::HiveMind(Config conf_in) :
                 (addr.is_ipv4() || (addr.is_ipv6() && addr.is_any_addr() && addr.dual_stack)))
                 maybe_out_alpn = out_alpn;
 
-            auto ep = quic::Endpoint::endpoint(loop_, addr, in_alpn, maybe_out_alpn);
+            auto ep = quic::Endpoint::endpoint(
+                    loop_,
+                    addr,
+                    in_alpn,
+                    maybe_out_alpn,
+                    quic::opt::allow_gro{},
+                    quic::opt::allow_gso{},
+                    quic::opt::socket_buffers{.recv = 16_Mi, .send = 2_Mi});
 
             ep->listen(
                     creds_in_,
                     [this](quic::Connection& c, quic::Endpoint& e, std::optional<int64_t>) {
                         return e.loop.make_shared<quic::BTRequestStream>(
                                 c, e, [this](quic::message m) { on_quic_request(m); });
-                    });
+                    },
+                    quic::opt::congestion_control::cubic);
 
             if (maybe_out_alpn)
                 quic_out_ = ep;
@@ -344,7 +353,7 @@ HiveMind::HiveMind(Config conf_in) :
 
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
     // timer because nothing in here is time critical:
-    subs_ticker_ = loop_.call_every(10s, [this] { check_subs(); });
+    loop_.add_timer(10s, [this] { check_subs(); });
 
     // For updating systemd Status line
     omq_.add_timer([this] { log_stats(); }, 15s);
@@ -701,7 +710,7 @@ void HiveMind::process_notifications() {
                             EncKey,
                             std::string,
                             std::string,
-                            std::optional<bstring>>>
+                            std::optional<std::vector<std::byte>>>>
                             notifies;
                     std::vector<Blake2B_32> filter_vals;
 
@@ -770,7 +779,7 @@ WHERE account = $1
                             // NB: ascii sorted keys
                             dict.append("", service);
                             if (svcdata)
-                                dict.append("!", as_sv(*svcdata));
+                                dict.append("!", *svcdata);
                             dict.append("#", hash);
                             dict.append("&", svcid);
                             dict.append("@", account.sv());
@@ -1089,7 +1098,7 @@ void HiveMind::on_notifier_validation(
                 std::optional<std::string> service_data;
                 if (data.size() > 2)
                     service_data = std::move(data[2]);
-                if (service_data->size() > SERVICE_DATA_MAX_SIZE)
+                if (service_data && service_data->size() > SERVICE_DATA_MAX_SIZE)
                     throw std::invalid_argument{
                             "service data too long ({})"_format(service_data->size())};
                 log::trace(cat, "Adding {} subscription for {}", service, pubkey.id.hex());
@@ -1317,15 +1326,6 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(enc_key),
                             std::move(data));
                 };
-
-                // We handle everything else (including the response) in `_on_notifier_validation`
-                // when/if the notifier service comes back to us with the unique identifier:
-                omq_.request(
-                        conn,
-                        "notifier.validate",
-                        std::move(reply_handler),
-                        service,
-                        service_info.dump());
             } else {
                 // unsubscribe
 
@@ -1354,6 +1354,8 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                 };
             }
 
+            // Everything else (including the response) is handled in on_notifier_validation
+            // when/if the notifier service comes back to us with the unique identifier.
             omq_.request(
                     conn,
                     "notifier.validate",
@@ -1411,7 +1413,7 @@ void HiveMind::quic_subscribe(quic::message& m) {
 }
 
 void HiveMind::quic_unsubscribe(quic::message& m) {
-    on_sub_unsub_impl(m, true);
+    on_sub_unsub_impl(m, false);
 }
 
 void HiveMind::on_subscribe(oxenmq::Message& m) {
