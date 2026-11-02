@@ -86,7 +86,7 @@ struct Subaccount {
         if (a.has_value() != b.has_value())
             return false;  // One set, one unset
         if (!a.has_value())
-            return false;  // Both unset
+            return true;  // Both unset
         return a->is_same(*b);
     }
 };
