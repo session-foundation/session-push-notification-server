@@ -352,9 +352,22 @@ class Setup:
 
         return json.loads((notifier or self.notifier).cmd("count"))
 
-    def wait_pushes(self, expected, timeout, settle=1.5, notifier=None):
-        """Waits for `expected` pushes, then `settle` more seconds to catch extras."""
+    def dropped(self, service):
+        """The pushes for `service` the hivemind has logged dropping."""
+        return sum(
+            int(n)
+            for n in re.findall(rf"Dropped (\d+) pushes for '{service}'", self.hivemind.log())
+        )
+
+    def wait_pushes(
+        self, expected, timeout, settle=1.5, notifier=None, service="dummy", sent=None
+    ):
+        """Waits for `expected` pushes, then `settle` more seconds to catch extras.  `sent`: the
+        pushes for `service` the scenario has caused in all, if it knows; once the hivemind has
+        dropped so many of them that fewer than `expected` can arrive, returns at once, short, so
+        that the scenario's check says so then rather than at the timeout."""
         deadline = time.time() + timeout * TIME_SCALE
+        next_drop_check = 0
         while True:
             c = self.counts(notifier)
             if c["pushes"] >= expected:
@@ -362,6 +375,12 @@ class Setup:
                 return self.counts(notifier)
             if time.time() > deadline:
                 return c
+            if sent is not None and time.time() >= next_drop_check:
+                if (dropped := self.dropped(service)) and sent - dropped < expected:
+                    print(f"    the hivemind dropped {dropped} pushes for '{service}'")
+                    time.sleep(settle)
+                    return self.counts(notifier)
+                next_drop_check = time.time() + 2
             time.sleep(0.25)
 
     def dump(self):
@@ -475,7 +494,7 @@ def scenario_burst(build_dir, accounts=50_000, messages=20_000, nodes=5, timeout
     try:
         s.network.cmd(f"burst 0 {messages} {accounts} 0 200")
         start = time.time()
-        c = s.wait_pushes(messages, timeout)
+        c = s.wait_pushes(messages, timeout, sent=messages)
         took = c["last_ms"] / 1000 - start if c["pushes"] else 0
         print(
             f"    {c['pushes']}/{messages} pushes, {nodes} copies of each, in {took:.2f}s"
@@ -501,7 +520,7 @@ def scenario_resend(build_dir):
         s.network.cmd("burst 0 30000 20000 0 200")
         time.sleep(5)
         s.notifier.p.send_signal(signal.SIGCONT)
-        c = s.wait_pushes(30_000, 120)
+        c = s.wait_pushes(30_000, 120, sent=30_000)
         check(
             c["pushes"] == 30_000 and c["duplicates"] == 0,
             f"expected 30000 unique pushes, got {c}",
@@ -577,7 +596,7 @@ def scenario_two_notifiers(build_dir):
         check(other.readline(120) == "registered", "second notifier did not register")
         s.notifier.p.send_signal(signal.SIGSTOP)
         s.network.cmd("burst 0 40000 40000 0 200")
-        c = s.wait_pushes(20_000, 30, notifier=other)
+        c = s.wait_pushes(20_000, 30, notifier=other, service="other", sent=20_000)
         check(
             c["pushes"] == 20_000 and c["duplicates"] == 0,
             f"the running notifier's pushes waited for the stopped one: {c}",
@@ -587,7 +606,7 @@ def scenario_two_notifiers(build_dir):
             "the stopped notifier's window never filled",
         )
         s.notifier.p.send_signal(signal.SIGCONT)
-        c = s.wait_pushes(20_000, 120)
+        c = s.wait_pushes(20_000, 120, sent=20_000)
         check(
             c["pushes"] == 20_000 and c["duplicates"] == 0,
             f"expected 20000 unique pushes once resumed, got {c}",
@@ -607,7 +626,10 @@ def scenario_backlog(build_dir):
     seed(0, 10_000)
     s = Setup(build_dir, nodes=3)
     try:
-        rate, seconds, stall = 2000, 14, 8
+        # A sanitizer slows the notifier to a few hundred pushes a second, and then 2,000 a
+        # second would pile up more than the hivemind holds for it (PUSH_BACKLOG_MAX, 50,000)
+        # and have it drop some; half that never can, the notifier taking none at all.
+        rate, seconds, stall = (1000 if SANITIZED else 2000), 14, 8
 
         def stall_db():
             time.sleep(2)
@@ -652,7 +674,7 @@ def scenario_backlog(build_dir):
                 notifier_backlog < limit,
                 f"node backlog reached {notifier_backlog} B while the notifier stalled",
             )
-        c = s.wait_pushes(2 * rate * seconds, 120)
+        c = s.wait_pushes(2 * rate * seconds, 120, sent=2 * rate * seconds)
         check(
             c["pushes"] == 2 * rate * seconds and c["duplicates"] == 0,
             f"expected {2 * rate * seconds} unique pushes, got {c}",
@@ -795,7 +817,7 @@ def scenario_sustained(build_dir, minutes=None):
         s.network.cmd("backlog")
         s.network.cmd(f"rate {rate} {seconds} 50000 0 500 0", timeout=seconds + 120)
         backlog = int(s.network.cmd("backlog"))
-        c = s.wait_pushes(rate * seconds, 300)
+        c = s.wait_pushes(rate * seconds, 300, sent=rate * seconds)
         stop.set()
         sampler.join()
         third = max(1, len(samples) // 3)
