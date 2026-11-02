@@ -2179,83 +2179,54 @@ bool HiveMind::add_subscription(
         EncKey enc_key,
         hive::Subscription sub) {
 
-    bool new_sub = false, insert_ns = false;
-
     auto conn = pool_.get();
     pqxx::work tx{conn};
 
-    auto result = tx.query01<int64_t, int64_t, pqxx::array<int16_t>>(
+    // One statement, so that concurrent subscribes for the same device cannot both find no row and
+    // then collide on the unique constraint.  xmax is 0 only in a row this statement inserted.
+    auto [id, new_sub] = tx.query1<int64_t, bool>(
             R"(
-SELECT
-    id,
-    signature_ts,
-    ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
-FROM subscriptions
-WHERE
-    account = $1 AND service = $2 AND svcid = $3)",
-            {pubkey.id, service, service_id});
-    std::optional<int64_t> id;
-    if (result) {
-        auto& [row_id, sig_ts, ns_arr_in] = *result;
-        std::vector<int16_t> ns_arr{ns_arr_in.cbegin(), ns_arr_in.cend()};
-
-        log::trace(cat, "updating subscription for {}", pubkey.id.hex());
-        auto updated =
-                tx.exec(
-                          R"(
-UPDATE subscriptions
-SET session_ed25519 = $2, subaccount_tag = $3, subaccount_sig = $4, signature = $5, signature_ts = $6, want_data = $7, enc_key = $8, svcdata = $9
-WHERE id = $1
-                    )",
-                          {row_id,
-                           pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
-                           sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
-                           sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
-                           sub.sig,
-                           sub.sig_ts.time_since_epoch().count(),
-                           sub.want_data,
-                           enc_key,
-                           service_data})
-                        .no_rows();
-        // db_cleanup() can delete the row after the SELECT, leaving nothing to update.
-        if (updated.affected_rows() > 0) {
-            id = row_id;
-            insert_ns = ns_arr != sub.namespaces;
-            if (insert_ns)
-                tx.exec("DELETE FROM sub_namespaces WHERE subscription = $1", {*id}).no_rows();
-        }
-    }
-    if (!id) {
-        new_sub = true;
-        log::trace(cat, "inserting new subscription for {}", pubkey.id.hex());
-        auto row = tx.exec(
-                             R"(
 INSERT INTO subscriptions
     (account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data, enc_key, service, svcid, svcdata)
 VALUES ($1,   $2,              $3,             $4,             $5,        $6,           $7,        $8,      $9,      $10,   $11)
-RETURNING id
-                )",
-                             {pubkey.id,
-                              pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
-                              sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
-                              sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
-                              sub.sig,
-                              sub.sig_ts.time_since_epoch().count(),
-                              sub.want_data,
-                              enc_key,
-                              service,
-                              service_id,
-                              service_data})
-                           .one_row();
+ON CONFLICT (account, service, svcid) DO UPDATE
+SET session_ed25519 = EXCLUDED.session_ed25519, subaccount_tag = EXCLUDED.subaccount_tag,
+    subaccount_sig = EXCLUDED.subaccount_sig, signature = EXCLUDED.signature,
+    signature_ts = EXCLUDED.signature_ts, want_data = EXCLUDED.want_data,
+    enc_key = EXCLUDED.enc_key, svcdata = EXCLUDED.svcdata
+RETURNING id, xmax = 0
+            )",
+            {pubkey.id,
+             pubkey.session_ed ? std::optional{pubkey.ed25519} : std::nullopt,
+             sub.subaccount ? std::optional{sub.subaccount->tag} : std::nullopt,
+             sub.subaccount ? std::optional{sub.subaccount->sig} : std::nullopt,
+             sub.sig,
+             sub.sig_ts.time_since_epoch().count(),
+             sub.want_data,
+             enc_key,
+             service,
+             service_id,
+             service_data});
+    log::trace(cat, "{} subscription for {}", new_sub ? "inserted" : "updated", pubkey.id.hex());
 
-        id = row[0].as<int64_t>();
-        insert_ns = true;
+    bool insert_ns = new_sub;
+    if (!new_sub) {
+        // A separate statement, and so a fresh snapshot: the upsert holds the row's lock, which any
+        // other writer of its namespaces must take first, so this is current until we commit.
+        auto [ns_arr] = tx.query1<pqxx::array<int16_t>>(
+                "SELECT ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = $1 ORDER "
+                "BY namespace)",
+                {id});
+        insert_ns = !std::equal(
+                ns_arr.cbegin(), ns_arr.cend(), sub.namespaces.cbegin(), sub.namespaces.cend());
+        if (insert_ns)
+            tx.exec("DELETE FROM sub_namespaces WHERE subscription = $1", {id}).no_rows();
     }
 
     if (insert_ns)
         for (auto n : sub.namespaces)
             tx.exec(R"(INSERT INTO sub_namespaces (subscription, namespace) VALUES ($1, $2))",
-                    {*id, n})
+                    {id, n})
                     .no_rows();
 
     for (const auto& s : {""s, service})

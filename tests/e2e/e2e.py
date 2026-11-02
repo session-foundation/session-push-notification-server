@@ -431,7 +431,8 @@ def scenario_correctness(build_dir):
 
         client = s.client_proc()
         acct5 = client.cmd("account 5")
-        check(client.cmd("sub 5") == "ok", "subscribe failed")
+        # Concurrent subscribes for one device must all succeed, not race on its row.
+        check(client.cmd("sub 5 8") == "ok", "concurrent subscribes failed")
         check(client.cmd(f"drop {svcid(2, 1)}") == "ok", "drop failed")
         time.sleep(1)
         net.cmd(f"send {acct5} hash-six-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 200")

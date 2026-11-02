@@ -8,7 +8,8 @@
 // one line:
 //
 //   account I               the account id of client I, in hex
-//   sub I                   subscribe client I to namespace 0, with data
+//   sub I [COUNT]           subscribe client I to namespace 0, with data, by COUNT identical
+//                           requests in flight together (default 1); "ok" if all succeed
 //   unsub I                 unsubscribe client I
 //   drop SVCID              drop the "dummy" registration SVCID
 //   churn FIRST COUNT ROUNDS
@@ -21,6 +22,7 @@
 #include <oxenmq/oxenmq.h>
 #include <sodium.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -135,14 +137,18 @@ int main(int argc, char** argv) {
             in >> i;
             std::cout << Client{i}.account_hex << std::endl;
         } else if (cmd == "sub" || cmd == "unsub") {
-            int i;
+            int i, count = 1;
             in >> i;
+            if (cmd == "sub")
+                in >> count;
             Client c{i};
             bool sub = cmd == "sub";
-            int ok = requests(
-                    {{sub ? "push.subscribe" : "push.unsubscribe",
-                      sub ? c.subscribe_body(now_s()) : c.unsubscribe_body(now_s())}});
-            std::cout << (ok ? "ok" : "failed") << std::endl;
+            std::vector<std::pair<std::string, std::string>> reqs(
+                    std::max(count, 1),
+                    {sub ? "push.subscribe" : "push.unsubscribe",
+                     sub ? c.subscribe_body(now_s()) : c.unsubscribe_body(now_s())});
+            int ok = requests(reqs);
+            std::cout << (ok == (int)reqs.size() ? "ok" : "failed") << std::endl;
         } else if (cmd == "drop") {
             std::string svcid;
             in >> svcid;
