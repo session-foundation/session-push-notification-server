@@ -65,9 +65,9 @@ inline constexpr size_t SERVICE_ID_MAX_SIZE = 999;
 inline constexpr size_t SERVICE_DATA_MAX_SIZE = 99'999;
 inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 
-// The highest subscription `slot` a device may choose.  Every slot can hold a subscription, each
-// submitted to the swarm as its own monitor entry, so this bounds the rows and monitor entries one
-// device can create per account.
+// The highest subscription `slot` a device may choose, which bounds the subscriptions one device
+// holds per account at once.  It does not bound monitor entries: one that a slot replaces stays
+// submitted until its signature expires.
 inline constexpr int MAX_SUBSCRIPTION_SLOT = 15;
 
 // Parameters for our request to get service node data:
