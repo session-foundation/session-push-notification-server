@@ -22,7 +22,7 @@ endforeach()
 set(e2e_sanitizer "")
 foreach(san thread address)
     if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=${san}")
-        set(e2e_sanitizer --sanitizer ${san})
+        set(e2e_sanitizer --sanitizer=${san})
     endif()
 endforeach()
 
