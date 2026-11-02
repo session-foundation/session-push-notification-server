@@ -12,9 +12,9 @@ CREATE TABLE subscriptions (
     service VARCHAR NOT NULL,     -- subscription service type ("apns", "firebase")
     svcid VARCHAR NOT NULL,       -- unique device/app identifier
     svcdata BYTEA,                -- arbitrary data for subscription service
+    slot SMALLINT NOT NULL DEFAULT 0 CHECK(slot >= 0), -- device-chosen; one subscription per slot
 
-    -- A device can hold one subscription with message data and one without
-    UNIQUE(account, service, svcid, want_data)
+    UNIQUE(account, service, svcid, slot)
 );
 
 CREATE INDEX subscriptions_signature_ts_idx ON subscriptions(signature_ts);

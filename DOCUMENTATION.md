@@ -14,7 +14,7 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
             "subkey_tag": "def789...",
             "namespaces": [-400,0,1,2,17],
             "data": true,
-            "coexist": true,
+            "slot": 1,
             "sig_ts": 1677520760,
             "signature": "f8efdd120007...",
             "service": "apns",
@@ -35,8 +35,8 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
       ascending order.
     - `data` -- if provided and true then notifications will include the body of the message (as long
       as it isn't too large); if false then the body will not be included in notifications.
-    - `coexist` -- optional, default false.  If true, this subscription replaces only the device's
-      subscription with the same `data` value, and one with the other value stays in place; see
+    - `slot` -- optional integer from 0 to 15 chosen by the device.  If given, this subscription
+      replaces only the device's subscription in that slot, and its others stay in place; see
       below.
     - `sig_ts` -- the signature unix timestamp (seconds, not ms); see below.
     - `signature` -- the 64-byte Ed25519 signature; see below.
@@ -52,13 +52,15 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
     re-subscribing with the same pubkey/service/token renews (or updates, if there are changes in
     other parameters such as the namespaces) an existing subscription.
 
-    With `"coexist": true` they are unique per pubkey/service/service_token/data instead, so a
-    device can hold two subscriptions to one account: one with `"data": true` for the namespaces
-    whose notifications should carry the message body, and one with `"data": false` for the rest.
-    Each is renewed by re-subscribing with the same `data` value (and `"coexist": true`); a
-    subscribe without `coexist` replaces both with the single new subscription.  If both include a
-    namespace, a message there is notified once, through the subscription with data.  To remove
-    just one, pass its `"data"` value to `/unsubscribe`; without it, `/unsubscribe` removes both.
+    A device can instead hold several subscriptions to one account by giving each a `slot`: then
+    they are unique per pubkey/service/service_token/slot, and re-subscribing with the same `slot`
+    renews or updates (including changing `data`) only that one.  For example, one subscription with
+    `"data": true` for the namespaces whose notifications should carry the message body, and one
+    with `"data": false` for the rest.  A subscribe without `slot` replaces all of the device's
+    subscriptions to the account with the single new one (stored as slot 0).  If several include a
+    namespace, a message there is notified once, through a subscription with data if there is one.
+    To remove just one, pass its `"slot"` to `/unsubscribe`; without it, `/unsubscribe` removes them
+    all.
 
     Signatures:
 
