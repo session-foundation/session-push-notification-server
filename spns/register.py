@@ -18,7 +18,6 @@ def subscribe():
         "subaccount_sig": "aGVsbG9...",
         "namespaces": [-400,0,1,2,17],
         "data": true,
-        "slot": 1,
         "sig_ts": 1677520760,
         "signature": "f8efdd120007...",
         "service": "apns",
@@ -41,9 +40,6 @@ def subscribe():
       ascending order.
     - data -- if provided and true then notifications will include the body of the message (as long
       as it isn't too large); if false then the body will not be included in notifications.
-    - slot -- optional integer from 0 to 15 chosen by the device.  If given, this subscription
-      replaces only the device's subscription in that slot, and its others stay in place; see
-      below.
     - sig_ts -- the signature unix timestamp (seconds, not ms); see below.
     - signature -- the 64-byte Ed25519 signature; see below.
     - service -- the string identifying the notification service, such as "apns" or "firebase".
@@ -52,17 +48,15 @@ def subscribe():
     - enc_key -- 32-byte encryption key; notification payloads sent to the device will be encrypted
       with XChaCha20-Poly1305 using this key.
 
-    Notification subscriptions are unique per pubkey/service/service_token which means that
-    re-subscribing with the same pubkey/service/token renews (or updates, if there are changes in
-    other parameters such as the namespaces) an existing subscription.
+    Notification subscriptions are unique per pubkey/service/service_token/data which means that
+    re-subscribing with the same pubkey/service/token/data renews (or updates, if there are changes
+    in other parameters such as the namespaces) an existing subscription.
 
-    A device can instead hold several subscriptions to one account by giving each a `slot`: then
-    they are unique per pubkey/service/service_token/slot, and re-subscribing with the same `slot`
-    renews or updates (including changing `data`) only that one.  For example, one subscription with
-    `"data": true` for the namespaces whose notifications should carry the message body, and one
-    with `"data": false` for the rest.  A subscribe without `slot` replaces all of the device's
-    subscriptions to the account with the single new one (stored as slot 0).  If several include a
-    namespace, a message there is notified once, through a subscription with data if there is one.
+    A device can therefore hold one subscription with `"data": true` and one with `"data": false` to
+    the same account: for example, one for the namespaces whose notifications should carry the
+    message body and one for the rest.  A device that turns data on or off for a subscription
+    subscribes with the new value and then unsubscribes the old one (`"data"` in /unsubscribe).  If
+    both include a namespace, a message there is notified once, with the body.
 
     Signatures:
 
@@ -151,13 +145,13 @@ def unsubscribe():
         "signature": "f8efdd120007...",
         "service": "apns",
         "service_info": { ... },
-        "slot": 1
+        "data": true
     }
 
     (or a list of such elements).
 
-    `slot` is optional.  If given, only the device's subscription in that slot is removed (see
-    `"slot"` in /subscribe); if omitted, all of the device's subscriptions to the account are
+    `data` is optional.  If given, only the device's subscription with that `data` value is removed
+    (see `"data"` in /subscribe); if omitted, all of the device's subscriptions to the account are
     removed.  It is not part of the signature.
 
     The signature here is over the value:
@@ -170,7 +164,7 @@ def unsubscribe():
 
     { "success": true, "removed": true }
 
-    if a registration for the given pubkey/service info (and `slot`, if given) was found and
+    if a registration for the given pubkey/service info (and `data`, if given) was found and
     removed; or:
 
     { "success": true, "removed": false }
