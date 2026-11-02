@@ -65,6 +65,15 @@ inline constexpr size_t SERVICE_ID_MAX_SIZE = 999;
 inline constexpr size_t SERVICE_DATA_MAX_SIZE = 99'999;
 inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 
+// The slot a subscription is stored in.  A device holds at most one subscription per slot for each
+// account, and we choose the slot from the subscription rather than letting the device pick one:
+// every subscription is state that we and each storage server in the account's swarm have to keep,
+// so a device gets one subscription for each kind it needs rather than as many as it asks for.  A
+// future kind of subscription that must sit beside these gets a slot of its own here.
+inline int16_t subscription_slot(bool want_data) {
+    return want_data ? 0 : 1;
+}
+
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
   "active_only": true,
@@ -228,7 +237,10 @@ class HiveMind {
     std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now() - 1h;
     void log_stats(std::string pre_cmd = "WATCHDOG=1"s);
 
-    using UnsubData = std::tuple<Signature, std::optional<Subaccount>, int64_t>;
+    // signature, subaccount, sig_ts, and the optional `data` choosing which of the device's
+    // subscriptions to remove
+    using UnsubData =
+            std::tuple<Signature, std::optional<Subaccount>, int64_t, std::optional<bool>>;
     void on_notifier_validation(
             nlohmann::json& final_response,
             size_t i,
@@ -310,7 +322,9 @@ class HiveMind {
 
     /// Add or updates a subscription for monitoring.  If the given pubkey is already monitored by
     /// the same device then this replaces the existing subscription details with this one,
-    /// otherwise it adds a new subscription.
+    /// otherwise it adds a new subscription.  Only the device's subscription in the same slot (see
+    /// `subscription_slot`) is replaced, so a device can hold one subscription with data and one
+    /// without.
     ///
     /// Will throw if the given data or signatures are incorrect.
     ///
@@ -359,13 +373,16 @@ class HiveMind {
     /// - signature -- the Ed25519 signature of: UNSUBSCRIBE || PUBKEY_HEX || sig_ts; this is signed
     ///   by pubkey, unless using subaccounts in which case it's signed by the subaccount ed25519
     ///   key contained in `subaccount`.
+    /// - want_data -- if given, remove only the device's subscription with (true) or without
+    ///   (false) data; if omitted, remove all of the device's subscriptions to the account.
     bool remove_subscription(
             const SwarmPubkey& pubkey,
             const std::optional<Subaccount>& subaccount,
             std::string service,
             std::string service_id,
             const Signature& sig,
-            int64_t sig_ts);
+            int64_t sig_ts,
+            std::optional<bool> want_data);
 
     // Called from SNode when we get a message notification
     void on_message_notification(quic::message m);

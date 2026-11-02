@@ -12,8 +12,9 @@ CREATE TABLE subscriptions (
     service VARCHAR NOT NULL,     -- subscription service type ("apns", "firebase")
     svcid VARCHAR NOT NULL,       -- unique device/app identifier
     svcdata BYTEA,                -- arbitrary data for subscription service
+    slot SMALLINT NOT NULL DEFAULT 0 CHECK(slot >= 0), -- subscription_slot in hivemind.hpp
 
-    UNIQUE(account, service, svcid)
+    UNIQUE(account, service, svcid, slot)
 );
 
 CREATE INDEX subscriptions_signature_ts_idx ON subscriptions(signature_ts);

@@ -44,9 +44,15 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
       with XChaCha20-Poly1305 using this key.  Though it is permitted for this to change, it is
       recommended that the device generate this once and persist it.
 
-    Notification subscriptions are unique per pubkey/service/service_token which means that
-    re-subscribing with the same pubkey/service/token renews (or updates, if there are changes in
-    other parameters such as the namespaces) an existing subscription.
+    Notification subscriptions are unique per pubkey/service/service_token/data which means that
+    re-subscribing with the same pubkey/service/token/data renews (or updates, if there are changes
+    in other parameters such as the namespaces) an existing subscription.
+
+    A device can therefore hold one subscription with `"data": true` and one with `"data": false` to
+    the same account: for example, one for the namespaces whose notifications should carry the
+    message body and one for the rest.  A device that turns data on or off for a subscription
+    subscribes with the new value and then unsubscribes the old one (`"data"` in /unsubscribe).  If
+    both include a namespace, a message there is notified once, with the body.
 
     Signatures:
 
