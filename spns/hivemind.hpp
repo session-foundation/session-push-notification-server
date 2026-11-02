@@ -97,6 +97,9 @@ inline constexpr auto PUSH_BLOCKED_REPORT_INTERVAL = 30s;
 // dropped and it is treated as any unregistered service.
 inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
 
+// oxend drops a block subscription that has not been renewed for 30 minutes.
+inline constexpr auto OXEND_BLOCK_SUB_INTERVAL = 5min;
+
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
   "active_only": true,
@@ -344,6 +347,8 @@ class HiveMind {
     void db_cleanup();
 
     void on_new_block(oxenmq::Message&) { refresh_sns(); }
+    // Subscribes, or renews our subscription, to oxend's notify.block, which calls refresh_sns().
+    void subscribe_blocks();
     void refresh_sns();
 
     void on_sns_response(std::vector<std::string> data);

@@ -2,11 +2,12 @@
 //
 // usage: fake_network NODES SWARMS OXEND_PORT FIRST_QUIC_PORT
 //
-// oxend: oxenmq on tcp://127.0.0.1:OXEND_PORT answering ping.ping and rpc.get_service_nodes with
-// NODES nodes spread over SWARMS swarms, so that the hivemind subscribes each account on one
-// swarm's nodes only.  Storage nodes: libquic on 127.0.0.1:FIRST_QUIC_PORT+i, answering "monitor"
-// with success.  Every notification is sent by each of the first SENDERS nodes (default: all), as
-// every member of a real swarm would; the hivemind does not check which node sends one.
+// oxend: oxenmq on tcp://127.0.0.1:OXEND_PORT answering ping.ping, sub.block and
+// rpc.get_service_nodes with NODES nodes spread over SWARMS swarms, so that the hivemind subscribes
+// each account on one swarm's nodes only.  Storage nodes: libquic on 127.0.0.1:FIRST_QUIC_PORT+i,
+// answering "monitor" with success.  Every notification is sent by each of the first SENDERS nodes
+// (default: all), as every member of a real swarm would; the hivemind does not check which node
+// sends one.
 //
 // Prints "ready" once every node has a stream from the hivemind, then reads commands on stdin, one
 // per line, and answers each with one line:
@@ -34,9 +35,14 @@
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
-#include <oxen/quic.hpp>
+#include <oxen/quic/address.hpp>
 #include <oxen/quic/btstream.hpp>
+#include <oxen/quic/connection.hpp>
+#include <oxen/quic/connection_ids.hpp>
+#include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
+#include <oxen/quic/loop.hpp>
+#include <oxen/quic/opt.hpp>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -161,6 +167,8 @@ int main(int argc, char** argv) {
     });
     omq.add_category("ping", oxenmq::AuthLevel::none)
             .add_request_command("ping", [](oxenmq::Message& m) { m.send_reply("pong"); });
+    omq.add_category("sub", oxenmq::AuthLevel::none)
+            .add_request_command("block", [](oxenmq::Message& m) { m.send_reply("OK"); });
     omq.add_category("rpc", oxenmq::AuthLevel::none)
             .add_request_command("get_service_nodes", [&](oxenmq::Message& m) {
                 auto states = nlohmann::json::array();

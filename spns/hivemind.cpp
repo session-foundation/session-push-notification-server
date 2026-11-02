@@ -356,8 +356,10 @@ HiveMind::HiveMind(Config conf_in) :
     // Set our ready flag, and process any requests that accumulated while we were starting up.
     set_ready();
 
+    subscribe_blocks();
     refresh_sns();
 
+    omq_.add_timer([this] { subscribe_blocks(); }, OXEND_BLOCK_SUB_INTERVAL);
     omq_.add_timer([this] { db_cleanup(); }, 30s);
 
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
@@ -1728,6 +1730,16 @@ void HiveMind::db_cleanup() {
             {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)})
             .no_rows();
     tx.commit();
+}
+
+void HiveMind::subscribe_blocks() {
+    omq_.request(oxend_, "sub.block", [](bool success, std::vector<std::string> data) {
+        if (!success)
+            log::warning(
+                    cat,
+                    "oxend block subscription request failed: {}",
+                    "{}"_format(fmt::join(data, " ")));
+    });
 }
 
 void HiveMind::refresh_sns() {
