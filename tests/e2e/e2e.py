@@ -1256,6 +1256,41 @@ def scenario_body_limit(build_dir):
     check_log(s.hivemind)
 
 
+def scenario_status_report(build_dir):
+    """The periodic status report, here every 15 seconds, with no saved state, and notifiers in
+    every state a service's stats can be in: one sent a push, one registered and reporting its
+    stats but sent no push, and one with stats left in the database from an earlier run but not
+    registered now.  The hivemind logs two reports, naming all three, and keeps running."""
+    fresh_db()
+    seed(0, 10)
+    execute(
+        "INSERT INTO service_stats (service, name, val_int) VALUES ('retired', 'notifies', 5)"
+    )
+    s = Setup(build_dir, nodes=3, config="status_report_interval = 15")
+    idle = None
+    try:
+        idle = Proc("idle", [f"{FAKES}/fake_notifier", "--stats", HIVEMIND_SOCK, "200", "idle"])
+        check(idle.readline(120) == "registered", "the idle notifier did not register")
+        s.network.cmd("send #1 status-report-aaaaaaaaaaaaaaaaaaaaaaaaaaa 0 100")
+        c = s.wait_pushes(1, 30)
+        check(c["pushes"] == 1, f"no push for the busy notifier: {c}")
+        deadline = time.time() + 60 * TIME_SCALE
+        while (reports := s.hivemind.log().count("Status report, over the last")) < 2:
+            check(s.hivemind.p.poll() is None, "the hivemind died before its second report")
+            check(time.time() < deadline, f"only {reports} status reports logged")
+            time.sleep(0.5)
+        log = s.hivemind.log()
+        for service in ("dummy", "idle", "retired"):
+            check(f"    {service}: " in log, f"the {service} notifier is missing from the report")
+        print(f"    {reports} status reports logged, naming the busy, idle and retired notifiers")
+    finally:
+        if idle:
+            idle.stop()
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
 def scenario_registration(build_dir):
     """A notifier is registered only if it speaks the hivemind's registration protocol and can
     deliver bodies as large as the hivemind's limit.  One that declares less, or speaks another
@@ -1588,6 +1623,7 @@ FAST = [
     "registration",
     "redundancy",
     "rebalance",
+    "status_report",
 ]
 SLOW = ["stalled_notifier", "sustained", "scale"]
 

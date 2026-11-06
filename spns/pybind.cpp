@@ -191,6 +191,13 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     },
                     "seconds a monitor request may go unanswered before it counts as failed; must "
                     "be positive")
+            .def_property(
+                    "status_report_interval",
+                    [](Config& self) { return self.status_report_interval.count(); },
+                    [](Config& self, int64_t seconds) {
+                        self.status_report_interval = std::chrono::seconds{seconds};
+                    },
+                    "seconds between status reports in the log; at least 15")
             .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,

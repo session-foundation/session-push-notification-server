@@ -63,6 +63,7 @@ Fast:
 | `registration` | a notifier declaring a smaller body than the hivemind's limit, or another protocol version, is refused with a critical log line and exits; a protocol 0 one (bare service name) is refused in the log |
 | `redundancy` | with redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes within a request's worth of each other; a node that leaves has its accounts back on 3 nodes from the others' scans |
 | `rebalance` | with redundancy 3 and 10s renewals, a node that joins a swarm already covered takes its share as the accounts are renewed |
+| `status_report` | with a status report every 15 seconds and no saved state, beside a notifier sent a push, one registered and reporting stats but sent none, and one with stats left from an earlier run but not registered: the hivemind logs two reports naming all three and keeps running |
 
 Slow (`--slow`, or by name):
 

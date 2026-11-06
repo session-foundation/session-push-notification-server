@@ -1737,7 +1737,9 @@ void HiveMind::log_stats(std::string pre_cmd) {
                                       : "{}\nSTATUS={}"_format(pre_cmd, stat_line);
         sd_notify(0, sd_out.c_str());
 
-        if (auto now = std::chrono::steady_clock::now(); now - last_stats_logged >= 4min + 55s) {
+        // Due a little early, so that the 15-second tick it goes out with does not slip past it.
+        if (auto now = std::chrono::steady_clock::now();
+            now - last_stats_logged >= config.status_report_interval - 5s) {
             double dt = !last_report_
                               ? std::chrono::duration<double>(system_clock::now() - startup_time)
                                         .count()

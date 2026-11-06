@@ -1,13 +1,15 @@
 // A fake notifier: registers with the hivemind and records every notifier.push.
 //
-// usage: fake_notifier [--protocol N] [--max-body BYTES] HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]
+// usage: fake_notifier [--protocol N] [--max-body BYTES] [--stats] HIVEMIND_ADDR [MAX_QUEUE
+//                      [SERVICE]]
 //
 // MAX_QUEUE is the oxenmq queue limit of the "notifier" category (default -1, unlimited); SERVICE
 // is the service name it registers (default "dummy").  It registers speaking notifier protocol N
 // (default 1; 0 sends the bare service name to the obsolete register_service), declaring BYTES as
 // the largest body it can deliver (default 2500), and exits with status 2 if the hivemind refuses
 // it or registering fails other than by timing out.  Answers notifier.validate by accepting
-// service_info.token as the service id.  Prints "registered", then reads commands on stdin, one per
+// service_info.token as the service id.  With --stats, it reports its stats (service_stats) once
+// registered, as a real notifier does.  Prints "registered", then reads commands on stdin, one per
 // line:
 //
 //   count    {"pushes": N, "unique": N, "duplicates": N, "first_ms": T, "last_ms": T}
@@ -44,6 +46,7 @@ int64_t now_ms() {
 int main(int argc, char** argv) {
     int protocol = 1;
     int64_t max_body = 2500;
+    bool stats = false;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -51,12 +54,14 @@ int main(int argc, char** argv) {
             protocol = std::stoi(argv[++i]);
         else if (a == "--max-body" && i + 1 < argc)
             max_body = std::stoll(argv[++i]);
+        else if (a == "--stats")
+            stats = true;
         else
             args.push_back(std::move(a));
     }
     if (args.empty()) {
-        std::cerr << "usage: fake_notifier [--protocol N] [--max-body BYTES] HIVEMIND_ADDR "
-                     "[MAX_QUEUE [SERVICE]]\n";
+        std::cerr << "usage: fake_notifier [--protocol N] [--max-body BYTES] [--stats] "
+                     "HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]\n";
         return 1;
     }
     // oxenmq's default: the hivemind's ack window must keep what it sends within it.
@@ -161,6 +166,12 @@ int main(int argc, char** argv) {
             }
             break;
         }
+    }
+    if (stats) {
+        oxenc::bt_dict_producer report;
+        report.append("+failures", 0);
+        report.append("+notifies", 0);
+        omq.send(conn, "admin.service_stats", service, report.view());
     }
     std::cout << "registered" << std::endl;
 
