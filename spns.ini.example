@@ -61,6 +61,10 @@ startup_wait = 8.0
 # fewest.
 #redundancy = -1
 
+# For testing only: seconds between an account's renewals, within a tenth either side, instead of
+# 45-55 minutes; it must stay well below the 65 minutes a storage server keeps a monitor.
+#renewal_interval = 60
+
 # The most monitor (subscription) requests in flight at once across all storage servers, and how
 # many seconds one may go unanswered before it is retried.  The defaults suit production.
 #monitor_requests = 64

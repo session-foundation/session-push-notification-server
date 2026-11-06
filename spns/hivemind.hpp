@@ -307,7 +307,8 @@ class HiveMind {
         return a.second > b.second;
     }
     void schedule(const SwarmPubkey& account, system_time when);
-    // How long until an account placed now is next renewed: 45-55 minutes (see RESUBSCRIBE_MIN).
+    // How long until an account placed now is next renewed: 45-55 minutes (see RESUBSCRIBE_MIN),
+    // unless configured otherwise.
     std::chrono::seconds resubscribe_delay() const;
 
     // Checks a node's word that `account` is now stored by swarm `swarm_hex` (its swarm id in

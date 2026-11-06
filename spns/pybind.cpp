@@ -144,6 +144,21 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     &Config::redundancy,
                     "how many of its swarm's nodes each account is subscribed on, at most the "
                     "swarm's size: -1 for all of them, or a positive number")
+            .def_property(
+                    "renewal_interval",
+                    [](Config& self) -> std::optional<int64_t> {
+                        if (self.renewal_interval)
+                            return self.renewal_interval->count();
+                        return std::nullopt;
+                    },
+                    [](Config& self, std::optional<int64_t> secs) {
+                        if (secs)
+                            self.renewal_interval = std::chrono::seconds{*secs};
+                        else
+                            self.renewal_interval.reset();
+                    },
+                    "seconds between an account's renewals, if not 45-55 minutes: for testing; "
+                    "None for the default")
             .def_readwrite(
                     "monitor_requests",
                     &Config::monitor_requests,

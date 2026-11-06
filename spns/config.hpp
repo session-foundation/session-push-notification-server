@@ -54,6 +54,12 @@ struct Config {
     // fewer nodes' connections.
     int redundancy = -1;
 
+    // How long after a placement an account is placed afresh, if not the hivemind's 45-55 minutes;
+    // each renewal is drawn within a tenth either side of it.  For testing, to see renewals
+    // within a test's run: it must stay well below the 65 minutes a storage server keeps a
+    // monitor.
+    std::optional<std::chrono::seconds> renewal_interval;
+
     // The most monitor requests in flight at once, across all nodes, if not the hivemind's default
     // (MONITOR_REQUESTS_IN_FLIGHT).
     std::optional<int> monitor_requests;

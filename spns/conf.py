@@ -97,6 +97,11 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
                 lambda x: re.fullmatch(r"\s*(-1|\d+)\s*", x) and int(x) != 0,
                 int,
             ),
+            "renewal_interval": (
+                "renewal_interval",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and 0 < int(x) < 3600,
+                int,
+            ),
             "monitor_requests": ("monitor_requests", None, int),
             "monitor_timeout": ("monitor_timeout", None, float),
             "filter_lifetime": ("filter_lifetime", None, int),

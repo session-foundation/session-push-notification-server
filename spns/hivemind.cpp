@@ -2029,8 +2029,12 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
 static thread_local std::mt19937_64 rng{std::random_device{}()};
 
 std::chrono::seconds HiveMind::resubscribe_delay() const {
-    return 1s * std::uniform_int_distribution<int64_t>{
-                        hive::RESUBSCRIBE_MIN.count(), hive::RESUBSCRIBE_MAX.count()}(rng);
+    auto [min, max] = config.renewal_interval
+                            ? std::
+                                      pair{*config.renewal_interval * 9 / 10,
+                                           *config.renewal_interval * 11 / 10}
+                            : std::pair{hive::RESUBSCRIBE_MIN, hive::RESUBSCRIBE_MAX};
+    return 1s * std::uniform_int_distribution<int64_t>{min.count(), max.count()}(rng);
 }
 
 void HiveMind::schedule(const SwarmPubkey& account, system_time when) {
