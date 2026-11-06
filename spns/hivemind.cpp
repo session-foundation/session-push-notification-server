@@ -367,6 +367,7 @@ HiveMind::HiveMind(Config conf_in) :
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
     // timer because nothing in here is time critical:
     sub_jq_.add_timer(10s, [this] { check_subs(); });
+    sub_jq_.add_timer(5s, [this] { log_coverage_progress(); });
     sub_jq_.add_timer(OXEND_BLOCK_SUB_INTERVAL, [this] { subscribe_blocks(); });
     // And this one reconnects to nodes whose connection failed or was lost, once their cooldown
     // has passed.
@@ -1295,6 +1296,27 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         result["snodes"] = sns_.size();
         result["accounts_monitored"] = subscribers_.size();
         result["swarm_index"] = {{"swarms", holding}, {"accounts", indexed}};
+        auto c = coverage();
+        result["coverage"] = {
+                {"redundancy", config.redundancy},
+                {"accounts", c.accounts},
+                {"at_target", c.at_target},
+                {"below_target", c.accounts - c.at_target},
+                {"at_zero", c.at_zero}};
+        // How many accounts each connected node holds.
+        size_t load_nodes = 0, load_min = 0, load_max = 0, load_total = 0;
+        for (const auto& [pk, sn] : sns_)
+            if (sn->up() && sn->slot >= 0) {
+                load_min = load_nodes ? std::min(load_min, sn->claimed) : sn->claimed;
+                load_max = std::max(load_max, sn->claimed);
+                load_total += sn->claimed;
+                load_nodes++;
+            }
+        result["node_load"] = {
+                {"nodes", load_nodes},
+                {"min", load_min},
+                {"avg", load_nodes ? double(load_total) / load_nodes : 0.0},
+                {"max", load_max}};
         result["placements"] = {
                 {"placed", placements_},
                 {"by_scans", scan_placements_},
@@ -2433,6 +2455,43 @@ void HiveMind::check_subs() {
             log::warning(cat, "Failed to check subs on {}: {}", pk, e.what());
         }
     }
+}
+
+HiveMind::Coverage HiveMind::coverage() const {
+    Coverage c;
+    for (const auto& [id, swarm] : swarms_) {
+        int goal = target(swarm);
+        for (const auto* account : swarm.members) {
+            if (account->next_due == SwarmPubkey::UNSCHEDULED)
+                continue;
+            c.accounts++;
+            int count = std::popcount(account->acked);
+            c.at_target += goal > 0 && count >= goal;
+            c.at_zero += count == 0;
+        }
+    }
+    return c;
+}
+
+void HiveMind::log_coverage_progress() {
+    auto c = coverage();
+    bool below = c.at_target < c.accounts,
+         was_below = coverage_logged_.at_target < coverage_logged_.accounts;
+    if ((below || was_below) &&
+        (c.accounts != coverage_logged_.accounts || c.at_target != coverage_logged_.at_target ||
+         c.at_zero != coverage_logged_.at_zero))
+        log::info(
+                cat,
+                "{}/{} accounts ({:.1f}%) are subscribed on their target number of nodes; {} on "
+                "none; {}/{} requests in flight, {} nodes waiting for one",
+                c.at_target,
+                c.accounts,
+                c.accounts ? 100.0 * c.at_target / c.accounts : 100.0,
+                c.at_zero,
+                requests_in_flight_,
+                max_requests_,
+                send_queue_.size());
+    coverage_logged_ = c;
 }
 
 void HiveMind::make_conns() {

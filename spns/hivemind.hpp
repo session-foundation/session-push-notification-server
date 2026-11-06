@@ -331,6 +331,17 @@ class HiveMind {
     // still in its old one would send that swarm's accounts to be refused.
     bool hold_dispatch_ = false;
 
+    // Accounts' coverage, over the accounts with subscriptions to renew: how many there are, how
+    // many are acknowledged on as many nodes as their swarm's target, and how many on none.
+    struct Coverage {
+        size_t accounts = 0, at_target = 0, at_zero = 0;
+    };
+    Coverage coverage() const;
+    // What log_coverage_progress() last reported, to report only changes.
+    Coverage coverage_logged_;
+    // While accounts are below their target, logs how many are at it; runs every few seconds.
+    void log_coverage_progress();
+
     // Placements of an account on a node since startup: made by place(), and by nodes' scans; and
     // of place()'s, those that moved a monitor from one node to another.
     int64_t placements_ = 0, scan_placements_ = 0, moved_placements_ = 0;
