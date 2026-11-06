@@ -60,6 +60,13 @@ struct Config {
     // monitor.
     std::optional<std::chrono::seconds> renewal_interval;
 
+    // Where the hivemind saves which nodes hold each account, and its monitor session tokens,
+    // every few minutes and when it stops, for a restart soon after to resume its sessions without
+    // having the nodes list every monitor.  Empty to save nothing, and start every node afresh.
+    // After a crash, the tokens nodes rotated since the last save are lost, and those nodes start
+    // afresh.
+    std::string state_file;
+
     // The most notifications for an account a node keeps while our monitor session with it is
     // detached, and replays when it is resumed, after a reconnection or a quick restart: the
     // newest, the rest being lost, as push notifications are best effort.

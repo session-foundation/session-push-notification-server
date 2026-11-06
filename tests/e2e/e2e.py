@@ -111,6 +111,12 @@ def fresh_db():
     execute("DROP TABLE IF EXISTS sub_namespaces, subscriptions, service_stats")
     with open(f"{SRC}/spns/schema.pgsql") as f:
         execute(f.read())
+    # The hivemind's saved placements (and monitor session tokens) belong to the database emptied.
+    for name in ("hivemind-state.bin", "hivemind-state.bin.tmp"):
+        try:
+            os.remove(f"{WORK}/{name}")
+        except FileNotFoundError:
+            pass
 
 
 # Account #i is 03 || SHA256(big-endian i), as in fake_network.
@@ -241,10 +247,11 @@ class Hivemind:
         build_dir,
         filter_lifetime=300,
         log_level="info",
+        name="hivemind",
         config="",
     ):
         """`config`: more [hivemind] settings."""
-        self.log_path = f"{WORK}/hivemind.log"
+        self.log_path = f"{WORK}/{name}.log"
         key = f"{WORK}/hivemind.key"
         with open(key, "wb") as f:
             f.write(os.urandom(32))
@@ -333,8 +340,12 @@ class Setup:
 
     def __init__(self, build_dir, nodes, swarms=1, network_args=(), **hivemind_args):
         os.makedirs(WORK, exist_ok=True)
+        self.build_dir = build_dir
         self.nodes = nodes
         self.hivemind = self.notifier = self.client = None
+        self.hivemind_args = hivemind_args
+        # Hivemind instances restart_hivemind stopped, for the scenario to check their logs.
+        self.stopped = []
         self.network = Proc(
             "network",
             [f"{FAKES}/fake_network"]
@@ -358,6 +369,22 @@ class Setup:
         except BaseException:
             self.stop()
             raise
+
+    def restart_hivemind(self, name):
+        """Stops the hivemind and its notifier, then yields, for the scenario to act while it is
+        down; resumed, starts a new one with the same settings, and a new notifier, and waits for it
+        to connect to every node."""
+        rc = self.hivemind.stop()
+        check(rc == 0, f"hivemind exit code {rc}")
+        self.stopped.append(self.hivemind)
+        self.notifier.stop()
+        yield
+        self.network.cmd("mark")
+        self.hivemind = Hivemind(self.build_dir, **{**self.hivemind_args, "name": name})
+        self.hivemind.wait_socket()
+        self.notifier = Proc(f"notifier-{name}", [f"{FAKES}/fake_notifier", HIVEMIND_SOCK])
+        check(self.notifier.readline(120) == "registered", "new notifier did not register")
+        self.wait_conns(60)
 
     def client_proc(self):
         if not self.client:
@@ -912,6 +939,221 @@ def scenario_reshuffle(build_dir):
     check_log(s.hivemind)
 
 
+def scenario_restart(build_dir):
+    """A hivemind restart.  With monitor sessions, the restarted hivemind restores its saved
+    placements, the nodes resume their sessions without listing their monitors and replay what
+    arrived while it was down, and it subscribes nothing again; when the nodes' answers to its
+    resumptions are lost, with their new tokens and the replay, it forgets the tokens and its next
+    connections start new sessions, every account placed again and that gap lost; after a gap in
+    which the swarms
+    split, the nodes that stayed resume so, and their accounts that moved are subscribed in their
+    new swarm; and from saved state too old to trust, every node starts afresh.  Without monitor
+    sessions, the gap is lost, and everything is subscribed again."""
+    accounts, gap = 2000, 100
+    subscriptions = accounts + accounts // 4
+    fresh_db()
+    seed(0, accounts)
+    # A second subscription for some accounts, with other namespaces: a node holds a monitor for
+    # each, and resuming must find both held.
+    seed(0, accounts // 4, namespaces="1", service="other")
+    # A replay budget below the notifications some accounts get while it is down.
+    budget = 2
+    config = f"resume_replay = {budget}"
+    s = Setup(build_dir, nodes=3, config=config)
+
+    def all_placed():
+        # A node holds the monitors of a session it was not offered again until they expire, so
+        # only what is missing counts here.
+        s.wait_for(lambda: s.check(0, accounts), 60, lambda c: c["missing"] == 0)
+
+    try:
+        s.wait_subscribed(0, accounts, 60)
+        s.network.cmd("send #1 before-the-restart-aaaaaaaaaaaaaaaaaaaaaa 0 100")
+        c = s.wait_pushes(1, 30)
+        check(c["pushes"] == 1, f"no push before the restart: {c}")
+
+        steps = s.restart_hivemind("hivemind2")
+        next(steps)
+        for i in range(gap):
+            s.network.cmd(f"send #{i} gap-{i:036d} 0 100")
+        next(steps, None)
+        s.wait_subscribed(0, accounts, 60)
+        c = s.wait_pushes(gap, 15 if MODE == "monitor" else 5)
+        n = s.net_counts()
+        print(
+            f"    {c['pushes']} of the {gap} notifications sent while it was down reached the "
+            f"notifier; {n['entries']} subscriptions sent after the restart, {n['resumed']} "
+            f"monitor sessions resumed ({n['resumed_unlisted']} without their listing)"
+        )
+        if MODE == "monitor":
+            check(
+                c["pushes"] == gap and c["duplicates"] == 0,
+                f"the replay did not deliver the gap: {c}",
+            )
+            check(
+                n["resumed"] == 3 and n["resumed_unlisted"] == 3 and n["listed"] == 0,
+                f"monitor sessions not resumed without their listing: {n}",
+            )
+            check(n["entries"] == 0, f"subscriptions sent after resuming every session: {n}")
+        else:
+            check(c["pushes"] == 0, f"pushes for the gap without monitor sessions: {c}")
+            check(
+                n["entries"] >= 3 * subscriptions,
+                f"only {n['entries']} subscriptions sent after the restart; expected a full fill",
+            )
+        before = c["pushes"]
+        s.network.cmd("send #7 after-the-restart-aaaaaaaaaaaaaaaaaaaaaaa 0 100")
+        c = s.wait_pushes(before + 1, 30)
+        check(c["pushes"] == before + 1, "no push for a notification sent after the restart")
+
+        if MODE == "monitor":
+            # More notifications for each of a few accounts than the replay budget: each node
+            # keeps and replays the newest of each account's, in order, and reports the rest
+            # discarded.
+            accts, per = 5, 5
+
+            def replay_hash(a, k):
+                return f"replay-{a}-{k}-".ljust(40, "a")
+
+            steps = s.restart_hivemind("hivemind-replay")
+            next(steps)
+            for k in range(per):
+                for a in range(accts):
+                    s.network.cmd(f"send #{a} {replay_hash(a, k)} 0 100")
+            next(steps, None)
+            c = s.wait_pushes(accts * budget, 30)
+            check(c["pushes"] == accts * budget, f"expected {accts * budget} pushes: {c}")
+            hashes = [line.split()[1] for line in s.dump()]
+            for a in range(accts):
+                got = [h for h in hashes if h.startswith(f"replay-{a}-")]
+                want = [replay_hash(a, k) for k in range(per - budget, per)]
+                check(got == want, f"account #{a}'s replay: {got}, expected {want}")
+            ms = s.stats()["monitor_sessions"]
+            check(
+                ms["replay_discarded"] == 3 * accts * (per - budget)
+                and ms["replay_discarded_accounts"] == 3 * accts,
+                f"discards beyond the replay budget: {ms}",
+            )
+            print(
+                f"    {per} notifications for each of {accts} accounts while it was down: the "
+                f"newest {budget} of each replayed in order; the nodes reported "
+                f"{ms['replay_discarded']} discarded for {ms['replay_discarded_accounts']} "
+                f"accounts"
+            )
+
+            # A reconnection while it runs resumes every session without its listing, the
+            # hivemind's claims for each node being current, and sends nothing again.
+            s.network.cmd("mark")
+            s.network.cmd("drop")
+            s.wait_conns(60)
+            s.wait_for(s.net_counts, 30, lambda n: n["resumed"] == 3)
+            time.sleep(2)
+            n = s.net_counts()
+            print(
+                f"    after every connection dropped: {n['resumed_unlisted']} monitor sessions "
+                f"resumed without their listing, {n['listed']} live monitors listed, "
+                f"{n['entries']} subscriptions sent"
+            )
+            check(
+                n["resumed_unlisted"] == 3 and n["listed"] == 0 and n["entries"] == 0,
+                f"a reconnection did not resume quietly: {n}",
+            )
+
+            # Every node's answer to the restarted hivemind's resumption is lost, with the new token
+            # and the replay of what arrived while it was down.  The token it offered is dead, so
+            # it forgets it, and its next connections start new sessions, placing everything
+            # again; the gap is lost.
+            lost = 20
+            steps = s.restart_hivemind("hivemind-lost-reply")
+            next(steps)
+            for i in range(s.nodes):
+                s.network.cmd(f"lose-reply {i}")
+            for i in range(lost):
+                s.network.cmd(f"send #{i} lost-{i:036d} 0 100")
+            next(steps, None)
+            s.wait_for(
+                lambda: s.hivemind.log().count("Forgot our monitor session token"),
+                30,
+                lambda n: n == s.nodes,
+            )
+            s.network.cmd("mark")
+            s.network.cmd("drop")
+            s.wait_conns(60)
+            s.wait_for(s.net_counts, 30, lambda n: n["created"] == 3)
+            all_placed()
+            time.sleep(1)
+            c = s.counts()
+            n = s.net_counts()
+            print(
+                f"    after every node's answer to the resumption was lost: {n['created']} new "
+                f"monitor sessions, {n['resumed']} resumed, {n['entries']} subscriptions sent; "
+                f"{c['pushes']} of the {lost} notifications sent while the hivemind was down "
+                f"pushed"
+            )
+            check(
+                n["created"] == 3 and n["resumed"] == 0,
+                f"expected new monitor sessions after the lost answers: {n}",
+            )
+            check(n["entries"] >= subscriptions, f"not everything subscribed again: {n}")
+            check(c["pushes"] == 0, f"pushes for a gap whose replay was lost: {c}")
+
+            # Nodes 0 and 2 stay in their swarm and node 1 moves to the new one, taking half the
+            # accounts: the two that stayed list those as ended.
+            steps = s.restart_hivemind("hivemind3")
+            next(steps)
+            s.network.cmd("swarms 2")
+            next(steps, None)
+            all_placed()
+            n = s.net_counts()
+            per_node = json.loads(s.network.cmd("subs"))
+            print(
+                f"    after a split while it was down: {n['resumed_unlisted']} monitor sessions "
+                f"resumed without their listing, {n['created']} new; subscriptions sent to each "
+                f"node {[p['entries'] for p in per_node]}"
+            )
+            check(
+                n["resumed_unlisted"] == 2 and n["created"] == 1 and n["listed"] == 0,
+                f"expected the nodes that stayed to resume without their listing: {n}",
+            )
+            check(
+                per_node[0]["entries"] == 0 and per_node[2]["entries"] == 0,
+                f"subscriptions sent to the nodes that stayed: {per_node}",
+            )
+            check(per_node[1]["entries"] > 0, f"nothing sent to the moved node: {per_node}")
+
+            # Saved state too old to trust: new sessions everywhere, and everything subscribed.
+            steps = s.restart_hivemind("hivemind4")
+            next(steps)
+            path = f"{WORK}/hivemind-state.bin"
+            with open(path, "r+b") as f:
+                f.seek(5)
+                (saved,) = struct.unpack("<q", f.read(8))
+                f.seek(5)
+                f.write(struct.pack("<q", saved - 11 * 60))
+            next(steps, None)
+            all_placed()
+            n = s.net_counts()
+            print(
+                f"    from saved state 11 minutes old: {n['created']} new monitor sessions, "
+                f"{n['resumed']} resumed; {n['entries']} subscriptions sent"
+            )
+            check(
+                n["created"] == 3 and n["resumed"] == 0,
+                f"expected every node to start afresh: {n}",
+            )
+            check(n["entries"] >= subscriptions, f"not everything subscribed again: {n}")
+            check(
+                "old, more than" in s.hivemind.log(),
+                "the hivemind did not say its saved state was too old",
+            )
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    for hm in s.stopped:
+        check_log(hm)
+    check_log(s.hivemind)
+
+
 def scenario_redundancy(build_dir):
     """With redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes each
     holding within a request's worth of the others; when a node leaves the network, its
@@ -1175,6 +1417,7 @@ FAST = [
     "churn",
     "shutdown",
     "reshuffle",
+    "restart",
     "retry",
     "redundancy",
     "rebalance",
@@ -1279,6 +1522,7 @@ def main():
         if results[-1][1] != "PASS":
             for log in (
                 "hivemind.log",
+                "hivemind2.log",
                 "network.err",
                 "notifier.err",
                 "notifier2.err",

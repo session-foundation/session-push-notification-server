@@ -117,6 +117,18 @@ inline constexpr int MONITOR_REQUESTS_IN_FLIGHT = 64;
 // leave plenty for the rest.
 inline constexpr std::chrono::milliseconds MONITOR_TIMEOUT = 10min;
 
+// An account restored from saved state is renewed at the latest this long before its monitors,
+// last renewed when it was last acknowledged, would expire.
+inline constexpr auto RESUME_MARGIN = 5min;
+
+// How often the hivemind saves its placements and monitor session tokens (see Config::state_file).
+inline constexpr auto DUMP_INTERVAL = 5min;
+
+// How old saved state may be for a restart to resume from it.  A monitor lasts 65 minutes from its
+// last renewal and renewals come every 45-55 minutes, so anything acknowledged in the 55 minutes
+// before a save made this long ago is live for at least 10 minutes yet.
+inline constexpr auto RESUME_MAX_AGE = 10min;
+
 // oxend drops a block subscription that has not been renewed for 30 minutes.
 inline constexpr auto OXEND_BLOCK_SUB_INTERVAL = 5min;
 
@@ -318,9 +330,33 @@ class HiveMind {
     void check_moved(std::string_view account, std::string_view swarm_hex);
     int64_t moved_agree_ = 0, moved_disagree_ = 0;
 
-    // The token each node last issued us for resuming our monitor session with it.
+    // The token each node last issued us for resuming our monitor session with it.  Saved with the
+    // placements (see save_state()), as resuming a session without its listing relies on both.
     std::unordered_map<Ed25519PK, MonitorToken> monitor_tokens_;
 
+    // Writes the swarms' slot tables, every acknowledged placement with when its account was last
+    // acknowledged, and the monitor session tokens to Config::state_file, replacing it whole.  The
+    // snapshot is taken here; the file is written on a thread of its own, unless `wait`.
+    void save_state(bool wait);
+    std::thread state_writer_;
+    std::atomic<bool> state_writing_ = false;
+    // What the last save held, and how long it took: its snapshot here, and its write.
+    struct {
+        std::optional<steady_time> when;
+        size_t bytes = 0, accounts = 0;
+        double snapshot_ms = 0;
+        std::atomic<double> write_ms = 0;
+    } state_saved_;
+    // Restores what Config::state_file holds, if it was saved within RESUME_MAX_AGE: the
+    // placements on nodes still in the same swarm, the accounts' renewals, and those nodes'
+    // tokens, for their sessions to be resumed without a listing.  Run once, with the first
+    // service node list.
+    void restore_state();
+    bool restore_tried_ = false;
+    struct {
+        double age = -1;
+        size_t accounts = 0, swarms = 0, slots = 0, slots_dropped = 0;
+    } restored_;
     // Gives up the claims a node holds for its monitor session to be resumed, when it was not
     // resumed after all.
     void abandon_resume(hive::SNode& node);

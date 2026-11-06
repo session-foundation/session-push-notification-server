@@ -81,6 +81,9 @@
 //   conns                               how many nodes have a connection from the hivemind
 //   drop                                closes every connection from the hivemind
 //   fail NODE MODE COUNT                as --fail, from now on
+//   lose-reply NODE                     node NODE handles its next monitor_session request, but
+//                                       answers it with an error and drops the replay, as if the
+//                                       reply were lost: the new token goes unlearned
 //   version NODE X.Y.Z|none             as --version, from the next service node list
 //   quit
 //
@@ -303,6 +306,8 @@ struct Node {
     // Monitor sessions resumed without their listing (l = 0), and the live monitors listed in
     // resumed sessions' answers.
     int64_t resumed_unlisted = 0, listed_live = 0;
+    // How many coming monitor_session requests to answer as if their reply were lost.
+    int lose_replies = 0;
     // Whether oxend lists the node (see "leave").
     bool listed = true;
     std::string fail_mode;
@@ -639,14 +644,20 @@ int main(int argc, char** argv) {
             }
         }
         reply.append("t", token);
-        m.respond(std::move(reply).str());
+        bool lost = node.lose_replies > 0;
+        if (lost) {
+            node.lose_replies--;
+            m.respond("Reply lost", true);
+        } else
+            m.respond(std::move(reply).str());
 
         // After the reply, on the same stream, with the data flag each message's monitors had when
         // it arrived; messages expired since are skipped.
         auto ms = now_ms();
-        for (auto& missed : sess.missed)
-            if (missed.note.z >= ms)
-                conn.stream->command("notify", notification(missed.note, missed.data));
+        if (!lost)
+            for (auto& missed : sess.missed)
+                if (missed.note.z >= ms)
+                    conn.stream->command("notify", notification(missed.note, missed.data));
         sess.missed.clear();
         sess.overflow = 0;
         node.monitor_sessions.emplace(token, std::move(sess));
@@ -1107,6 +1118,11 @@ int main(int argc, char** argv) {
                 nodes.at(node).fail_mode = mode;
                 nodes.at(node).fail_count = count;
             });
+            std::cout << "ok" << std::endl;
+        } else if (cmd == "lose-reply") {
+            int node;
+            in >> node;
+            loop.call_get([&] { nodes.at(node).lose_replies++; });
             std::cout << "ok" << std::endl;
         } else if (cmd == "quit") {
             break;

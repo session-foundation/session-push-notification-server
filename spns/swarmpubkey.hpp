@@ -24,6 +24,9 @@ struct SwarmPubkey {
     // node claims the account while either of its bits is set.
     mutable uint16_t sent = 0, acked = 0;
     static_assert(SWARM_SLOTS == 16);
+    // When a node last acknowledged a subscription for the account (unix seconds; 0 for never):
+    // what is saved of its renewals, for a restarted hivemind to know how long its monitors last.
+    mutable uint32_t acked_at = 0;
     uint64_t swarm_space;
     mutable uint64_t swarm;
 

@@ -70,6 +70,9 @@ inline constexpr int MONITOR_NO_SWARM_INFO = 7;
 inline constexpr std::chrono::seconds RESUBSCRIBE_MIN = 45min;
 inline constexpr std::chrono::seconds RESUBSCRIBE_MAX = 55min;
 
+// How long a storage server keeps a monitor after its last renewal.
+inline constexpr auto MONITOR_LIFETIME = 65min;
+
 // How long we wait (in seconds) after a failed connection attempt to a snode storage server before
 // re-trying the connection; we use the first value after the first failure, the second one after
 // the second failure, and so on (if we run off the end we use the last value).
@@ -194,8 +197,9 @@ class SNode : public std::enable_shared_from_this<SNode> {
     /// to send before anything its scan finds; and its coverage scan (see HiveMind::next_claim).
     int slot = -1;
     size_t claimed = 0;
-    /// Set while the node's claims are held for its monitor session to be resumed, kept across a
-    /// lost connection: they stand until the session's resumption confirms or refutes them.
+    /// Set while the node's claims are held for its monitor session to be resumed, restored from
+    /// saved state after a restart or kept across a lost connection: they stand until the
+    /// session's resumption confirms or refutes them.
     bool resuming = false;
     std::deque<const SwarmPubkey*> due;
     struct {
