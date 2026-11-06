@@ -54,6 +54,18 @@ startup_wait = 8.0
 # this is set other notifiers can still register, they just aren't required for startup to proceed).
 #notifiers_expected = apns,firebase
 
+# How many of its swarm's nodes each account is subscribed on, at most the swarm's size: -1, the
+# default, for all of them, or a positive number.  Fewer means fewer subscriptions to make and
+# renew, and fewer duplicate notifications from the swarm, at the cost of an account's
+# notifications depending on fewer nodes' connections.  The accounts go to the nodes holding the
+# fewest.
+#redundancy = -1
+
+# The most monitor (subscription) requests in flight at once across all storage servers, and how
+# many seconds one may go unanswered before it is retried.  The defaults suit production.
+#monitor_requests = 64
+#monitor_timeout = 600
+
 
 [keys]
 

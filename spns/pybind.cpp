@@ -140,6 +140,32 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     "the `notifier_wait` time early once we have registered notifiers for all the "
                     "values set here.")
             .def_readwrite(
+                    "redundancy",
+                    &Config::redundancy,
+                    "how many of its swarm's nodes each account is subscribed on, at most the "
+                    "swarm's size: -1 for all of them, or a positive number")
+            .def_readwrite(
+                    "monitor_requests",
+                    &Config::monitor_requests,
+                    "most monitor requests in flight at once across all nodes; None for the "
+                    "default")
+            .def_property(
+                    "monitor_timeout",
+                    [](Config& self) -> std::optional<double> {
+                        if (!self.monitor_timeout)
+                            return std::nullopt;
+                        return std::chrono::duration<double>(*self.monitor_timeout).count();
+                    },
+                    [](Config& self, std::optional<double> seconds) {
+                        if (seconds)
+                            self.monitor_timeout = std::chrono::milliseconds{
+                                    static_cast<int64_t>(*seconds * 1000)};
+                        else
+                            self.monitor_timeout.reset();
+                    },
+                    "seconds a monitor request may go unanswered before it counts as failed; None "
+                    "for the default")
+            .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,
                     "maximum number of permitted simultaneous connection attempts.  (This is not "

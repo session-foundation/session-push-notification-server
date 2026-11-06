@@ -47,6 +47,21 @@ struct Config {
     // have a registered notifier for all of the services in this set.
     std::unordered_set<std::string> notifiers_expected;
 
+    // How many of its swarm's nodes each account is subscribed on, at most the swarm's size: -1
+    // for all of them, or a positive number.  Each node delivers every notification for the
+    // accounts it holds, so fewer nodes per account means fewer subscriptions to make and renew,
+    // and fewer duplicate notifications, at the cost of the account's notifications waiting on
+    // fewer nodes' connections.
+    int redundancy = -1;
+
+    // The most monitor requests in flight at once, across all nodes, if not the hivemind's default
+    // (MONITOR_REQUESTS_IN_FLIGHT).
+    std::optional<int> monitor_requests;
+
+    // How long a monitor request may go unanswered, if not the hivemind's default
+    // (MONITOR_TIMEOUT).
+    std::optional<std::chrono::milliseconds> monitor_timeout;
+
     // Maximum connections we will attempt to establish simultaneously (we can have more, we just
     // won't try to open more than this at once until some succeed or fail).  You can set this to 0
     // for a "dry run" mode where no connections at all will be made.

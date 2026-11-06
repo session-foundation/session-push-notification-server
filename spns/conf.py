@@ -92,6 +92,13 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
         "hivemind": {
             "subs_interval": ("subs_interval", None, int),
             "max_connects": ("max_pending_connects", None, int),
+            "redundancy": (
+                "redundancy",
+                lambda x: re.fullmatch(r"\s*(-1|\d+)\s*", x) and int(x) != 0,
+                int,
+            ),
+            "monitor_requests": ("monitor_requests", None, int),
+            "monitor_timeout": ("monitor_timeout", None, float),
             "filter_lifetime": ("filter_lifetime", None, int),
             "startup_wait": ("notifier_wait", None, lambda x: round(1000 * float(x))),
             "notifiers_expected": (

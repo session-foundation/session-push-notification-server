@@ -6,21 +6,24 @@
 #include <oxenc/base32z.h>
 #include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
-#include <oxenmq/batch.h>
 #include <oxenmq/message.h>
 #include <sodium/crypto_sign_ed25519.h>
 #include <spdlog/common.h>
 #include <systemd/sd-daemon.h>
 
 #include <algorithm>
+#include <bit>
+#include <charconv>
 #include <chrono>
 #include <concepts>
+#include <cstring>
 #include <nlohmann/json.hpp>
 #include <oxen/log.hpp>
 #include <oxen/quic/btstream.hpp>
 #include <oxen/quic/format.hpp>
 #include <oxen/quic/gnutls_crypto.hpp>
 #include <oxen/quic/opt.hpp>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -359,12 +362,15 @@ HiveMind::HiveMind(Config conf_in) :
     subscribe_blocks();
     refresh_sns();
 
-    omq_.add_timer([this] { subscribe_blocks(); }, OXEND_BLOCK_SUB_INTERVAL);
     omq_.add_timer([this] { db_cleanup(); }, 30s);
 
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
     // timer because nothing in here is time critical:
-    jq_.add_timer(10s, [this] { check_subs(); });
+    sub_jq_.add_timer(10s, [this] { check_subs(); });
+    sub_jq_.add_timer(OXEND_BLOCK_SUB_INTERVAL, [this] { subscribe_blocks(); });
+    // And this one reconnects to nodes whose connection failed or was lost, once their cooldown
+    // has passed.
+    jq_.add_timer(10s, [this] { make_conns(); });
 
     // For updating systemd Status line
     omq_.add_timer([this] { log_stats(); }, 15s);
@@ -403,14 +409,24 @@ HiveMind::~HiveMind() {
         quic_in_.clear();
         q.reset();
 
+        conns_.clear();
+    });
+
+    // The subscription thread stops only now: the endpoint teardown above was the last thing that
+    // could queue on it (oxenmq is already gone), and it queues on jq_, which must therefore
+    // outlive it.  It runs what the teardown queued for it against its members, which are intact
+    // until the QUIC loop clears them below, and then drops its timers.
+    sub_jq_.stop();
+
+    loop_.call_get([this] {
         swarms_.clear();
         sns_.clear();
 
         // Last, so that anything the teardown above queued on it (it runs synchronously on the
-        // loop thread, so nothing queued could have run yet) is dropped rather than left to run
+        // QUIC loop, so nothing queued could have run yet) is dropped rather than left to run
         // against the members destroyed after this, and so that nothing above could hit a stopped
-        // queue.  Nothing can queue more once this returns: oxenmq and the processing thread are
-        // gone, and so are the endpoints and nodes.
+        // queue.  Nothing can queue more once this returns: oxenmq, the processing thread and the
+        // subscription thread are gone, and so are the endpoints and nodes.
         jq_.stop();
     });
 }
@@ -631,6 +647,52 @@ void HiveMind::on_message_notification(quic::message m) {
     notify_cv_.notify_one();
 }
 
+void HiveMind::on_monitor_ended(hive::SNode& node, quic::message m) {
+    try {
+        oxenc::bt_dict_consumer d{m.body()};
+        auto account = d.require<std::string_view>("@");
+        auto swarm = d.require<std::string_view>("swarm");
+        check_moved(account, swarm);
+        if (account.size() != AccountID::SIZE)
+            return;
+        AccountID id;
+        std::memcpy(id.data(), account.data(), id.size());
+        // Not placed again here: the node ends a monitor when the account leaves its swarm, which
+        // we may not have heard of yet, and the account would only be sent back to it.  The move,
+        // once our swarm list has it, or else the account's renewal places it afresh.
+        if (auto it = subscribers_.find(SwarmPubkey{id, std::nullopt, /*_skip_validation=*/true});
+            it != subscribers_.end())
+            unclaim(node, it->first);
+    } catch (const std::exception& e) {
+        log::warning(cat, "Invalid monitor_ended notification: {}", e.what());
+    }
+}
+
+void HiveMind::check_moved(std::string_view account, std::string_view swarm_hex) {
+    AccountID id;
+    uint64_t swarm;
+    if (account.size() != id.size() ||
+        std::from_chars(swarm_hex.data(), swarm_hex.data() + swarm_hex.size(), swarm, 16).ptr !=
+                swarm_hex.data() + swarm_hex.size())
+        throw std::invalid_argument{"invalid account or swarm"};
+    std::memcpy(id.data(), account.data(), id.size());
+
+    auto it = subscribers_.find(SwarmPubkey{id, std::nullopt, /*_skip_validation=*/true});
+    if (it == subscribers_.end())
+        return;
+    if (it->first.swarm == swarm)
+        moved_agree_++;
+    else {
+        log::debug(
+                cat,
+                "A node places account {} in swarm {:x}, but we place it in {:x}",
+                id.hex(),
+                swarm,
+                it->first.swarm);
+        moved_disagree_++;
+    }
+}
+
 void HiveMind::send_push(
         const std::string& service, const oxenmq::ConnectionID& conn, std::string_view push) {
     omq_.send(
@@ -706,7 +768,7 @@ void HiveMind::process_notifications() {
 
     while (true) {
         // Declared per pass so that its messages are freed here, outside the lock, rather than in
-        // the next pass's critical section while the loop thread waits to queue more.
+        // the next pass's critical section while the QUIC loop waits to queue more.
         std::vector<quic::message> process;
         {
             std::unique_lock lock{notify_mutex_};
@@ -1209,16 +1271,51 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         }
     }
 
-    jq_.call_soon([when_ready = std::move(when_ready), result = std::move(result), this]() mutable {
+    sub_jq_.call_soon([when_ready = std::move(when_ready),
+                       result = std::move(result),
+                       this]() mutable {
         size_t n_conns = 0;
         for (auto& sn : sns_)
             n_conns += sn.second->connected();
 
+        size_t indexed = 0, holding = 0, with_nodes = 0, pending = 0, pending_nodes = 0;
+        for (const auto& [id, swarm] : swarms_) {
+            indexed += swarm.members.size();
+            holding += !swarm.members.empty();
+            with_nodes += swarm.nodes > 0;
+        }
+        for (const auto& [pk, sn] : sns_) {
+            pending += sn->due.size();
+            pending_nodes += !sn->due.empty() || !sn->scan.done;
+        }
+
         result["block_hash"] = last_block_.first;
         result["block_height"] = last_block_.second;
-        result["swarms"] = swarms_.size();
+        result["swarms"] = with_nodes;
         result["snodes"] = sns_.size();
         result["accounts_monitored"] = subscribers_.size();
+        result["swarm_index"] = {{"swarms", holding}, {"accounts", indexed}};
+        result["placements"] = {
+                {"placed", placements_},
+                {"by_scans", scan_placements_},
+                {"moved", moved_placements_}};
+        result["schedule"] = schedule_.size();
+        result["pending"] = {
+                {"accounts", pending},
+                {"nodes", pending_nodes},
+                {"requests", requests_in_flight_},
+                {"request_cap", max_requests_},
+                {"waiting_nodes", send_queue_.size()}};
+        result["subscriptions_distinct"] = subscription_count_;
+        const auto& ms = monitor_stats_;
+        result["monitor_requests"] = {
+                {"sent", ms.sent},
+                {"answered", ms.answered},
+                {"failed", ms.failed},
+                {"timed_out", ms.timed_out},
+                {"wrong_swarm", ms.wrong_swarm},
+                {"rejected", ms.rejected}};
+        result["accounts_moved"] = moved_total_;
         result["connections"] = n_conns;
         result["pending_connections"] = pending_connects_.load();
         result["uptime"] =
@@ -1748,7 +1845,9 @@ void HiveMind::refresh_sns() {
             "rpc.get_service_nodes",
             [this](bool success, std::vector<std::string> data) {
                 if (success)
-                    jq_.call_get([&] { on_sns_response(std::move(data)); });
+                    sub_jq_.call_soon([this, data = std::move(data)]() mutable {
+                        on_sns_response(std::move(data));
+                    });
                 else
                     log::warning(
                             cat,
@@ -1794,6 +1893,8 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
         }
 
         bool swarms_changed = false;
+        std::vector<const SwarmPubkey*> moved;
+        hold_dispatch_ = true;
         auto new_hash = res.at("block_hash").get<std::string>();
         auto new_height = res.at("height").get<int64_t>();
         if (new_hash != last_block_.first) {
@@ -1815,6 +1916,7 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
 
                 swarm_ids_.clear();
                 swarm_ids_.insert(swarm_ids_.end(), new_swarm_ids.begin(), new_swarm_ids.end());
+                moved = reassign_swarms();
             }
 
             last_block_ = {std::move(new_hash), new_height};
@@ -1840,25 +1942,30 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
         log::debug(
                 cat, "{} active SNs ({} missing details)", sns.size(), sn_st.size() - sns.size());
 
+        // The QUIC loop connects to each of `addrs` (reconnecting only where the address changed)
+        // and disconnects from `gone`.
+        std::vector<std::pair<std::shared_ptr<hive::SNode>, quic::RemoteAddress>> addrs;
+        std::vector<std::shared_ptr<hive::SNode>> gone;
+
         // Anything in self.sns but not in sns is no longer on the network (decommed, dereged,
         // expired), or possibly we lost info for it (from the above).  We're going to
         // disconnect from these (if any are connected).
         int dropped = 0;
         for (auto it = sns_.begin(); it != sns_.end();) {
             const auto& [pk, snode] = *it;
-            if (sns.count(pk)) {
+            if (sns.contains(pk)) {
                 ++it;
                 continue;
             }
 
             log::debug(cat, "Disconnecting {}", pk);
-            swarms_[snode->swarm].erase(snode);
-            snode->disconnect();
+            leave_swarm(*snode);
+            gone.push_back(snode);
             it = sns_.erase(it);
             dropped++;
         }
 
-        std::unordered_set<std::shared_ptr<hive::SNode>> new_or_changed_sns;
+        int new_or_changed = 0;
 
         for (const auto& [pk, details] : sns) {
             const auto& [ip, port, swarm] = details;
@@ -1866,108 +1973,458 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
 
             if (auto it = sns_.find(pk); it != sns_.end()) {
                 // We already know about this service node from the last update, but it might
-                // have changed address or swarm, in which case we want to disconnect and then
-                // store it as "new" so that we reconnect to it (if required) later.  (We don't
-                // technically have to reconnect if swarm changes, but it simplifies things a
-                // bit to do it anyway).
+                // have changed address or swarm.  A node whose swarm changed loses its claims on
+                // the old one's accounts, and scans its new one's.
                 auto& snode = it->second;
                 if (snode->swarm != swarm) {
-                    swarms_[snode->swarm].erase(snode);
-                    snode->reset_swarm(swarm);
-                    swarms_[swarm].insert(snode);
-                    new_or_changed_sns.insert(snode);
+                    leave_swarm(*snode);
+                    snode->swarm = swarm;
+                    join_swarm(*snode);
+                    new_or_changed++;
                 }
 
-                // Update the address; this reconnects if the address has changed, does nothing
-                // otherwise.
-                snode->connect(std::move(addr));
+                addrs.emplace_back(snode, std::move(addr));
             } else {
-                // New snode
-                auto snode = loop_.make_shared<hive::SNode>(*this, std::move(addr), swarm);
+                // New snode; it scans its swarm once it connects.
+                auto snode = loop_.make_shared<hive::SNode>(*this, addr, swarm);
                 sns_.emplace(pk, snode);
-                swarms_[swarm].insert(snode);
-                new_or_changed_sns.insert(snode);
+                join_swarm(*snode);
+                addrs.emplace_back(std::move(snode), std::move(addr));
+                new_or_changed++;
             }
         }
 
-        for (auto it = swarms_.begin(); it != swarms_.end();) {
-            if (it->second.empty())
-                it = swarms_.erase(it);
-            else
-                ++it;
-        }
+        log::debug(cat, "{} new/updated SNs; dropped {} old SNs", new_or_changed, dropped);
 
-        log::debug(
-                cat, "{} new/updated SNs; dropped {} old SNs", new_or_changed_sns.size(), dropped);
-
-        // If we had a change to the network's swarms then we need to trigger a full recheck of
-        // swarm membership, ejecting any pubkeys that moved while adding all pubkeys again to
-        // be sure they are in each(possibly new) slot.
-        if (swarms_changed || !new_or_changed_sns.empty()) {
-            int sw_changes = 0;
-            // Recalculate the swarm id of all subscribers:
-            for (auto& [pk, v] : subscribers_)
-                sw_changes += pk.update_swarm(swarm_ids_);
-
-            log::debug(cat, "{} accounts changed swarms", sw_changes);
-
-            oxenmq::Batch<void> batch;
-            batch.reserve(swarms_.size());
-            for (auto& [swid, snodes] : swarms_) {
-                batch.add_job([this, swid = swid, s = &snodes] {
-                    // This seems suspicious that we are modifying multiple SN objects from
-                    // different threads, but we aren't because each SNode is only inside `swarms_`
-                    // once, and so there shouldn't be any overlap across SNs while this batch is
-                    // running.
-                    for (auto& sn : *s)
-                        sn->remove_stale_swarm_members(swarm_ids_);
-                    for (auto& [swarmpk, v] : subscribers_)
-                        if (swarmpk.swarm == swid)
-                            for (auto& sn : *s)
-                                sn->add_account(swarmpk);
-                });
+        jq_.call_soon([this, addrs = std::move(addrs), gone = std::move(gone)]() mutable {
+            for (auto& snode : gone)
+                snode->disconnect();
+            conns_.clear();
+            for (auto& [snode, addr] : addrs) {
+                snode->connect(std::move(addr));
+                conns_.push_back(std::move(snode));
             }
+        });
 
-            std::promise<void> done;
-            batch.completion([&done](auto&&) { done.set_value(); });
-            omq_.batch(std::move(batch));
+        // Placed only now that the nodes are in their own new swarms.
+        for (const auto* account : moved)
+            place(*account);
+        std::erase_if(swarms_, [](const auto& s) {
+            return s.second.nodes == 0 && s.second.members.empty();
+        });
+        hold_dispatch_ = false;
+        dispatch_requests();
 
-            done.get_future().get();
+        if (swarms_changed || new_or_changed)
             check_subs();
-        }
-#if 0  // TODO: this is much slower than the above full scan; investigate
-        else if (!new_or_changed_sns.empty()) {
-            // Otherwise swarms stayed the same(which means no accounts changed swarms), but
-            // snodes might have moved in / out of existing swarms, so re-add any subscribers to
-            // swarm changers to ensure they have all the accounts that belong to them.
-
-            std::unordered_map<uint64_t, std::vector<SwarmPubkey>> swarm_subs;
-            for (const auto& snode : new_or_changed_sns)
-                swarm_subs[snode->swarm];  // default-construction side effect
-
-            for (auto& [swarmpk, v] : subscribers_) {
-                if (auto it = swarm_subs.find(swarmpk.swarm); it != swarm_subs.end())
-                    it->second.push_back(swarmpk);
-
-                for (const auto& snode : new_or_changed_sns)
-                    for (const auto& swarmpk : swarm_subs[snode->swarm])
-                        snode->add_account(swarmpk);
-            }
-
-            check_subs();
-        }
-#endif
     } catch (const std::exception& e) {
         log::warning(cat, "An exception occured while processing the SN update: {}", e.what());
     }
+    if (hold_dispatch_) {
+        hold_dispatch_ = false;
+        dispatch_requests();
+    }
+}
+
+static thread_local std::mt19937_64 rng{std::random_device{}()};
+
+std::chrono::seconds HiveMind::resubscribe_delay() const {
+    return 1s * std::uniform_int_distribution<int64_t>{
+                        hive::RESUBSCRIBE_MIN.count(), hive::RESUBSCRIBE_MAX.count()}(rng);
+}
+
+void HiveMind::schedule(const SwarmPubkey& account, system_time when) {
+    account.next_due = when;
+    schedule_.emplace_back(&account, when);
+    std::push_heap(schedule_.begin(), schedule_.end(), schedule_later);
+}
+
+std::vector<const SwarmPubkey*>::iterator HiveMind::Swarm::find(const SwarmPubkey& account) {
+    auto it = std::lower_bound(
+            members.begin(),
+            members.end(),
+            account.swarm_space,
+            [](const SwarmPubkey* a, uint64_t space) { return a->swarm_space < space; });
+    for (; it != members.end() && (*it)->swarm_space == account.swarm_space; ++it)
+        if (*it == &account)
+            return it;
+    return members.end();
+}
+
+void HiveMind::Swarm::insert(const SwarmPubkey& account) {
+    by_claims[std::popcount<uint16_t>(account.sent | account.acked)]++;
+    generation++;
+    members.insert(
+            std::upper_bound(
+                    members.begin(),
+                    members.end(),
+                    account.swarm_space,
+                    [](uint64_t space, const SwarmPubkey* a) { return space < a->swarm_space; }),
+            &account);
+}
+
+void HiveMind::Swarm::erase(const SwarmPubkey& account) {
+    if (auto it = find(account); it != members.end()) {
+        by_claims[std::popcount<uint16_t>(account.sent | account.acked)]--;
+        members.erase(it);
+        generation++;
+    }
+}
+
+void HiveMind::claim(const SwarmPubkey& account, Swarm& swarm, hive::SNode& node) {
+    auto claims = std::popcount<uint16_t>(account.sent | account.acked);
+    swarm.by_claims[claims]--;
+    swarm.by_claims[claims + 1]++;
+    account.sent |= static_cast<uint16_t>(1u << node.slot);
+    node.claimed++;
+}
+
+void HiveMind::release(const SwarmPubkey& account, Swarm& swarm, int slot) {
+    auto bit = static_cast<uint16_t>(1u << slot);
+    if ((account.sent | account.acked) & bit) {
+        auto claims = std::popcount<uint16_t>(account.sent | account.acked);
+        swarm.by_claims[claims]--;
+        swarm.by_claims[claims - 1]++;
+        account.sent &= ~bit;
+        account.acked &= ~bit;
+        if (auto* node = swarm.slots[slot])
+            node->claimed--;
+    }
+}
+
+void HiveMind::release_all(const SwarmPubkey& account, uint64_t swarm) {
+    auto it = swarms_.find(swarm);
+    if (it == swarms_.end())
+        return;
+    for (uint16_t bits = account.sent | account.acked; bits; bits &= bits - 1)
+        release(account, it->second, std::countr_zero(bits));
+}
+
+void HiveMind::place(const SwarmPubkey& account, uint16_t prev_acked, bool by_scan) {
+    auto it = swarms_.find(account.swarm);
+    if (it == swarms_.end())
+        return;
+    auto& swarm = it->second;
+    uint16_t claimed_by = account.sent | account.acked;
+    int short_by = target(swarm) - std::popcount(claimed_by);
+    if (short_by <= 0)
+        return;
+
+    struct Candidate {
+        hive::SNode* node;
+        bool held;
+        uint64_t draw;
+    };
+    std::array<Candidate, SWARM_SLOTS> candidates;
+    int n = 0;
+    for (int s = 0; s < SWARM_SLOTS; s++)
+        if (auto* node = swarm.slots[s]; node && node->up() && !(claimed_by >> s & 1))
+            candidates[n++] = {node, bool(prev_acked >> s & 1), rng()};
+    int chosen = std::min(short_by, n);
+    std::partial_sort(
+            candidates.begin(),
+            candidates.begin() + chosen,
+            candidates.begin() + n,
+            [](const Candidate& a, const Candidate& b) {
+                return std::tuple{a.node->claimed, !a.held, a.draw} <
+                       std::tuple{b.node->claimed, !b.held, b.draw};
+            });
+
+    uint16_t chosen_bits = 0;
+    int fresh = 0;
+    for (int i = 0; i < chosen; i++) {
+        auto& node = *candidates[i].node;
+        claim(account, swarm, node);
+        node.due.push_back(&account);
+        chosen_bits |= static_cast<uint16_t>(1u << node.slot);
+        fresh += !candidates[i].held;
+        send_pending(node);
+    }
+    (by_scan ? scan_placements_ : placements_) += chosen;
+    // A node that did not hold the account before takes the place of one that did, while any of
+    // those is left out; beyond them it is an addition, not a move.
+    moved_placements_ += std::min(fresh, std::popcount<uint16_t>(prev_acked & ~chosen_bits));
+}
+
+void HiveMind::replace(const SwarmPubkey& account) {
+    auto prev_acked = account.acked;
+    release_all(account, account.swarm);
+    place(account, prev_acked);
+}
+
+void HiveMind::place_again(const std::vector<const SwarmPubkey*>& accounts) {
+    for (const auto* account : accounts)
+        if (account->swarm != INVALID_SWARM_ID && account->next_due != SwarmPubkey::UNSCHEDULED)
+            place(*account);
+}
+
+// Where a scan starts: at a random member, so that the nodes of a swarm woken together do not
+// all walk it in step.
+static uint64_t scan_start(const std::vector<const SwarmPubkey*>& members) {
+    if (members.empty())
+        return 0;
+    return members[std::uniform_int_distribution<size_t>{0, members.size() - 1}(rng)]->swarm_space;
+}
+
+void HiveMind::wake(hive::SNode& node) {
+    if (node.slot < 0)
+        return;
+    node.scan.done = false;
+    node.scan.pass = 0;
+    node.scan.walked = 0;
+    send_pending(node);
+}
+
+void HiveMind::wake(Swarm& swarm, const hive::SNode* except) {
+    for (auto* node : swarm.slots)
+        if (node && node != except)
+            wake(*node);
+}
+
+void HiveMind::join_swarm(hive::SNode& node) {
+    auto& swarm = swarms_[node.swarm];
+    auto free = std::find(swarm.slots.begin(), swarm.slots.end(), nullptr);
+    if (free == swarm.slots.end()) {
+        log::critical(
+                cat,
+                "{} is node {} of swarm {:x}, which has room for only {}: it is given no "
+                "subscriptions",
+                node.pubkey,
+                swarm.nodes + 1,
+                node.swarm,
+                SWARM_SLOTS);
+        node.slot = -1;
+        return;
+    }
+    *free = &node;
+    swarm.nodes++;
+    node.slot = free - swarm.slots.begin();
+    node.claimed = 0;
+    node.due.clear();
+    node.scan.cursor = scan_start(swarm.members);
+    node.scan.generation = UINT64_MAX;
+    // The swarm's target may have grown with it.
+    wake(swarm);
+}
+
+void HiveMind::clear_slot(Swarm& swarm, hive::SNode& node) {
+    if (node.claimed > 0)
+        for (const auto* account : swarm.members)
+            release(*account, swarm, node.slot);
+    assert(node.claimed == 0);
+    node.due.clear();
+}
+
+void HiveMind::leave_swarm(hive::SNode& node) {
+    if (node.slot < 0)
+        return;
+    auto it = swarms_.find(node.swarm);
+    auto& swarm = it->second;
+    clear_slot(swarm, node);
+    swarm.slots[node.slot] = nullptr;
+    swarm.nodes--;
+    node.slot = -1;
+    node.scan.done = true;
+    if (swarm.nodes == 0 && swarm.members.empty())
+        swarms_.erase(it);
+    else
+        wake(swarm);
+}
+
+void HiveMind::drop_claims(hive::SNode& node) {
+    node.due.clear();
+    node.scan.done = true;
+    if (node.slot < 0 || node.claimed == 0)
+        return;
+    auto& swarm = swarms_.at(node.swarm);
+    node.scan.cursor = scan_start(swarm.members);
+    node.scan.generation = UINT64_MAX;
+    clear_slot(swarm, node);
+    // The accounts it held are below their target now, for the others' scans to find.
+    wake(swarm, &node);
+}
+
+void HiveMind::subscribed(hive::SNode& node, const SwarmPubkey& account) {
+    if (node.slot < 0 || account.swarm != node.swarm)
+        return;
+    auto bit = static_cast<uint16_t>(1u << node.slot);
+    if (account.sent & bit) {
+        account.sent &= ~bit;
+        account.acked |= bit;
+    }
+}
+
+void HiveMind::unclaim(hive::SNode& node, const SwarmPubkey& account) {
+    if (node.slot < 0 || account.swarm != node.swarm)
+        return;
+    release(account, swarms_.at(node.swarm), node.slot);
+}
+
+const SwarmPubkey* HiveMind::next_claim(hive::SNode& node) {
+    auto it = swarms_.find(node.swarm);
+    if (node.slot < 0 || it == swarms_.end()) {
+        node.due.clear();
+        node.scan.done = true;
+        return nullptr;
+    }
+    auto& swarm = it->second;
+    auto bit = static_cast<uint16_t>(1u << node.slot);
+
+    // The scan walks the members round from where it last stopped, looking first for accounts
+    // claimed on no node, then on one, and so on up to one short of the target.  It places each
+    // where any placement would go, rather than taking those this node would be chosen for: which
+    // nodes those are changes with every claim, and a node passing an account before it became
+    // one of them would leave it short.
+    auto& scan = node.scan;
+    const auto& members = swarm.members;
+    int goal = target(swarm);
+    while (true) {
+        while (!node.due.empty()) {
+            const auto* account = node.due.front();
+            node.due.pop_front();
+            // Not if a renewal or a move has placed it afresh since.
+            if ((account->sent & bit) && account->swarm == node.swarm)
+                return account;
+        }
+        if (scan.done || scan.pass >= goal || members.empty())
+            break;
+        if (scan.walked >= members.size() || swarm.by_claims[scan.pass] == 0) {
+            scan.pass++;
+            scan.walked = 0;
+            continue;
+        }
+        if (scan.generation != swarm.generation) {
+            scan.index = std::lower_bound(
+                                 members.begin(),
+                                 members.end(),
+                                 scan.cursor,
+                                 [](const SwarmPubkey* a, uint64_t cursor) {
+                                     return a->swarm_space < cursor;
+                                 }) -
+                         members.begin();
+            scan.generation = swarm.generation;
+        }
+        if (scan.index >= members.size())
+            scan.index = 0;
+        const auto* account = members[scan.index++];
+        // Wraps round to 0 past the last possible swarm_space, as the walk does.
+        scan.cursor = account->swarm_space + 1;
+        scan.walked++;
+
+        if (std::popcount<uint16_t>(account->sent | account->acked) == scan.pass &&
+            account->next_due != SwarmPubkey::UNSCHEDULED)
+            place(*account, 0, /*by_scan=*/true);
+    }
+    scan.done = true;
+    return nullptr;
+}
+
+std::vector<const SwarmPubkey*> HiveMind::reassign_swarms() {
+    auto now = system_clock::now();
+    std::vector<const SwarmPubkey*> moved;
+    size_t placed = 0, before = schedule_.size();
+    for (auto& [pk, subs] : subscribers_) {
+        auto old = pk.swarm;
+        if (!pk.update_swarm(swarm_ids_))
+            continue;
+        if (old != INVALID_SWARM_ID)
+            release_all(pk, old);
+        if (pk.swarm == INVALID_SWARM_ID)
+            continue;  // No swarms known at all; placed again once there are
+
+        // An account placed for the first time is subscribed by its nodes' scans as they connect,
+        // so only its renewal is scheduled; a moved one is placed on its new swarm at once.
+        if (old == INVALID_SWARM_ID) {
+            pk.next_due = now + resubscribe_delay();
+            schedule_.emplace_back(&pk, pk.next_due);
+            placed++;
+        } else if (pk.next_due != SwarmPubkey::UNSCHEDULED)
+            moved.push_back(&pk);
+    }
+    // One O(n) heapify instead of a push per account, since the first placement is every account.
+    if (schedule_.size() != before)
+        std::make_heap(schedule_.begin(), schedule_.end(), schedule_later);
+
+    // Rebuilt rather than edited, as a move takes a large share of the accounts.
+    for (auto& [id, swarm] : swarms_) {
+        swarm.members.clear();
+        swarm.by_claims.fill(0);
+        swarm.generation++;
+    }
+    for (const auto& [pk, subs] : subscribers_)
+        if (pk.swarm != INVALID_SWARM_ID) {
+            auto& swarm = swarms_[pk.swarm];
+            swarm.members.push_back(&pk);
+            swarm.by_claims[std::popcount<uint16_t>(pk.sent | pk.acked)]++;
+        }
+    size_t holding = 0;
+    for (auto& [id, swarm] : swarms_) {
+        std::sort(swarm.members.begin(), swarm.members.end(), [](const auto* a, const auto* b) {
+            return a->swarm_space < b->swarm_space;
+        });
+        holding += !swarm.members.empty();
+    }
+
+    log::info(
+            cat,
+            "Swarm list changed: {} accounts moved swarm, {} placed for the first time; {} swarms "
+            "hold accounts",
+            moved.size(),
+            placed,
+            holding);
+    return moved;
 }
 
 void HiveMind::check_subs() {
-    assert(loop_.inside());
+    assert(sub_loop_.inside());
+
+    auto now = system_clock::now();
+    auto sig_min = now - hive::Subscription::SIGNATURE_EXPIRY + 10s;
+    auto sig_max = now + hive::Subscription::SIGNATURE_EARLY;
+
+    size_t due = 0, lapsed = 0;
+    while (!schedule_.empty() && schedule_.front().second <= now) {
+        std::pop_heap(schedule_.begin(), schedule_.end(), schedule_later);
+        auto [account, when] = schedule_.back();
+        schedule_.pop_back();
+        if (when != account->next_due)
+            continue;  // Rescheduled since
+
+        auto it = subscribers_.find(*account);
+        if (it == subscribers_.end() ||
+            std::none_of(it->second.begin(), it->second.end(), [&](const auto& sub) {
+                return sub.sig_ts >= sig_min && sub.sig_ts <= sig_max;
+            })) {
+            // Nothing left to renew: it is scheduled again if it is subscribed again.
+            release_all(*account, account->swarm);
+            account->next_due = SwarmPubkey::UNSCHEDULED;
+            lapsed++;
+            continue;
+        }
+
+        replace(*account);
+        schedule(*account, now + resubscribe_delay());
+        due++;
+    }
+    if (due || lapsed)
+        log::debug(cat, "{} accounts due for (re)subscription; {} lapsed", due, lapsed);
+
+    if (moved_disagree_) {
+        log::warning(
+                cat,
+                "Nodes moved {} accounts to the swarm we place them in, and {} to another; "
+                "refreshing the swarm list",
+                moved_agree_,
+                moved_disagree_);
+        refresh_sns();
+    } else if (moved_agree_)
+        log::debug(cat, "Nodes moved {} accounts to the swarm we place them in", moved_agree_);
+    moved_total_ += moved_agree_;
+    moved_agree_ = moved_disagree_ = 0;
 
     for (const auto& [pk, snode] : sns_) {
         try {
-            snode->check_subs(subscribers_);
+            send_pending(*snode);
         } catch (const std::exception& e) {
             log::warning(cat, "Failed to check subs on {}: {}", pk, e.what());
         }
@@ -1977,7 +2434,7 @@ void HiveMind::check_subs() {
 void HiveMind::make_conns() {
     assert(loop_.inside());
 
-    for (const auto& [pk, snode] : sns_) {
+    for (const auto& snode : conns_) {
         if (pending_connects_ >= config.max_pending_connects)
             return;
 
@@ -1985,8 +2442,41 @@ void HiveMind::make_conns() {
     }
 }
 
-void HiveMind::check_my_subs(hive::SNode& snode) {
-    snode.check_subs(subscribers_);
+void HiveMind::on_node_connected(hive::SNode& snode, int gen) {
+    if (snode.connection_up(gen))
+        wake(snode);
+}
+
+void HiveMind::send_pending(hive::SNode& snode) {
+    if (!snode.queued && snode.ready_to_send()) {
+        snode.queued = true;
+        send_queue_.push_back(snode.shared_from_this());
+    }
+    dispatch_requests();
+}
+
+void HiveMind::request_finished() {
+    requests_in_flight_--;
+    dispatch_requests();
+}
+
+void HiveMind::dispatch_requests() {
+    if (dispatching_)
+        return;
+    dispatching_ = true;
+    struct Done {
+        bool& flag;
+        ~Done() { flag = false; }
+    } done{dispatching_};
+    while (!hold_dispatch_ && requests_in_flight_ < max_requests_ && !send_queue_.empty()) {
+        auto snode = std::move(send_queue_.front());
+        send_queue_.pop_front();
+        snode->queued = false;
+        if (snode->send_next(subscribers_, [&] { return next_claim(*snode); })) {
+            requests_in_flight_++;
+            monitor_stats_.sent++;
+        }
+    }
 }
 
 void HiveMind::finished_connect() {
@@ -2169,6 +2659,7 @@ WHERE id % {0} = {1})"_format(n, i))) {
             "Done loading saved subscriptions; {} unique subscriptions to {} accounts",
             unique,
             subscribers_.size());
+    subscription_count_ = unique;
 }
 
 bool HiveMind::add_subscription(
@@ -2234,35 +2725,45 @@ RETURNING id, xmax = 0
 
     tx.commit();
 
-    return jq_.call_get([&] {
-        pubkey.update_swarm(swarm_ids_);
+    sub_jq_.call_soon([this, new_sub, pubkey = std::move(pubkey), sub = std::move(sub)]() mutable {
+        auto [it, inserted] = subscribers_.try_emplace(std::move(pubkey));
+        const auto& account = it->first;
+        // Before the first swarm list the account stays unplaced, and reassign_swarms() places it
+        // along with every other.
+        if (inserted && account.update_swarm(swarm_ids_))
+            swarms_[account.swarm].insert(account);
 
-        auto& subscriptions = subscribers_[pubkey];
-        bool found_existing = false;
+        auto& subscriptions = it->second;
+        bool found_existing = false, changed = false;
         for (auto& existing : subscriptions) {
             if (existing.is_same(sub)) {
                 if (sub.is_newer(existing)) {
                     existing.sig = sub.sig;
                     existing.sig_ts = sub.sig_ts;
+                    changed = true;
                 }
                 found_existing = true;
                 break;
             }
         }
-        if (!found_existing)
+        if (!found_existing) {
             subscriptions.push_back(std::move(sub));
+            subscription_count_++;
+            changed = true;
+        }
 
-        // If this is actually adding a new subscription (and not just renewing an
-        // existing one) then we need to force subscription (or resubscription) on all
-        // of the account's swarm members to get the subscription active ASAP.
-        // (Otherwise don't do anything because we already have an equivalent
-        // subscription in place).
-        if (new_sub)
-            for (auto& sn : swarms_[pubkey.swarm])
-                sn->add_account(pubkey, /*force_now=*/true);
-
-        return new_sub;
+        // A new device's subscription, or a new or newly signed one, is placed afresh at once, as
+        // is any for an account with nothing scheduled (its subscriptions had lapsed, or were not
+        // loaded for being about to); a repeat of one already held goes with the account's next
+        // scheduled renewal.
+        if ((new_sub || changed || account.next_due == SwarmPubkey::UNSCHEDULED) &&
+            account.swarm != INVALID_SWARM_ID) {
+            replace(account);
+            schedule(account, system_clock::now() + resubscribe_delay());
+        }
     });
+
+    return new_sub;
 }
 
 /// Removes a subscription for monitoring.  Returns true if the given pubkey was

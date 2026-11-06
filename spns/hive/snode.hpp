@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <iterator>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <oxen/quic/btstream.hpp>
@@ -31,9 +34,26 @@ namespace quic = oxen::quic;
 
 using namespace std::literals;
 
-// Maximum number of simultaneous subscriptions in a single subscription request to a single SN; if
-// we have more than this then we send this many and wait for the response before sending more.
-inline constexpr size_t SUBS_REQUEST_LIMIT = 2000;
+// Maximum number of subscriptions in a single monitor request to a single SN; if we have more than
+// this then we send this many and wait for the response before sending more.  Requests go through
+// the hivemind's cap on those in flight (MONITOR_REQUESTS_IN_FLIGHT), so a bigger one gains
+// nothing, while a small one (some 85 kB) stays well inside the timeout and shares the uplink
+// evenly.
+inline constexpr size_t SUBS_REQUEST_LIMIT = 500;
+
+// A failed or timed out monitor request, and the entries of one that a node could not take for now,
+// are queued again after this long, doubling with each consecutive failure up to the maximum.
+inline constexpr auto RETRY_BACKOFF_MIN = 2s;
+inline constexpr auto RETRY_BACKOFF_MAX = 30s;
+
+// The storage server's per-subscription monitor error codes that are retried, with the node's
+// backoff, as are entries the response leaves unanswered: an account the node does not store, and
+// its not knowing the swarms at all.  Either is the node's (or its oxend's) view of the swarms
+// disagreeing with ours, typically by its being a few seconds behind after a swarm change, and goes
+// on being retried as long as the disagreement lasts.  The other codes reject the subscription
+// itself, which would only be rejected again, and are dropped.
+inline constexpr int MONITOR_WRONG_SWARM = 6;
+inline constexpr int MONITOR_NO_SWARM_INFO = 7;
 
 // How long (in seconds) after a successful subscription before we re-subscribe; each subscription
 // gets a uniform random value between these two values (to spread out the renewal requests a bit).
@@ -49,36 +69,64 @@ inline constexpr std::array CONNECT_COOLDOWN = {10s, 30s, 60s, 120s};
 // fails then we enter the cooldown, above.
 inline constexpr auto RECONNECT_WAIT = 1s;
 
-class SNode {
-    // Class managing a connection to a single service node
+// The hivemind's subscriptions, per account; see HiveMind::subscribers_.
+using Subscribers = std::unordered_map<SwarmPubkey, std::vector<Subscription>>;
+
+class SNode : public std::enable_shared_from_this<SNode> {
+    // Class managing a connection to a single service node, and what is to be subscribed on it.
+    //
+    // Two threads share it, each owning its own members: the hivemind's QUIC loop (jq_) owns the
+    // connection, and its subscription thread (sub_jq_) owns what is to be sent on it.  Each hands
+    // the other work through the other's job queue.
 
     HiveMind& hivemind_;
-    std::shared_ptr<quic::Connection> conn_;
-    quic::RemoteAddress addr_;
-    std::shared_ptr<quic::BTRequestStream> stream_;
-    std::atomic<bool> connected_ = false;
-    std::unordered_set<SwarmPubkey> subs_;
-    uint64_t swarm_;
+
+    // The hivemind's two queues: the QUIC loop's, and the subscription thread's.
+    quic::JobQueue& jq_;
+    quic::JobQueue& sub_jq_;
 
     using system_clock = std::chrono::system_clock;
     using steady_clock = std::chrono::steady_clock;
     using system_time = system_clock::time_point;
     using steady_time = steady_clock::time_point;
-    inline static constexpr system_time system_epoch{};
 
-    // Sorted by next re-subscription time.  We reset the pubkey as a means of lazy deferred queue
-    // entry deletion (when processing the queue, we just skip such entries).
-    std::deque<std::pair<std::optional<SwarmPubkey>, system_time>> next_;
-
+    // Touched only from the QUIC loop (jq_), which owns the connection:
+    std::shared_ptr<quic::Connection> conn_;
+    quic::RemoteAddress addr_;
+    std::shared_ptr<quic::BTRequestStream> stream_;
     std::optional<steady_time> cooldown_until_;
     int cooldown_fails_ = 0;
+    // Incremented as each connection is lost, and handed to the subscription thread with each
+    // connection's events, so that it can tell which connection one is about.
+    int conn_gen_ = 0;
+
+    // Read anywhere, written on the QUIC loop.
+    std::atomic<bool> connected_ = false;
+
+    // Touched only from the subscription thread (sub_jq_):
+    // Whether the subscription thread knows the connection numbered gen_ to be up.
+    bool up_ = false;
+    int gen_ = 0;
+    // Set while a monitor request awaits its reply, holding one of the hivemind's request slots.
+    bool in_flight_ = false;
+    // Set while a failed request's accounts wait out retry_backoff_ to be placed again; nothing is
+    // sent meanwhile.  The backoff is zero after a request that succeeded.
+    bool retry_wait_ = false;
+    std::chrono::milliseconds retry_backoff_{0};
 
   public:
-    const uint64_t& swarm{swarm_};
+    const Ed25519PK pubkey;
 
+    // The node's swarm; subscription thread (sub_jq_) only.  HiveMind changes it, keeping its
+    // swarms_ index in step.
+    uint64_t swarm;
+
+    // Does not connect: the QUIC loop does, by calling connect().
     SNode(HiveMind& hivemind, quic::RemoteAddress addr, uint64_t swarm);
 
     ~SNode() { disconnect(); }
+
+    // --- Called only from the QUIC loop (jq_) ---
 
     /// Checks the given address against the current one: if different, it gets replaced, the
     /// current connection (if any) is disconnected, and then we initiate reconnection to the new
@@ -87,45 +135,119 @@ class SNode {
     /// Does nothing if already connected to the given address.
     void connect(quic::RemoteAddress addr);
 
-    /// Initiates a connection, if not already connected, to the current address.
+    /// Initiates a connection, if not already connected or connecting, and not cooling down after
+    /// failures, to the current address.
     void connect();
-
-    bool connected() { return connected_; }
 
     void disconnect();
 
-    /// Adds a new account to be signed up for subscriptions, if it is not already subscribed.
-    /// The new account's subscription will be submitted to the SS the next time check_subs() is
-    /// called (either automatically or manually).
-    ///
-    /// If `force_now` is True then the account is scheduled for subscription at the next update
-    /// even if already exists.
-    void add_account(const SwarmPubkey& account, bool force_now = false);
+    // --- Callable from any thread ---
 
-    /// Called when this snode's swarm changes; all current subscriptions are dropped.
-    void reset_swarm(uint64_t new_swarm);
+    bool connected() const { return connected_; }
 
-    /// Called when the network swarm list has changed to eject any swarm subscriptions that don't
-    /// belong here anymore.  Any existing subscribers that are no longer in this swarm will be
-    /// removed.  (Even without a swarm change of this node, this can happen if another new swarm is
-    /// created next to us).
-    ///
-    /// This isn't responsible for adding *new* swarm members: this is just called as a first step
-    /// for removing any that shouldn't be here anymore.
-    void remove_stale_swarm_members(const std::vector<uint64_t>& swarm_ids);
+    // --- Called only from the subscription thread (sub_jq_) ---
 
-    /// Check our subscriptions to resubscribe to any that need it.  Takes a reference to hivemind's
-    /// master list of all subscriptions (to be able to pull subscription details from).
-    ///
-    /// This method is *only* called from HiveMind.
-    void check_subs(const std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>>& subs);
+    /// Whether the subscription thread has been told of the node's connection, and not of its
+    /// loss.
+    bool up() const { return up_; }
+
+    /// The node's part in its swarm's placements, kept by the hivemind: its slot (its bit in the
+    /// swarm's accounts' sent and acked masks), or -1 for none; how many of the swarm's accounts
+    /// it claims, always the number with its bit set in either mask; the accounts placed on it,
+    /// to send before anything its scan finds; and its coverage scan (see HiveMind::next_claim).
+    int slot = -1;
+    size_t claimed = 0;
+    std::deque<const SwarmPubkey*> due;
+    struct {
+        // The swarm_space the scan has reached, so that changes to the swarm's members leave its
+        // place alone, and that place's index among them while their generation is unchanged; the
+        // claim count it is looking for, and how far round the swarm it has gone looking for it;
+        // and whether it has found nothing at any count, when it rests until the hivemind wakes it.
+        uint64_t cursor = 0;
+        size_t index = 0;
+        uint64_t generation = UINT64_MAX;
+        int pass = 0;
+        size_t walked = 0;
+        bool done = true;
+    } scan;
+
+    /// Whether the node may have accounts to send and can send a request for them: it has some
+    /// placed on it or its scan has more to look at, it is up, and it is neither awaiting a reply
+    /// nor backing off after a failure.
+    bool ready_to_send() const {
+        return up_ && !in_flight_ && !retry_wait_ && (!due.empty() || !scan.done);
+    }
+
+    /// If ready_to_send(), encodes a monitor request of up to SUBS_REQUEST_LIMIT subscriptions for
+    /// the accounts `next` gives, each claimed for this node, for the QUIC loop to send, and
+    /// returns true; false if `next` gives none.  Called only by the hivemind's dispatcher, which
+    /// counts the request as in flight until the node calls its request_finished().  Takes the
+    /// hivemind's subscriptions to find each account's in.
+    bool send_next(const Subscribers& subs, const std::function<const SwarmPubkey*()>& next);
+
+    /// Whether the node is in the hivemind's dispatch queue, waiting for a request slot.
+    bool queued = false;
+
+    /// Updates the subscription thread's record of whether the node's connection is usable, from
+    /// the QUIC loop's event that the connection with generation number `gen` is up, dropping the
+    /// previous connection's work.  Returns false, changing nothing, if `gen` is already recorded
+    /// as up, so that a duplicate event does not fill the node twice.
+    bool connection_up(int gen);
+
+    /// Updates the subscription thread's record of whether the node's connection is usable, from
+    /// the QUIC loop's event that the connection with generation number `gen` was lost, dropping
+    /// its work.  Ignored unless `gen` is the generation currently recorded as up, so that a late
+    /// loss event for a connection already replaced cannot knock out its successor.
+    void connection_down(int gen);
 
   private:
+    // --- Called only from the QUIC loop (jq_) ---
     void on_connected(quic::Connection& c);
 
     void on_disconnected(quic::Connection& c, uint64_t errcode);
 
     void on_notify(quic::message msg);
+
+    // Lost the connection numbered conn_gen_: tells the subscription thread, and numbers the next.
+    void lost_connection();
+
+    // A reply handler for request(), called on the subscription thread, and only if the reply is
+    // to a request on the connection still up.
+    using ReplyHandler = std::function<void(SNode&, quic::message)>;
+
+    void send_request(
+            int gen,
+            std::string endpoint,
+            std::string body,
+            std::chrono::milliseconds timeout,
+            ReplyHandler on_reply);
+
+    // --- Called only from the subscription thread (sub_jq_) ---
+
+    // Has the QUIC loop send a request on the connection up, if it still is when it gets there.
+    void request(
+            std::string endpoint,
+            std::string body,
+            std::chrono::milliseconds timeout,
+            ReplyHandler on_reply);
+
+    // `entries` holds the account of each subscription in the request, in order: an account
+    // with several subscriptions has several consecutive entries.  An account answered with
+    // success is acknowledged on this node; one refused as not stored by the node's swarm, or for
+    // its not knowing the swarms, or left unanswered, loses its claim here and is placed again
+    // after the backoff (see MONITOR_WRONG_SWARM); one refused otherwise loses its claim.
+    void on_monitor_response(std::vector<const SwarmPubkey*> entries, quic::message response);
+
+    // Clears in_flight_, if set, giving its request slot back to the hivemind.
+    void finish_request();
+
+    // Drops what belonged to the connection that is gone: its claims on its swarm's accounts, as a
+    // new connection's monitors start from nothing, and the request awaiting a reply, which never
+    // comes, so its slot goes back to the in-flight cap; and with them the retry state.
+    void drop_connection_work();
+
+    // Has the hivemind place `accounts` again once the backoff has passed.
+    void retry_later(std::vector<const SwarmPubkey*> accounts);
 };
 
 }  // namespace spns::hive
