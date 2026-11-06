@@ -179,24 +179,18 @@ PYBIND11_MODULE(spns_hivemind, m) {
             .def_readwrite(
                     "monitor_requests",
                     &Config::monitor_requests,
-                    "most monitor requests in flight at once across all nodes; None for the "
-                    "default")
+                    "most monitor requests in flight at once across all nodes; must be positive")
             .def_property(
                     "monitor_timeout",
-                    [](Config& self) -> std::optional<double> {
-                        if (!self.monitor_timeout)
-                            return std::nullopt;
-                        return std::chrono::duration<double>(*self.monitor_timeout).count();
+                    [](Config& self) {
+                        return std::chrono::duration<double>(self.monitor_timeout).count();
                     },
-                    [](Config& self, std::optional<double> seconds) {
-                        if (seconds)
-                            self.monitor_timeout = std::chrono::milliseconds{
-                                    static_cast<int64_t>(*seconds * 1000)};
-                        else
-                            self.monitor_timeout.reset();
+                    [](Config& self, double seconds) {
+                        self.monitor_timeout =
+                                std::chrono::milliseconds{static_cast<int64_t>(seconds * 1000)};
                     },
-                    "seconds a monitor request may go unanswered before it counts as failed; None "
-                    "for the default")
+                    "seconds a monitor request may go unanswered before it counts as failed; must "
+                    "be positive")
             .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,

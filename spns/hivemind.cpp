@@ -1485,7 +1485,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
                 {"accounts", pending},
                 {"nodes", pending_nodes},
                 {"requests", requests_in_flight_},
-                {"request_cap", max_requests_},
+                {"request_cap", config.monitor_requests},
                 {"waiting_nodes", send_queue_.size()}};
         int64_t supported = 0, unsupported = 0;
         for (const auto& [pk, sn] : sns_) {
@@ -2891,7 +2891,7 @@ void HiveMind::log_coverage_progress() {
                 c.accounts ? 100.0 * c.at_target / c.accounts : 100.0,
                 c.at_zero,
                 requests_in_flight_,
-                max_requests_,
+                config.monitor_requests,
                 send_queue_.size());
     coverage_logged_ = c;
 }
@@ -3366,7 +3366,8 @@ void HiveMind::dispatch_requests() {
         bool& flag;
         ~Done() { flag = false; }
     } done{dispatching_};
-    while (!hold_dispatch_ && requests_in_flight_ < max_requests_ && !send_queue_.empty()) {
+    while (!hold_dispatch_ && requests_in_flight_ < config.monitor_requests &&
+           !send_queue_.empty()) {
         auto snode = std::move(send_queue_.front());
         send_queue_.pop_front();
         snode->queued = false;

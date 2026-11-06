@@ -102,25 +102,6 @@ inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
 // register_notifier).
 inline constexpr int NOTIFIER_PROTOCOL_VERSION = 1;
 
-// The most monitor requests in flight at once, across all nodes, unless configured otherwise.
-// Unthrottled, each node sends its next request as soon as its last is answered, so a cold start
-// puts one from every node (some 2,000) on the uplink together, each crawling towards its timeout
-// while it shares the bandwidth with all the others.  Through a cap they go a few at a time at full
-// speed: 64 requests of SUBS_REQUEST_LIMIT subscriptions, some 5 MB in all, keep a fast uplink busy
-// while any one of them is answered quickly.  A node still has at most one in flight.
-inline constexpr int MONITOR_REQUESTS_IN_FLIGHT = 64;
-
-// How long a monitor request may go unanswered before it counts as failed, unless configured
-// otherwise.  libquic fails every outstanding request on a stream as soon as the stream or its
-// connection closes (BTRequestStream::closed()), so a lost connection is noticed at once whatever
-// this is: it governs only a connection that stays open without answering.  Behind a saturated
-// uplink a request queued for a minute is slow, not failed, and failing it only puts its
-// subscriptions back on the backlog, so this is long enough to fire only for a node that is wedged.
-// A wedged node holds one of the MONITOR_REQUESTS_IN_FLIGHT slots this long; its back-off after the
-// failure keeps it from taking another at once, and the cap is large enough that a few such nodes
-// leave plenty for the rest.
-inline constexpr std::chrono::milliseconds MONITOR_TIMEOUT = 10min;
-
 // An account restored from saved state is renewed at the latest this long before its monitors,
 // last renewed when it was last acknowledged, would expire.
 inline constexpr auto RESUME_MARGIN = 5min;
@@ -395,11 +376,10 @@ class HiveMind {
         int64_t replay_discarded = 0, replay_discarded_accounts = 0;
     } monitor_session_stats_;
 
-    // The dispatcher of monitor requests: the nodes waiting for one of the max_requests_ slots, in
-    // the order they asked, so that slots go round the nodes; and how many are taken.
+    // The dispatcher of monitor requests: the nodes waiting for one of the Config::monitor_requests
+    // slots, in the order they asked, so that slots go round the nodes; and how many are taken.
     std::deque<std::shared_ptr<hive::SNode>> send_queue_;
     int requests_in_flight_ = 0;
-    const int max_requests_ = config.monitor_requests.value_or(MONITOR_REQUESTS_IN_FLIGHT);
     // Sends requests for the queued nodes while slots are free, unless held.  Not reentrant: a
     // node building its request queues nodes as it places accounts on them, and they are sent
     // once it is done.
@@ -510,10 +490,6 @@ class HiveMind {
     void defer_request(quic::message&& m, ExcWrapper& callback);
 
   public:
-    // How long a monitor request may go unanswered; see MONITOR_TIMEOUT.
-    const std::chrono::milliseconds monitor_timeout =
-            config.monitor_timeout.value_or(MONITOR_TIMEOUT);
-
     HiveMind(Config conf_);
 
     ~HiveMind();

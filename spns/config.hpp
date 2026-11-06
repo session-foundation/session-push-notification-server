@@ -86,13 +86,25 @@ struct Config {
     // newest, the rest being lost, as push notifications are best effort.
     int resume_replay = 10;
 
-    // The most monitor requests in flight at once, across all nodes, if not the hivemind's default
-    // (MONITOR_REQUESTS_IN_FLIGHT).
-    std::optional<int> monitor_requests;
+    // The most monitor requests in flight at once, across all nodes.  Unthrottled, each node sends
+    // its next request as soon as its last is answered, so a cold start puts one from every node
+    // (some 2,000) on the uplink together, each crawling towards its timeout while it shares the
+    // bandwidth with all the others.  Through a cap they go a few at a time at full speed: 64
+    // requests of 500 subscriptions (hive::SUBS_REQUEST_LIMIT), some 5 MB in all, keep a fast
+    // uplink busy while any one of them is answered quickly.  A node still has at most one in
+    // flight.  Must be positive.
+    int monitor_requests = 64;
 
-    // How long a monitor request may go unanswered, if not the hivemind's default
-    // (MONITOR_TIMEOUT).
-    std::optional<std::chrono::milliseconds> monitor_timeout;
+    // How long a monitor request may go unanswered before it counts as failed.  libquic fails every
+    // outstanding request on a stream as soon as the stream or its connection closes
+    // (BTRequestStream::closed()), so a lost connection is noticed at once whatever this is: it
+    // governs only a connection that stays open without answering.  Behind a saturated uplink a
+    // request queued for a minute is slow, not failed, and failing it only puts its subscriptions
+    // back on the backlog, so this is long enough to fire only for a node that is wedged.  A wedged
+    // node holds one of the monitor_requests slots this long; its back-off after the failure keeps
+    // it from taking another at once, and the cap is large enough that a few such nodes leave
+    // plenty for the rest.  Must be positive.
+    std::chrono::milliseconds monitor_timeout = 10min;
 
     // Maximum connections we will attempt to establish simultaneously (we can have more, we just
     // won't try to open more than this at once until some succeed or fail).  You can set this to 0

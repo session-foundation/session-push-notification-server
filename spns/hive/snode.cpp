@@ -417,7 +417,7 @@ bool SNode::send_next(
     in_flight_ = true;
     request("monitor",
             std::move(req).str(),
-            hivemind_.monitor_timeout,
+            hivemind_.config.monitor_timeout,
             [entries = std::move(entries)](SNode& self, quic::message response) mutable {
                 self.on_monitor_response(std::move(entries), std::move(response));
             });

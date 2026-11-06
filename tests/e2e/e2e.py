@@ -1564,7 +1564,7 @@ def scenario_scale(build_dir):
             f"    every account subscribed on its swarm {time.time() - start:.0f}s after start; "
             f"at most {most} monitor requests in flight at once"
         )
-        # The hivemind's MONITOR_REQUESTS_IN_FLIGHT, which 50 nodes cannot reach.
+        # The default [hivemind] monitor_requests, which 50 nodes cannot reach.
         check(most <= 64, f"{most} monitor requests in flight at once")
     finally:
         rc = s.stop()

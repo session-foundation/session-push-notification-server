@@ -86,7 +86,8 @@ startup_wait = 8.0
 #renewal_interval = 60
 
 # The most monitor (subscription) requests in flight at once across all storage servers, and how
-# many seconds one may go unanswered before it is retried.  The defaults suit production.
+# many seconds one may go unanswered before it is retried; both must be positive.  The defaults,
+# shown here, suit production.
 #monitor_requests = 64
 #monitor_timeout = 600
 

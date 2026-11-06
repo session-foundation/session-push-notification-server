@@ -36,7 +36,7 @@ using namespace std::literals;
 
 // Maximum number of subscriptions in a single monitor request to a single SN; if we have more than
 // this then we send this many and wait for the response before sending more.  Requests go through
-// the hivemind's cap on those in flight (MONITOR_REQUESTS_IN_FLIGHT), so a bigger one gains
+// the hivemind's cap on those in flight (Config::monitor_requests), so a bigger one gains
 // nothing, while a small one (some 85 kB) stays well inside the timeout and shares the uplink
 // evenly.
 inline constexpr size_t SUBS_REQUEST_LIMIT = 500;
