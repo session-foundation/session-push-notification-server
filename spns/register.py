@@ -18,6 +18,7 @@ def subscribe():
         "subaccount_sig": "aGVsbG9...",
         "namespaces": [-400,0,1,2,17],
         "data": true,
+        "truncate": true,
         "sig_ts": 1677520760,
         "signature": "f8efdd120007...",
         "service": "apns",
@@ -40,6 +41,8 @@ def subscribe():
       ascending order.
     - data -- if provided and true then notifications will include the body of the message (as long
       as it isn't too large); if false then the body will not be included in notifications.
+    - truncate -- optional, default false; if true, and `data` is true, a message too large for a
+      notification is sent truncated, instead of omitted.
     - sig_ts -- the signature unix timestamp (seconds, not ms); see below.
     - signature -- the 64-byte Ed25519 signature; see below.
     - service -- the string identifying the notification service, such as "apns" or "firebase".

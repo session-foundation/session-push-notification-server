@@ -28,7 +28,7 @@ endforeach()
 
 # These lists must match FAST and SLOW in e2e.py, which rejects a name it does not know.
 set(e2e_fast correctness burst resend notifier_restart two_notifiers backlog churn shutdown
-    reshuffle restart retry redundancy rebalance)
+    reshuffle restart body_limit retry redundancy rebalance)
 set(e2e_slow stalled_notifier sustained scale)
 
 # Scenarios share ports and the database, so each target runs them in one e2e.py invocation rather

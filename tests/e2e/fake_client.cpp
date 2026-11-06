@@ -8,8 +8,10 @@
 // one line:
 //
 //   account I               the account id of client I, in hex
-//   sub I [COUNT]           subscribe client I to namespace 0, with data, by COUNT identical
-//                           requests in flight together (default 1); "ok" if all succeed
+//   sub I [COUNT] [truncate]
+//                           subscribe client I to namespace 0, with data (and truncated bodies,
+//                           with truncate), by COUNT identical requests in flight together
+//                           (default 1); "ok" if all succeed
 //   unsub I                 unsubscribe client I
 //   drop SVCID              drop the "dummy" registration SVCID
 //   stats                   the hivemind's get_stats, as one line of JSON
@@ -70,10 +72,12 @@ struct Client {
                 {"service_info", {{"token", svcid}}}};
     }
 
-    std::string subscribe_body(int64_t ts) const {
+    std::string subscribe_body(int64_t ts, bool truncate = false) const {
         auto j = base(ts);
         j["namespaces"] = {0};
         j["data"] = true;
+        if (truncate)
+            j["truncate"] = true;
         j["enc_key"] = std::string(64, 'e');
         j["signature"] = sign("MONITOR" + account_hex + std::to_string(ts) + "1" + "0");
         return j.dump();
@@ -139,15 +143,21 @@ int main(int argc, char** argv) {
             std::cout << Client{i}.account_hex << std::endl;
         } else if (cmd == "sub" || cmd == "unsub") {
             int i, count = 1;
+            bool truncate = false;
             in >> i;
             if (cmd == "sub")
-                in >> count;
+                for (std::string arg; in >> arg;) {
+                    if (arg == "truncate")
+                        truncate = true;
+                    else
+                        count = std::stoi(arg);
+                }
             Client c{i};
             bool sub = cmd == "sub";
             std::vector<std::pair<std::string, std::string>> reqs(
                     std::max(count, 1),
                     {sub ? "push.subscribe" : "push.unsubscribe",
-                     sub ? c.subscribe_body(now_s()) : c.unsubscribe_body(now_s())});
+                     sub ? c.subscribe_body(now_s(), truncate) : c.unsubscribe_body(now_s())});
             int ok = requests(reqs);
             std::cout << (ok == (int)reqs.size() ? "ok" : "failed") << std::endl;
         } else if (cmd == "stats") {

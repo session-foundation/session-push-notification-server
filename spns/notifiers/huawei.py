@@ -30,11 +30,6 @@ queue_timer = None
 # is speaking to:
 SPNS_HUAWEI_VERSION = 1
 
-# If our JSON payload hits 4000 bytes then Huawei will reject it, so we limit ourselves to this size
-# *before* encryption + base64 encoding.  If the source message exceeds this, we send an alternative
-# "too big" response in the metadata instead of including the message.
-MAX_MSG_SIZE = 2500
-
 # Firebase max simultaneous notifications:
 MAX_NOTIFIES = 500
 
@@ -68,7 +63,7 @@ def validate(msg: Message):
 def push_notification(msg: Message):
     data = oxenc.bt_deserialize(msg.data()[0])
 
-    enc_payload = encrypt_notify_payload(data, max_msg_size=MAX_MSG_SIZE)
+    enc_payload = encrypt_notify_payload(data)
 
     device_token = data[b"&"].decode()  # unique service id, as we returned from validate
 

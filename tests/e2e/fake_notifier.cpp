@@ -10,7 +10,8 @@
 //   count    {"pushes": N, "unique": N, "duplicates": N, "first_ms": T, "last_ms": T}
 //   dump     one line per push so far: "svcid hash ns body svcdata", body being the length of the
 //            body pushed (0 for none), marked "!" if it is not the start of the body fake_network
-//            makes for that hash; then "end"
+//            makes for that hash, with " full=SIZE" after it for a message over the hivemind's body
+//            limit; then "end"
 //   quit
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/oxenmq.h>
@@ -62,6 +63,7 @@ int main(int argc, char** argv) {
                         std::string svcid{d.require<std::string_view>("&")};
                         d.skip_until("n");
                         auto ns = d.consume_integer<int>();
+                        auto full_size = d.maybe<int64_t>("}");
                         auto body = d.maybe<std::string_view>("~");
                         bool intact = true;
                         if (body)
@@ -79,7 +81,8 @@ int main(int argc, char** argv) {
                             log.push_back(
                                     svcid + ' ' + hash + ' ' + std::to_string(ns) + ' ' +
                                     std::to_string(body ? body->size() : 0) + (intact ? "" : "!") +
-                                    ' ' + (svcdata ? std::string{*svcdata} : "-"));
+                                    ' ' + (svcdata ? std::string{*svcdata} : "-") +
+                                    (full_size ? " full=" + std::to_string(*full_size) : ""));
                     })
             .add_request_command("ack", [](oxenmq::Message& msg) { msg.send_reply(); })
             .add_request_command("validate", [](oxenmq::Message& msg) {

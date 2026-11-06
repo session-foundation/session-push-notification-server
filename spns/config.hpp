@@ -47,6 +47,17 @@ struct Config {
     // have a registered notifier for all of the services in this set.
     std::unordered_set<std::string> notifiers_expected;
 
+    // The most bytes of a message body that reach a device, for subscriptions that want data.
+    // Storage servers are asked to cut bodies to it for the whole of each monitor session; a node
+    // without sessions cannot be, and sends the whole body, which the hivemind then cuts itself.
+    // A bigger message is pushed as its first part, with its full size, to a subscription that
+    // opted in to truncated bodies, and as its size alone to the rest.  2,500 bytes is the most a
+    // body can be and still fit the push services' payload caps once it is encrypted, padded to a
+    // multiple of 256 bytes, base64-encoded and wrapped in their JSON (Huawei rejects a payload
+    // over 4,000 bytes; APNs and FCM, over 4,096), so a larger value makes the services reject the
+    // notifications of bigger messages, and is only for testing.  Must be positive.
+    int64_t monitor_body_limit = 2500;
+
     // How many of its swarm's nodes each account is subscribed on, at most the swarm's size: -1
     // for all of them, or a positive number.  Each node delivers every notification for the
     // accounts it holds, so fewer nodes per account means fewer subscriptions to make and renew,

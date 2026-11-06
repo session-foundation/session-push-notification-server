@@ -110,6 +110,7 @@ HiveMind::HiveMind(Config conf_in) :
             //     "subaccount_sig": "14c7b71f...",
             //     "namespaces": [-400,0,1,2,17],
             //     "data": true,
+            //     "truncate": true,
             //     "sig_ts": 1677520760,
             //     "signature": "f8efdd120007...",
             //     "service": "apns",
@@ -118,6 +119,12 @@ HiveMind::HiveMind(Config conf_in) :
             // }
             //
             // or a JSON array of such objects.
+            //
+            // `truncate` is optional (default false), and matters only with `"data": true`: if
+            // true, a message over the body limit (monitor_body_limit) is pushed cut to the limit,
+            // with its full size, rather than as its size alone.  It is not part of what the
+            // storage servers are asked to monitor, nor of the signature, so a resubscription can
+            // change it.
             //
             // The `service_info` argument is passed along to the underlying notification provider
             // and must contain whatever info is required to send notifications to the device:
@@ -182,19 +189,25 @@ HiveMind::HiveMind(Config conf_in) :
             // notified of an incoming message.  It is a single-part, bencoded dict containing:
             //
             // - '' -- the service name, e.g. b"apns"
-            // - '&' -- the unique service id (as was provided by the validate endpoint).
             // - '!' -- supplemental service data, if the validate request returned any; omitted
             //   otherwise.
-            // - '^' -- the xchacha20-poly1305encryption key the user gave when registering for
-            //   notifications with which the notification payload should be encrypted.
             // - '#' -- the message hash from storage server.
+            // - '&' -- the unique service id (as was provided by the validate endpoint).
             // - '@' -- the account ID (Session ID or closed group ID) to which the message was sent
             //   (33 bytes).
+            // - '^' -- the xchacha20-poly1305encryption key the user gave when registering for
+            //   notifications with which the notification payload should be encrypted.
             // - 'n' -- the swarm namespace to which the message was deposited (-32768 to 32767).
             // - 't' -- the swarm timestamp when the message was created (unix epoch milliseconds).
             // - 'z' -- the message's swarm expiry timestamp (unix epoch milliseconds).
+            // - '}' -- for a registration that requested data, the message's full size in bytes,
+            //   present only when the message is over the hivemind's body limit
+            //   (monitor_body_limit).
             // - '~' -- the encrypted message data; this field will not be present if the
-            //   registration did not request data.
+            //   registration did not request data.  With '}', it is only the message's first part,
+            //   cut to the body limit, and present only if the registration asked for truncated
+            //   bodies; without it, the message is too large to deliver, and the device should be
+            //   told so along with its size.
             //
             // `notifier.ack` is a request command that must reply (with no data) when reached.
             // The hivemind sends one after every PUSH_ACK_INTERVAL pushes and stops sending once
@@ -916,7 +929,10 @@ void HiveMind::process_notifications() {
             std::string_view hash;
             int16_t ns;
             int64_t timestamp_ms, expiry_ms;
+            // The whole body; or, for a message over the body limit, its first part (if any),
+            // with the message's full size in full_size.
             std::optional<std::string_view> data;
+            std::optional<int64_t> full_size;
             Blake2B_32 filt_hash;
         };
         std::vector<Parsed> parsed;
@@ -942,6 +958,9 @@ void HiveMind::process_notifications() {
                     continue;
                 }
                 std::memcpy(account.data(), account_str.data(), account.size());
+
+                // The message's full size, when its body was cut or left out for our body limit.
+                auto full_size = dict.maybe<int64_t>("L");
 
                 if (!dict.skip_until("h")) {
                     log::warning(cat, "Unexpected notification: missing msg hash (h)");
@@ -973,6 +992,14 @@ void HiveMind::process_notifications() {
                 auto expiry_ms = dict.consume_integer<int64_t>();
 
                 auto maybe_data = dict.maybe<std::string_view>("~");
+                // A node without a monitor session has no body limit and sends the whole body: cut
+                // it here as a node with one would, so that every message over the limit is
+                // handled the same way whichever node it came from.
+                if (auto limit = config.monitor_body_limit;
+                    !full_size && maybe_data && maybe_data->size() > (size_t)limit) {
+                    full_size = maybe_data->size();
+                    maybe_data = maybe_data->substr(0, limit);
+                }
 
                 log::trace(
                         cat,
@@ -994,15 +1021,22 @@ void HiveMind::process_notifications() {
                 }
 
                 parsed.push_back(
-                        {account, hash, ns, timestamp_ms, expiry_ms, maybe_data, filt_hash});
+                        {account,
+                         hash,
+                         ns,
+                         timestamp_ms,
+                         expiry_ms,
+                         maybe_data,
+                         full_size,
+                         filt_hash});
             } catch (const std::exception& e) {
                 log::warning(cat, "Failed to process incoming notification: {}", e.what());
                 continue;
             }
         }
 
-        // {account: [(service, svcid, svcdata, enc_key, want_data, namespaces)...]} for every
-        // account in the batch, from one query per SUBSCRIPTION_LOOKUP_BATCH accounts.
+        // {account: [(service, svcid, svcdata, enc_key, want_data, want_truncated, namespaces)...]}
+        // for every account in the batch, from one query per SUBSCRIPTION_LOOKUP_BATCH accounts.
         std::unordered_map<
                 AccountID,
                 std::vector<std::tuple<
@@ -1010,6 +1044,7 @@ void HiveMind::process_notifications() {
                         std::string,
                         std::vector<std::byte>,
                         EncKey,
+                        bool,
                         bool,
                         std::vector<int16_t>>>>
                 subs;
@@ -1031,17 +1066,25 @@ void HiveMind::process_notifications() {
                 }
                 for (auto row : tx.exec(
                              R"(
-SELECT account, service, svcid, svcdata, enc_key, want_data,
+SELECT account, service, svcid, svcdata, enc_key, want_data, want_truncated,
     ARRAY(SELECT namespace FROM sub_namespaces WHERE subscription = id ORDER BY namespace)
 FROM subscriptions
 WHERE account IN ({}))"_format(placeholders),
                              params)) {
-                    auto [account, service, svcid, svcdata, enc_key, want_data, ns_arr] =
+                    auto [account,
+                          service,
+                          svcid,
+                          svcdata,
+                          enc_key,
+                          want_data,
+                          want_truncated,
+                          ns_arr] =
                             row.as<AccountID,
                                    std::string,
                                    std::string,
                                    std::optional<std::vector<std::byte>>,
                                    EncKey,
+                                   bool,
                                    bool,
                                    pqxx::array<int16_t>>();
                     subs[account].emplace_back(
@@ -1050,6 +1093,7 @@ WHERE account IN ({}))"_format(placeholders),
                             svcdata ? std::move(*svcdata) : std::vector<std::byte>{},
                             enc_key,
                             want_data,
+                            want_truncated,
                             std::vector<int16_t>{ns_arr.begin(), ns_arr.end()});
                 }
             }
@@ -1077,7 +1121,7 @@ WHERE account IN ({}))"_format(placeholders),
 
         size_t notify_count = 0;
 
-        for (const auto& [account, hash, ns, timestamp_ms, expiry_ms, maybe_data, filt_hash] :
+        for (const auto& [account, hash, ns, timestamp_ms, expiry_ms, data, full_size, filt_hash] :
              parsed) {
             auto subs_it = subs.find(account);
             if (subs_it == subs.end() || subs_it->second.empty()) {
@@ -1085,7 +1129,7 @@ WHERE account IN ({}))"_format(placeholders),
                 continue;
             }
 
-            for (const auto& [service, svcid, svcdata, enc_key, want_data, namespaces] :
+            for (const auto& [service, svcid, svcdata, enc_key, want_data, trunc_ok, namespaces] :
                  subs_it->second) {
                 if (!std::binary_search(namespaces.begin(), namespaces.end(), ns))
                     continue;
@@ -1109,8 +1153,9 @@ WHERE account IN ({}))"_format(placeholders),
                                      3 + 8 +                  // 1:n i-32768e
                                      3 + 15 +                 // 1:t i1695078498534e (timestamp)
                                      3 + 15 +                 // 1:t i1695078498534e (expiry)
+                                     3 + 21 +                 // 1:} i76800e
                                      (svcdata.empty() ? 0 : 3 + 21 + svcdata.size()) +
-                                     (want_data && maybe_data ? 3 + 21 + maybe_data->size() : 0);
+                                     (want_data && data ? 3 + 21 + data->size() : 0);
 
                 if (buf.size() < size_needed)
                     buf.resize(size_needed);
@@ -1129,8 +1174,12 @@ WHERE account IN ({}))"_format(placeholders),
                     dict.append("n", ns);
                     dict.append("t", timestamp_ms);
                     dict.append("z", expiry_ms);
-                    if (want_data && maybe_data)
-                        dict.append("~", *maybe_data);
+                    if (want_data) {
+                        if (full_size)
+                            dict.append("}", *full_size);
+                        if (data && (!full_size || trunc_ok))
+                            dict.append("~", *data);
+                    }
                 } catch (const std::exception& e) {
                     log::critical(cat, "failed to build notifier message: bad size estimation?");
                     continue;
@@ -1517,6 +1566,7 @@ void HiveMind::on_notifier_validation(
         const SwarmPubkey& pubkey,
         std::shared_ptr<hive::Subscription> sub,
         const std::optional<EncKey>& enc_key,
+        bool want_truncated,
         std::vector<std::string> data,
         const std::optional<UnsubData>& unsub) {
 
@@ -1574,6 +1624,7 @@ void HiveMind::on_notifier_validation(
                         std::move(service_id),
                         std::move(service_data),
                         *enc_key,
+                        want_truncated,
                         std::move(*sub));
 
                 response[newsub ? "added" : "updated"] = true;
@@ -1760,6 +1811,9 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
             if (subscribe) {
                 auto enc_key = from_hex_or_b64<EncKey>(at(e, "enc_key").get<std::string_view>());
                 auto namespaces = at(e, "namespaces").get<std::vector<int16_t>>();
+                bool want_truncated = false;
+                if (auto it = e.find("truncate"); it != e.end())
+                    want_truncated = it->get<bool>();
 
                 reply_handler = [this,
                                  response,
@@ -1777,6 +1831,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                                          std::move(sig)),
                                  pubkey = pubkey,
                                  enc_key = std::move(enc_key),
+                                 want_truncated,
                                  replier](bool success, std::vector<std::string> data) mutable {
                     on_notifier_validation(
                             *response,
@@ -1789,6 +1844,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(pubkey),
                             std::move(sub),
                             std::move(enc_key),
+                            want_truncated,
                             std::move(data));
                 };
             } else {
@@ -1814,6 +1870,7 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
                             std::move(pubkey),
                             nullptr,
                             std::nullopt,
+                            false,
                             std::move(data),
                             std::move(unsub));
                 };
@@ -3246,6 +3303,7 @@ bool HiveMind::add_subscription(
         std::string service_id,
         std::optional<std::string> service_data,
         EncKey enc_key,
+        bool want_truncated,
         hive::Subscription sub) {
 
     auto conn = pool_.get();
@@ -3256,13 +3314,13 @@ bool HiveMind::add_subscription(
     auto [id, new_sub] = tx.query1<int64_t, bool>(
             R"(
 INSERT INTO subscriptions
-    (account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data, enc_key, service, svcid, svcdata)
-VALUES ($1,   $2,              $3,             $4,             $5,        $6,           $7,        $8,      $9,      $10,   $11)
+    (account, session_ed25519, subaccount_tag, subaccount_sig, signature, signature_ts, want_data, want_truncated, enc_key, service, svcid, svcdata)
+VALUES ($1,   $2,              $3,             $4,             $5,        $6,           $7,        $8,             $9,      $10,     $11,   $12)
 ON CONFLICT (account, service, svcid) DO UPDATE
 SET session_ed25519 = EXCLUDED.session_ed25519, subaccount_tag = EXCLUDED.subaccount_tag,
     subaccount_sig = EXCLUDED.subaccount_sig, signature = EXCLUDED.signature,
     signature_ts = EXCLUDED.signature_ts, want_data = EXCLUDED.want_data,
-    enc_key = EXCLUDED.enc_key, svcdata = EXCLUDED.svcdata
+    want_truncated = EXCLUDED.want_truncated, enc_key = EXCLUDED.enc_key, svcdata = EXCLUDED.svcdata
 RETURNING id, xmax = 0
             )",
             {pubkey.id,
@@ -3272,6 +3330,7 @@ RETURNING id, xmax = 0
              sub.sig,
              sub.sig_ts.time_since_epoch().count(),
              sub.want_data,
+             want_truncated,
              enc_key,
              service,
              service_id,

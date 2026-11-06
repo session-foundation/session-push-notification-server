@@ -5,7 +5,7 @@ notifier and a fake subscribing client. CI (`.woodpecker/build.star`) runs the f
 every event and the slow ones on pushes, tags, manual and cron runs.
 
 Every scenario runs twice: against storage nodes without monitor sessions, as today's network is
-(`legacy`: `monitor_session` is an unknown endpoint), and against nodes with them
+(`legacy`: `monitor_session` is an unknown endpoint, `b` is ignored), and against nodes with them
 (`monitor`). `E2E_ARGS="--mode legacy"` (or `monitor`) runs one.
 
 ```
@@ -58,6 +58,7 @@ Fast:
 | `shutdown` | SIGTERM mid-burst with pushes held back exits cleanly |
 | `reshuffle` | 8 nodes go from 2 swarms to 4: the accounts that moved are subscribed on their new swarm's nodes, and nothing is sent to a node not of an account's swarm, then or after every connection is dropped and made again; then to 8, with one node 5 seconds behind: what it refuses meanwhile is subscribed once it catches up |
 | `restart` | the hivemind restarts while 100 notifications arrive: with monitor sessions it restores its saved placements, the nodes resume their sessions without listing their monitors and replay the gap, and nothing is subscribed again; with more notifications for an account than the replay budget, only its newest are replayed, in order, and the rest reported discarded; a reconnection while it runs resumes every session without its listing, and sends nothing; when every node's answer to a resumption is lost, the hivemind forgets the dead tokens, its next connections start new sessions and place everything again, and the gap is lost; after a split while it is down, the nodes that stayed resume so and the moved accounts are subscribed in their new swarm; from saved state too old to trust, every node starts afresh; without monitor sessions, the gap is lost and everything is subscribed again |
+| `body_limit` | monitor sessions carry the body limit `b`, and a message over it is cut to it, by the node with monitor sessions, live and in the replay after a hivemind restart, and by the hivemind without: a subscription that opted in to truncated bodies gets the exact prefix and the full size, any other the full size alone, and a message within the limit reaches both whole |
 | `retry` | one node stalls a monitor request until it times out, one fails one, one refuses every entry of one: all end up fully subscribed within a timeout of startup |
 | `redundancy` | with redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes within a request's worth of each other; a node that leaves has its accounts back on 3 nodes from the others' scans |
 | `rebalance` | with redundancy 3 and 10s renewals, a node that joins a swarm already covered takes its share as the accounts are renewed |
@@ -89,7 +90,7 @@ Docker's seccomp filter, which refuses the `setarch -R` it needs.
   nodes between swarms, drop connections, fail requests, and report what each node holds and has
   been sent; it also measures each stream's unsent bytes.
 - `fake_notifier`: registers as the `dummy` notifier, accepts any `service_info.token` as the
-  service id, answers `notifier.ack`, and records every push.
+  service id, answers `notifier.ack`, and records every push, with its `L` if it has one.
 - `fake_client`: signs subscribe and unsubscribe requests for deterministic `05` accounts.
 
 Each reads commands on stdin and answers on stdout; the comment at the top of each file lists them.

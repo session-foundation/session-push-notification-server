@@ -1154,6 +1154,94 @@ def scenario_restart(build_dir):
     check_log(s.hivemind)
 
 
+def scenario_body_limit(build_dir):
+    """A message over the body limit of 2500 bytes is cut to the limit: with monitor sessions by
+    the node, whose sessions carry the limit, live and in the replay after a hivemind restart;
+    without, by the hivemind, from the whole body the node sends.  A subscription that opted in to
+    truncated bodies gets the exact first 2500 bytes with the full size; any other, the full size
+    alone; and a message within the limit reaches both whole."""
+    fresh_db()
+    seed(0, 10)
+    s = Setup(build_dir, nodes=3)
+    try:
+        sub = s.wait_subscribed(0, 10, 60)
+        print(f"    {sub['with_b']} of {sub['monitors']} monitors have a body limit")
+        # Only a monitor session can carry the limit.
+        want_b = sub["monitors"] if MODE == "monitor" else 0
+        check(sub["with_b"] == want_b, f"expected {want_b} monitors with a body limit: {sub}")
+
+        # Client 3 opts in, then resubscribes without: the flag follows the latest subscription.
+        client = s.client_proc()
+        for cmd in ("sub 1 truncate", "sub 2", "sub 3 truncate", "sub 3"):
+            check(client.cmd(cmd) == "ok", f"{cmd} failed")
+        truncated = {
+            i: query1(
+                f"SELECT want_truncated FROM subscriptions WHERE svcid = '{client_svcid(i)}'"
+            )
+            for i in (1, 2, 3)
+        }
+        check(truncated == {1: True, 2: False, 3: False}, f"stored truncate flags: {truncated}")
+        time.sleep(2 * TIME_SCALE)
+
+        sizes = {1: 2000, 2: 2500, 3: 3000}
+        for i, size in sizes.items():
+            s.network.cmd(f"send #{i} limit-{size}-aaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 {size}")
+        for i in (1, 2, 3):
+            acct = client.cmd(f"account {i}")
+            for size in (2000, 3000):
+                s.network.cmd(f"send {acct} limit-c{i}-{size}-aaaaaaaaaaaaaaaaaaaaaaaaa 0 {size}")
+        want_pushes = len(sizes) + 6
+        c = s.wait_pushes(want_pushes, 30)
+        check(c["pushes"] == want_pushes, f"expected {want_pushes} pushes, got {c}")
+        got = sorted(s.dump())
+        want = [
+            f"{svcid(1)} limit-2000-aaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 2000 -",
+            f"{svcid(2)} limit-2500-aaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 2500 -",
+            f"{svcid(3)} limit-3000-aaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 - full=3000",
+            f"{client_svcid(1)} limit-c1-2000-aaaaaaaaaaaaaaaaaaaaaaaaa 0 2000 -",
+            f"{client_svcid(1)} limit-c1-3000-aaaaaaaaaaaaaaaaaaaaaaaaa 0 2500 - full=3000",
+        ] + [
+            line
+            for i in (2, 3)
+            for line in (
+                f"{client_svcid(i)} limit-c{i}-2000-aaaaaaaaaaaaaaaaaaaaaaaaa 0 2000 -",
+                f"{client_svcid(i)} limit-c{i}-3000-aaaaaaaaaaaaaaaaaaaaaaaaa 0 0 - full=3000",
+            )
+        ]
+        check(got == sorted(want), f"pushes: {got}")
+
+        if MODE == "monitor":
+            # Sent while the hivemind is down, so replayed by the nodes on resuming its sessions.
+            accts = {i: client.cmd(f"account {i}") for i in (1, 2)}
+            steps = s.restart_hivemind("hivemind-replay")
+            next(steps)
+            s.network.cmd("send #3 replay-3000-aaaaaaaaaaaaaaaaaaaaaaaaaaa 0 3000")
+            for i, acct in accts.items():
+                for size in (2000, 3000):
+                    s.network.cmd(f"send {acct} replay-c{i}-{size}-aaaaaaaaaaaaaaaaaaaaaa 0 {size}")
+            next(steps, None)
+            c = s.wait_pushes(5, 30)
+            n = s.net_counts()
+            check(n["resumed"] == 3, f"monitor sessions not resumed: {n}")
+            check(c["pushes"] == 5, f"expected 5 replayed pushes, got {c}")
+            got = sorted(s.dump())
+            want = [
+                f"{svcid(3)} replay-3000-aaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 - full=3000",
+                f"{client_svcid(1)} replay-c1-2000-aaaaaaaaaaaaaaaaaaaaaa 0 2000 -",
+                f"{client_svcid(1)} replay-c1-3000-aaaaaaaaaaaaaaaaaaaaaa 0 2500 - full=3000",
+                f"{client_svcid(2)} replay-c2-2000-aaaaaaaaaaaaaaaaaaaaaa 0 2000 -",
+                f"{client_svcid(2)} replay-c2-3000-aaaaaaaaaaaaaaaaaaaaaa 0 0 - full=3000",
+            ]
+            check(got == sorted(want), f"replayed pushes: {got}")
+            print("    after a restart, the nodes' replay cut to the limit as live delivery is")
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    for hm in s.stopped:
+        check_log(hm)
+    check_log(s.hivemind)
+
+
 def scenario_redundancy(build_dir):
     """With redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes each
     holding within a request's worth of the others; when a node leaves the network, its
@@ -1418,6 +1506,7 @@ FAST = [
     "shutdown",
     "reshuffle",
     "restart",
+    "body_limit",
     "retry",
     "redundancy",
     "rebalance",

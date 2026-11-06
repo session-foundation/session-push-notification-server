@@ -140,6 +140,14 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     "the `notifier_wait` time early once we have registered notifiers for all the "
                     "values set here.")
             .def_readwrite(
+                    "monitor_body_limit",
+                    &Config::monitor_body_limit,
+                    "most bytes of a message body that reach a device, for subscriptions that want "
+                    "data; a bigger message is pushed cut to this, with its full size, to "
+                    "subscriptions that opted in to truncated bodies, and as its size alone to the "
+                    "rest.  Must be positive; the default of 2500 is the most the push services "
+                    "accept once the body is encrypted and encoded, and larger is only for testing.")
+            .def_readwrite(
                     "redundancy",
                     &Config::redundancy,
                     "how many of its swarm's nodes each account is subscribed on, at most the "

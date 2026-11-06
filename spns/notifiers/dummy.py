@@ -59,8 +59,14 @@ def validate(msg: Message):
 @warn_on_except
 def push_notification(msg: Message):
     data = oxenc.bt_deserialize(msg.data()[0])
+    if b"}" in data:
+        body = f"{len(data[b'~'])}B of {data[b'}']}B" if b"~" in data else f"too large: {data[b'}']}B"
+    elif b"~" in data:
+        body = f"{len(data[b'~'])}B"
+    else:
+        body = "no data"
     logger.critical(
-        f"Dummy notifier received push for {data[b'&']}, enc_key {data[b'^']}, message hash {data[b'#']} ({len(data[b'~'])}B) for account {data[b'@'].hex()}/{data[b'n']}"
+        f"Dummy notifier received push for {data[b'&']}, enc_key {data[b'^']}, message hash {data[b'#']} ({body}) for account {data[b'@'].hex()}/{data[b'n']}"
     )
     global stats_lock, notifies
     with stats_lock:

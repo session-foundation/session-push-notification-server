@@ -36,17 +36,19 @@ def encrypt_payload(msg: bytes, enc_key: bytes):
     return nonce + ciphertext
 
 
-def encrypt_notify_payload(data: dict, max_msg_size: int = 2500, broken_nobody_hack: bool = False):
+def encrypt_notify_payload(data: dict, broken_nobody_hack: bool = False):
     enc_key = data[b"^"]
 
     metadata = {"@": data[b"@"].hex(), "#": data[b"#"].decode(), "n": data[b"n"], "t": data[b"t"], "z": data[b"z"]}
     body = data.get(b"~")
 
-    if body:
-        metadata["l"] = len(body)
-        if max_msg_size >= 0 and len(body) > max_msg_size:
+    if b"}" in data:
+        # The message is over the hivemind's body limit: any body is only its first part.
+        metadata["l"] = data[b"}"]
+        if not body:
             metadata["B"] = True
-            body = None
+    elif body:
+        metadata["l"] = len(body)
 
     metadata_json = json.dumps(metadata)
     payload = bt_serialize([metadata_json, body] if body else [metadata if broken_nobody_hack else metadata_json])

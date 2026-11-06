@@ -534,6 +534,7 @@ class HiveMind {
             const SwarmPubkey& pubkey,
             std::shared_ptr<hive::Subscription> sub,
             const std::optional<EncKey>& enc_key,
+            bool want_truncated,
             std::vector<std::string> data,
             const std::optional<UnsubData>& unsub = std::nullopt);
 
@@ -692,6 +693,8 @@ class HiveMind {
     ///   and contains any extra data (beyond just the service_id) needed for the
     ///   service handler to send the notification to the device.
     /// - enc_key this user's 32-byte encryption key for pushed notifications
+    /// - want_truncated -- whether a message over the body limit is pushed as its first part,
+    ///   rather than as its size alone, if the subscription wants data
     /// - sub -- the subscription to add
     bool add_subscription(
             SwarmPubkey pubkey,
@@ -699,6 +702,7 @@ class HiveMind {
             std::string service_id,
             std::optional<std::string> service_data,
             EncKey enc_key,
+            bool want_truncated,
             hive::Subscription sub);
 
     /// Removes a subscription for monitoring.  Returns true if the given pubkey was

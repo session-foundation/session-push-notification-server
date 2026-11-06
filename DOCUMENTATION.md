@@ -14,6 +14,7 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
             "subkey_tag": "def789...",
             "namespaces": [-400,0,1,2,17],
             "data": true,
+            "truncate": true,
             "sig_ts": 1677520760,
             "signature": "f8efdd120007...",
             "service": "apns",
@@ -34,6 +35,8 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
       ascending order.
     - `data` -- if provided and true then notifications will include the body of the message (as long
       as it isn't too large); if false then the body will not be included in notifications.
+    - `truncate` -- optional, default false; if true, and `data` is true, a message too large for a
+      notification is sent truncated, with a body shorter than its `l`, instead of omitted with `B`.
     - `sig_ts` -- the signature unix timestamp (seconds, not ms); see below.
     - `signature` -- the 64-byte Ed25519 signature; see below.
     - `service` -- the string identifying the notification service, such as "apns" or "firebase".
@@ -116,19 +119,22 @@ via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b6
     "@" - the session ID (hex)
     "#" - the storage server message hash
     "n" - the namespace (integer)
-    "l" - the byte length of the message data
+    "l" - the byte length of the message data: the message's full length, even when the data
+          included is only its first part, or is omitted as too long
     "B" - will be present and set to true if the message data was too long for inclusion in the
           notification, omitted otherwise.
 
     Both "l" and "B" will be omitted if the subscription opted out of data (i.e. if it passed
     `"data": false).
 
-  - Assuming the user subscribed to message data and the data is not too long (2.5kB, since we also
-    have to go through base64 encoding after encryption and still end up <4kB), the message data
-    will then be included as bytes as the second element of the enc_payload bt-encoded list.
+  - Assuming the user subscribed to message data and the data is not too long (the hivemind's limit
+    of 2.5kB, the most that still fits the push services' 4kB payload cap once it is encrypted and
+    base64-encoded), the message data will then be included as bytes as the second element of the
+    enc_payload bt-encoded list.  If the subscription set `truncate`, a message over the limit is
+    delivered as a prefix, and `l` is the full length, so a body shorter than `l` is truncated.
 
-    (If the user didn't want data, or the data was too big, then the enc_payload will only have the
-    metadata object).
+    (If the user didn't want data, or the data was too big and the subscription did not set
+    `truncate`, then the enc_payload will only have the metadata object).
 
 - For Android, the subscription request uses `"service": "firebase"`, and the request data is the
   same as iOS except with the Apple-specific `"aps"` key omitted (that is: it has the `enc_payload`

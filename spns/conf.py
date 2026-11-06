@@ -92,6 +92,11 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
         "hivemind": {
             "subs_interval": ("subs_interval", None, int),
             "max_connects": ("max_pending_connects", None, int),
+            "body_limit": (
+                "monitor_body_limit",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) > 0,
+                int,
+            ),
             "redundancy": (
                 "redundancy",
                 lambda x: re.fullmatch(r"\s*(-1|\d+)\s*", x) and int(x) != 0,

@@ -257,6 +257,9 @@ void SNode::start_monitor_session(const std::optional<MonitorToken>& token) {
     assert(sub_jq_.inside());
     handshake_ = true;
     oxenc::bt_dict_producer req;
+    // The body limit is the session's, so creation and every resume state it.  A node without
+    // sessions cannot be limited: it sends whole bodies, which the hivemind cuts itself.
+    req.append("b", hivemind_.config.monitor_body_limit);
     if (token)
         req.append("l", 0);
     req.append("m", hivemind_.config.resume_replay);

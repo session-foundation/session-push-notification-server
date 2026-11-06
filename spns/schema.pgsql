@@ -8,6 +8,8 @@ CREATE TABLE subscriptions (
     signature BYTEA NOT NULL,     -- subscription authentication signature (for swarm)
     signature_ts BIGINT NOT NULL, -- unix timestamp of the auth signature (for swarm)
     want_data BOOLEAN NOT NULL,   -- whether the client wants msg data included in the notification
+    want_truncated BOOLEAN NOT NULL DEFAULT FALSE, -- with want_data, whether a message over the
+                                  -- body limit is sent cut to it, rather than as its size alone
     enc_key BYTEA NOT NULL,       -- encryption key with which we encrypt the payload
     service VARCHAR NOT NULL,     -- subscription service type ("apns", "firebase")
     svcid VARCHAR NOT NULL,       -- unique device/app identifier

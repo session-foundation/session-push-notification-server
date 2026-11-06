@@ -19,9 +19,11 @@
 // protocol (the token the only credential, and only the latest one issued valid, the session's
 // monitors listed on resume, or only its ended ones with "l" at 0, missed notifications recorded
 // while it is detached, at most "m" per account, the newest, and replayed after the reply, which
-// reports the discards), and give "x" in replies; without, they model today's network:
-// monitor_session is an unknown endpoint, and there is no "x".  When a swarm change takes an
-// account from a node, its monitors there end, with a monitor_ended to a connection bound to them.
+// reports the discards), cut the bodies they send for a monitor session to its "b", with "L", and
+// give "x" in replies; without, they model today's network: monitor_session is an unknown endpoint,
+// and there is no "x".  A "b" on a monitor entry is ignored, and monitors on a connection without a
+// session get whole bodies.  When a swarm change takes an account from a node, its monitors there
+// end, with a monitor_ended to a connection bound to them.
 //
 // Every notification is sent by each of the first SENDERS nodes (default: all), to the newest
 // connection to it, as every member of a real swarm would; the hivemind does not check which node
@@ -63,9 +65,11 @@
 //                                       as a node behind oxend's does
 //   check FIRST COUNT                   whether accounts #FIRST.. are subscribed on exactly the
 //                                       nodes of their swarm: {"expected": E, "missing": M,
-//                                       "extra": X, "monitors": T}, E being the (account, node)
-//                                       pairs wanted, M those without a monitor, X the monitors of
-//                                       any account on a node not of its swarm, T all monitors
+//                                       "extra": X, "with_b": B, "monitors": T}, E being the
+//                                       (account, node) pairs wanted, M those without a monitor, X
+//                                       the monitors of any account on a node not of its swarm, B
+//                                       the data monitors in sessions with a body limit, T all
+//                                       monitors
 //   counts                              {"requests": R, "entries": E, "wrong_swarm": W, "created":
 //                                       C, "resumed": S, "resumed_unlisted": U, "listed": L,
 //                                       "missed": M}: monitor requests and subscriptions received
@@ -205,8 +209,8 @@ struct Note {
     size_t body;
 };
 
-// The first `len` bytes of a message's body: its hash, repeated, so that whoever receives a body
-// (fake_notifier) can tell that it is the start of that message's.
+// The first `len` bytes of a message's body: its hash, repeated, so that whoever receives a cut
+// body (fake_notifier) can tell that it is the start of that message's.
 std::string body_of(const Note& n, size_t len) {
     std::string b(len, '\0');
     for (size_t k = 0; k < len; ++k)
@@ -254,15 +258,21 @@ Delivery delivery(const std::vector<Monitor>& mons, int ns, steady_clock::time_p
     return d;
 }
 
-std::string notification(const Note& n, bool data) {
+std::string notification(const Note& n, bool data, std::optional<int64_t> b) {
     oxenc::bt_dict_producer d;
     d.append("@", n.account);
+    size_t body = data ? n.body : 0;
+    if (data && b && n.body > (size_t)*b) {
+        d.append("L", n.body);
+        body = *b;
+    } else if (data && b && *b == 0)
+        d.append("L", n.body);
     d.append("h", n.hash);
     d.append("n", n.ns);
     d.append("t", n.t);
     d.append("z", n.z);
-    if (data && n.body)
-        d.append("~", body_of(n, n.body));
+    if (body)
+        d.append("~", body_of(n, body));
     return std::move(d).str();
 }
 
@@ -276,6 +286,9 @@ struct MonitorSession {
     std::optional<quic::ConnectionID> bound;
     std::deque<Missed> missed;
     int64_t overflow = 0;
+    // The most bytes of a body sent for the session (the request's b; none if unset), live and on
+    // replay alike.
+    std::optional<int64_t> body_limit;
     // The most missed notifications kept per account (the request's m), and how many each
     // account has had discarded beyond it since the session's last answer.
     std::optional<int64_t> budget;
@@ -548,9 +561,12 @@ int main(int argc, char** argv) {
         std::optional<std::string> t;
         // Without the listing (l = 0), a resumed session's answer lists only its ended monitors.
         bool listing = true;
-        std::optional<int64_t> budget;
+        std::optional<int64_t> budget, body_limit;
         try {
             oxenc::bt_dict_consumer d{m.body()};
+            body_limit = d.maybe<int64_t>("b");
+            if (body_limit && *body_limit < 0)
+                throw std::invalid_argument{"b must not be negative"};
             listing = d.maybe<int>("l").value_or(1) != 0;
             budget = d.maybe<int64_t>("m");
             if (budget && *budget < 1)
@@ -592,6 +608,7 @@ int main(int argc, char** argv) {
         randombytes_buf(token.data(), token.size());
         sess.bound = rid;
         sess.budget = budget;
+        sess.body_limit = body_limit;
         conn.monitor_session = token;
 
         oxenc::bt_dict_producer reply;
@@ -652,12 +669,13 @@ int main(int argc, char** argv) {
             m.respond(std::move(reply).str());
 
         // After the reply, on the same stream, with the data flag each message's monitors had when
-        // it arrived; messages expired since are skipped.
+        // it arrived, cut to the limit this request set; messages expired since are skipped.
         auto ms = now_ms();
         if (!lost)
             for (auto& missed : sess.missed)
                 if (missed.note.z >= ms)
-                    conn.stream->command("notify", notification(missed.note, missed.data));
+                    conn.stream->command(
+                            "notify", notification(missed.note, missed.data, sess.body_limit));
         sess.missed.clear();
         sess.overflow = 0;
         node.monitor_sessions.emplace(token, std::move(sess));
@@ -838,10 +856,13 @@ int main(int argc, char** argv) {
         auto& conn = node.conns.at(*node.current);
         auto& mons = node.monitors_of(conn);
         if (auto it = mons.find(note.account); it != mons.end()) {
+            auto limit = conn.monitor_session.empty()
+                               ? std::nullopt
+                               : node.monitor_sessions.at(conn.monitor_session).body_limit;
             if (auto d = delivery(it->second, note.ns, now); d.send)
-                conn.stream->command("notify", notification(note, d.data));
+                conn.stream->command("notify", notification(note, d.data, limit));
         } else
-            conn.stream->command("notify", notification(note, true));
+            conn.stream->command("notify", notification(note, true, std::nullopt));
     };
 
     // Sends the same notification from every sending node.
@@ -1005,7 +1026,7 @@ int main(int argc, char** argv) {
                             return true;
                     return false;
                 };
-                int64_t expected = 0, missing = 0, extra = 0, monitors = 0;
+                int64_t expected = 0, missing = 0, extra = 0, with_b = 0, monitors = 0;
                 for (uint32_t i = first; i < first + count; i++) {
                     auto account = indexed_account(i);
                     auto sw = swarm_for(swarm_ids, account);
@@ -1015,24 +1036,26 @@ int main(int argc, char** argv) {
                             missing += !live_on(node, account);
                         }
                 }
-                auto count_mons = [&](Node& node, const Monitors& mons) {
+                auto count_mons = [&](Node& node, const Monitors& mons, bool limited) {
                     for (auto& [account, ms] : mons)
                         for (auto& mon : ms)
                             if (mon.live(now)) {
                                 monitors++;
+                                with_b += mon.data && limited;
                                 extra += swarm_for(swarm_ids, account) != node.swarm;
                             }
                 };
                 for (auto& node : nodes) {
                     for (auto& [token, sess] : node.monitor_sessions)
-                        count_mons(node, sess.monitors);
+                        count_mons(node, sess.monitors, sess.body_limit.has_value());
                     for (auto& [rid, conn] : node.conns)
-                        count_mons(node, conn.monitors);
+                        count_mons(node, conn.monitors, false);
                 }
                 return nlohmann::json{
                         {"expected", expected},
                         {"missing", missing},
                         {"extra", extra},
+                        {"with_b", with_b},
                         {"monitors", monitors}}
                         .dump();
             }) << std::endl;
