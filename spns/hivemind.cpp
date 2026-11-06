@@ -1344,7 +1344,7 @@ static nlohmann::json seconds_since(const std::optional<steady_time>& t, steady_
     return std::chrono::duration<double>(now - *t).count();
 }
 
-void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
+void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, bool audit) {
     auto result = nlohmann::json{};
 
     {
@@ -1420,6 +1420,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
 
     sub_jq_.call_soon([when_ready = std::move(when_ready),
                        result = std::move(result),
+                       audit,
                        this]() mutable {
         size_t n_conns = 0;
         for (auto& sn : sns_)
@@ -1442,7 +1443,27 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         result["snodes"] = sns_.size();
         result["accounts_monitored"] = subscribers_.size();
         result["swarm_index"] = {{"swarms", holding}, {"accounts", indexed}};
-        auto c = coverage(true);
+        std::unordered_map<uint64_t, Recount> recount;
+        if (audit)
+            recount = audit_counters();
+        auto c = coverage(true, audit);
+        if (audit) {
+            auto index = coverage();
+            for (auto [counter, kept, counted] :
+                 {std::tuple{"accounts", index.accounts, c.accounts},
+                  std::tuple{"covered accounts", index.covered, c.covered},
+                  std::tuple{"under-covered accounts", index.under, c.under},
+                  std::tuple{"accounts on none", index.at_zero, c.at_zero},
+                  std::tuple{"unsendable accounts", index.unsendable, c.unsendable}})
+                if (kept != counted)
+                    log::warning(
+                            cat,
+                            "Coverage: the swarm index gives {} {}, which disagrees with a recount "
+                            "of the accounts: {}",
+                            kept,
+                            counter,
+                            counted);
+        }
         result["coverage"] = {
                 {"redundancy", config.redundancy},
                 {"covered_threshold",
@@ -1465,9 +1486,14 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         size_t load_nodes = 0, load_min = 0, load_max = 0, load_total = 0;
         for (const auto& [pk, sn] : sns_)
             if (sn->up() && sn->slot >= 0) {
-                load_min = load_nodes ? std::min(load_min, sn->claimed) : sn->claimed;
-                load_max = std::max(load_max, sn->claimed);
-                load_total += sn->claimed;
+                size_t claimed = sn->claimed;
+                if (audit) {
+                    auto it = recount.find(sn->swarm);
+                    claimed = it == recount.end() ? 0 : it->second.claimed[sn->slot];
+                }
+                load_min = load_nodes ? std::min(load_min, claimed) : claimed;
+                load_max = std::max(load_max, claimed);
+                load_total += claimed;
                 load_nodes++;
             }
         result["node_load"] = {
@@ -1736,7 +1762,10 @@ void HiveMind::on_get_stats(oxenmq::Message& m) {
 }
 
 void HiveMind::log_stats(std::string pre_cmd) {
-    get_stats_json([this, pre_cmd = std::move(pre_cmd)](nlohmann::json s) {
+    // Decided before the stats are gathered, as only a report has them audited.
+    bool report = std::chrono::steady_clock::now() - last_stats_logged >=
+                  config.status_report_interval - 5s;
+    auto on_stats = [this, pre_cmd = std::move(pre_cmd), report](nlohmann::json s) {
         std::list<std::string> notifiers;
         for (auto& [k, v] : s.items())
             if (starts_with(k, "last."))
@@ -1768,8 +1797,7 @@ void HiveMind::log_stats(std::string pre_cmd) {
         sd_notify(0, sd_out.c_str());
 
         // Due a little early, so that the 15-second tick it goes out with does not slip past it.
-        if (auto now = std::chrono::steady_clock::now();
-            now - last_stats_logged >= config.status_report_interval - 5s) {
+        if (auto now = std::chrono::steady_clock::now(); report) {
             double dt = !last_report_
                               ? std::chrono::duration<double>(system_clock::now() - startup_time)
                                         .count()
@@ -1784,7 +1812,8 @@ void HiveMind::log_stats(std::string pre_cmd) {
         } else {
             log::debug(stats, "Status: {}", stat_line);
         }
-    });
+    };
+    get_stats_json(std::move(on_stats), report);
 }
 
 void HiveMind::on_drop_registrations(oxenmq::Message& m) {
@@ -2923,7 +2952,48 @@ void HiveMind::check_subs() {
     }
 }
 
-HiveMind::Coverage HiveMind::coverage(bool detail) const {
+std::unordered_map<uint64_t, HiveMind::Recount> HiveMind::audit_counters() const {
+    std::unordered_map<uint64_t, Recount> recount;
+    for (const auto& [account, subs] : subscribers_) {
+        if (account.swarm == INVALID_SWARM_ID)
+            continue;
+        auto& r = recount[account.swarm];
+        r.members++;
+        uint16_t bits = account.sent | account.acked;
+        r.by_claims[std::popcount(bits)]++;
+        for (; bits; bits &= bits - 1)
+            r.claimed[std::countr_zero(bits)]++;
+    }
+    auto check = [](uint64_t id, std::string_view counter, size_t kept, size_t counted) {
+        if (kept != counted)
+            log::warning(
+                    cat,
+                    "Swarm {:x}: {} is {}, which disagrees with a recount of its accounts: {}",
+                    id,
+                    counter,
+                    kept,
+                    counted);
+    };
+    static const Recount none;
+    for (const auto& [id, swarm] : swarms_) {
+        auto it = recount.find(id);
+        const auto& r = it == recount.end() ? none : it->second;
+        check(id, "its member count", swarm.members.size(), r.members);
+        for (int n = 0; n <= SWARM_SLOTS; n++)
+            check(id, "by_claims[{}]"_format(n), swarm.by_claims[n], r.by_claims[n]);
+        for (int slot = 0; slot < SWARM_SLOTS; slot++)
+            check(id,
+                  "slot {}'s claim count"_format(slot),
+                  swarm.slots[slot] ? swarm.slots[slot]->claimed : 0,
+                  r.claimed[slot]);
+    }
+    for (const auto& [id, r] : recount)
+        if (!swarms_.contains(id))
+            check(id, "its member count (it is not indexed)", 0, r.members);
+    return recount;
+}
+
+HiveMind::Coverage HiveMind::coverage(bool detail, bool recount) const {
     Coverage c;
     // The window send_next sends subscriptions in.
     auto now = system_clock::now();
@@ -2941,101 +3011,121 @@ HiveMind::Coverage HiveMind::coverage(bool detail) const {
             described[cls].push_back("{}: {}"_format(account.id.hex(), why));
     };
 
-    for (const auto& [id, swarm] : swarms_) {
-        int goal = covered_threshold(swarm);
-        int up = 0;
+    // Each swarm's threshold, node count, and connected nodes with slots (as a count and a mask).
+    struct SwarmInfo {
+        int goal = 1, nodes = 0, up = 0;
         uint16_t up_slots = 0;
+    };
+    auto info = [&](const Swarm& swarm) {
+        SwarmInfo si{covered_threshold(swarm), swarm.nodes};
         for (int i = 0; i < SWARM_SLOTS; i++)
             if (const auto* node = swarm.slots[i]; node && node->up()) {
-                up++;
-                up_slots |= static_cast<uint16_t>(1u << i);
+                si.up++;
+                si.up_slots |= static_cast<uint16_t>(1u << i);
             }
-        for (const auto* account : swarm.members) {
-            if (account->next_due == SwarmPubkey::UNSCHEDULED) {
-                c.lapsed++;
-                continue;
-            }
-            c.accounts++;
-            int count = std::popcount(account->acked);
-            if (count >= goal) {
-                c.covered++;
-                continue;
-            }
-            if (count > 0) {
-                c.under++;
-                c.under_down_only += (up_slots & ~account->acked) == 0;
-                continue;
-            }
+        return si;
+    };
+    auto visit = [&](uint64_t id, const SwarmInfo& si, const SwarmPubkey* account) {
+        if (account->next_due == SwarmPubkey::UNSCHEDULED) {
+            c.lapsed++;
+            return;
+        }
+        c.accounts++;
+        int count = std::popcount(account->acked);
+        if (count >= si.goal) {
+            c.covered++;
+            return;
+        }
+        if (count > 0) {
+            c.under++;
+            c.under_down_only += (si.up_slots & ~account->acked) == 0;
+            return;
+        }
 
-            auto subs = subscribers_.find(*account);
-            if (subs == subscribers_.end() || subs->second.empty()) {
-                c.unsendable++;
-                describe(unsendable, *account, "unsendable: no subscriptions");
-                continue;
-            }
-            if (std::none_of(subs->second.begin(), subs->second.end(), [&](const auto& sub) {
-                    return sub.sig_ts >= sig_min && sub.sig_ts <= sig_max;
-                })) {
-                c.unsendable++;
-                describe(
-                        unsendable,
-                        *account,
-                        "unsendable: none of its {} subscriptions signed within the window"_format(
-                                subs->second.size()));
-                continue;
-            }
+        auto subs = subscribers_.find(*account);
+        if (subs == subscribers_.end() || subs->second.empty()) {
+            c.unsendable++;
+            describe(unsendable, *account, "unsendable: no subscriptions");
+            return;
+        }
+        if (std::none_of(subs->second.begin(), subs->second.end(), [&](const auto& sub) {
+                return sub.sig_ts >= sig_min && sub.sig_ts <= sig_max;
+            })) {
+            c.unsendable++;
+            describe(
+                    unsendable,
+                    *account,
+                    "unsendable: none of its {} subscriptions signed within the window"_format(
+                            subs->second.size()));
+            return;
+        }
 
-            c.at_zero++;
-            auto text = [&] {
-                auto it = unplaced_detail_.find(account);
-                return it == unplaced_detail_.end() ? ""s : it->second;
-            };
-            if (account->unplaced == SwarmPubkey::Unplaced::rejected) {
-                c.rejected++;
-                describe(rejected, *account, "every entry rejected: {}"_format(text()));
-            } else if (account->unplaced == SwarmPubkey::Unplaced::retrying) {
-                c.retrying++;
-                describe(retrying, *account, "retrying: {}"_format(text()));
-            } else if (up == 0) {
-                c.no_node++;
+        c.at_zero++;
+        auto text = [&] {
+            auto it = unplaced_detail_.find(account);
+            return it == unplaced_detail_.end() ? ""s : it->second;
+        };
+        if (account->unplaced == SwarmPubkey::Unplaced::rejected) {
+            c.rejected++;
+            describe(rejected, *account, "every entry rejected: {}"_format(text()));
+        } else if (account->unplaced == SwarmPubkey::Unplaced::retrying) {
+            c.retrying++;
+            describe(retrying, *account, "retrying: {}"_format(text()));
+        } else if (si.up == 0) {
+            c.no_node++;
+            describe(
+                    no_node,
+                    *account,
+                    "no connected node with a slot in swarm {:x} ({} nodes)"_format(id, si.nodes));
+        } else if (account->sent) {
+            c.claimed++;
+            describe(
+                    claimed,
+                    *account,
+                    "sent to {} nodes, not yet acknowledged"_format(std::popcount(account->sent)));
+        } else {
+            c.other++;
+            if (detail && described[other].size() < LISTED) {
+                std::vector<std::string> signed_;
+                for (const auto& sub : subs->second)
+                    signed_.push_back(
+                            "signed {} ago{}, {} namespaces"_format(
+                                    ago(sub.sig_ts),
+                                    sub.want_data ? " with data" : "",
+                                    sub.namespaces.size()));
                 describe(
-                        no_node,
+                        other,
                         *account,
-                        "no connected node with a slot in swarm {:x} ({} nodes)"_format(
-                                id, swarm.nodes));
-            } else if (account->sent) {
-                c.claimed++;
-                describe(
-                        claimed,
-                        *account,
-                        "sent to {} nodes, not yet acknowledged"_format(
-                                std::popcount(account->sent)));
-            } else {
-                c.other++;
-                if (detail && described[other].size() < LISTED) {
-                    std::vector<std::string> signed_;
-                    for (const auto& sub : subs->second)
-                        signed_.push_back(
-                                "signed {} ago{}, {} namespaces"_format(
-                                        ago(sub.sig_ts),
-                                        sub.want_data ? " with data" : "",
-                                        sub.namespaces.size()));
-                    describe(
-                            other,
-                            *account,
-                            "unexplained: sent {:04x}, acked {:04x}, swarm {:x} ({} nodes, {} up), "
-                            "due in {}, {} subscriptions ({})"_format(
-                                    account->sent,
-                                    account->acked,
-                                    id,
-                                    swarm.nodes,
-                                    up,
-                                    std::chrono::floor<std::chrono::seconds>(
-                                            account->next_due - now),
-                                    subs->second.size(),
-                                    fmt::join(signed_, "; ")));
-                }
+                        "unexplained: sent {:04x}, acked {:04x}, swarm {:x} ({} nodes, {} up), "
+                        "due in {}, {} subscriptions ({})"_format(
+                                account->sent,
+                                account->acked,
+                                id,
+                                si.nodes,
+                                si.up,
+                                std::chrono::floor<std::chrono::seconds>(account->next_due - now),
+                                subs->second.size(),
+                                fmt::join(signed_, "; ")));
             }
+        }
+    };
+
+    if (!recount) {
+        for (const auto& [id, swarm] : swarms_) {
+            auto si = info(swarm);
+            for (const auto* account : swarm.members)
+                visit(id, si, account);
+        }
+    } else {
+        std::unordered_map<uint64_t, SwarmInfo> infos;
+        for (const auto& [account, subs] : subscribers_) {
+            if (account.swarm == INVALID_SWARM_ID)
+                continue;
+            auto [it, fresh] = infos.try_emplace(account.swarm);
+            if (fresh)
+                if (auto sw = swarms_.find(account.swarm); sw != swarms_.end())
+                    it->second = info(sw->second);
+            visit(account.swarm, it->second, &account);
         }
     }
     for (auto& list : described)

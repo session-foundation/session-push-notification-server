@@ -414,7 +414,20 @@ class HiveMind {
         size_t lapsed = 0;
         std::vector<std::string> described;
     };
-    Coverage coverage(bool detail = false) const;
+    //
+    // The swarm index (Swarm::members) is walked by default; with `recount`, the accounts
+    // themselves (subscribers_), as a check on the index.
+    Coverage coverage(bool detail = false, bool recount = false) const;
+    // The incremental counters recounted from the accounts themselves: for each swarm, its
+    // accounts, how many are claimed by each number of nodes (Swarm::by_claims), and how many
+    // each slot's node claims (SNode::claimed).
+    struct Recount {
+        size_t members = 0;
+        std::array<size_t, SWARM_SLOTS + 1> by_claims{};
+        std::array<size_t, SWARM_SLOTS> claimed{};
+    };
+    // Recounts them, warning of every one that disagrees with its recount.
+    std::unordered_map<uint64_t, Recount> audit_counters() const;
     // What a node said when it last gave up an account (Unplaced): the last refusal's text, or the
     // node and its backoff; until the account is placed again.
     std::unordered_map<const SwarmPubkey*, std::string> unplaced_detail_;
@@ -539,7 +552,9 @@ class HiveMind {
     /// integer and string values are permitted (+keys only allow integers).
     void on_service_stats(oxenmq::Message& m);
 
-    void get_stats_json(std::function<void(nlohmann::json)> when_ready);
+    // With `audit`, as for the periodic status report, the counters are checked against a recount
+    // (audit_counters()) and the coverage and node load figures come from the recount.
+    void get_stats_json(std::function<void(nlohmann::json)> when_ready, bool audit = false);
 
     void on_get_stats(oxenmq::Message& m);
 

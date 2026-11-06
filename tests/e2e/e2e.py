@@ -400,6 +400,16 @@ class Setup:
         check(self.notifier.readline(120) == "registered", "new notifier did not register")
         self.wait_conns(60)
 
+    def wait_report(self, timeout=60):
+        """Waits for the hivemind to log another periodic status report, whose counters it checks
+        against a recount of the accounts (which check_log() then looks for disagreements from):
+        for a scenario with status_report_interval set low."""
+        before = self.hivemind.log().count("Status report, over the last")
+        deadline = time.time() + timeout * TIME_SCALE
+        while self.hivemind.log().count("Status report, over the last") == before:
+            check(time.time() < deadline, "no status report logged")
+            time.sleep(0.5)
+
     def client_proc(self):
         if not self.client:
             self.client = Proc("client", [f"{FAKES}/fake_client", HIVEMIND_SOCK])
@@ -524,6 +534,7 @@ def check_log(hm):
         "terminate called",
         "Failed to process incoming notification",
         "failed to build notifier message",
+        "disagrees with a recount",
     ):
         check(bad not in log, f"hivemind log has '{bad}'")
 
@@ -802,10 +813,11 @@ def scenario_backlog(build_dir):
 
 def scenario_churn(build_dir):
     """Subscriptions changing while notifications flow: no push lost for stable accounts, and
-    afterwards pushes match what the database holds."""
+    afterwards pushes match what the database holds, and the status report's recount agrees with
+    the hivemind's counters."""
     fresh_db()
     seed(0, 20_000)
-    s = Setup(build_dir, nodes=3)
+    s = Setup(build_dir, nodes=3, config="status_report_interval = 15")
     try:
         client = s.client_proc()
         done = {}
@@ -835,6 +847,7 @@ def scenario_churn(build_dir):
         check(c["duplicates"] == 0, f"{c['duplicates']} duplicate pushes")
         n = query1("SELECT count(*) FROM subscriptions WHERE svcid LIKE 'client-%'")
         check(n == 100, f"database holds {n} client subscriptions, expected 100")
+        s.wait_report()
     finally:
         rc = s.stop()
     check(rc == 0, f"hivemind exit code {rc}")
@@ -883,7 +896,7 @@ def scenario_reshuffle(build_dir):
         nodes=8,
         swarms=2,
         network_args=["--version", version, "--reply-delay", "10"],
-        config=f"monitor_requests = {cap}",
+        config=f"monitor_requests = {cap}\nstatus_report_interval = 15",
     )
     try:
         c = s.wait_subscribed(0, 4000, 60)
@@ -947,6 +960,7 @@ def scenario_reshuffle(build_dir):
             f"    with node 1 five seconds behind the next split: {n['wrong_swarm']} refused as "
             f"not its swarm's, and all subscribed {time.time() - start:.0f}s after the split"
         )
+        s.wait_report()
     finally:
         rc = s.stop()
     check(rc == 0, f"hivemind exit code {rc}")
