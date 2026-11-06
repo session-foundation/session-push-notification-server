@@ -52,6 +52,10 @@ Fast:
 | `backlog` | while the database is locked, then while the notifier is stopped, the nodes' streams to the hivemind stay under 1 MB: the hivemind keeps reading |
 | `churn` | subscriptions changing during a steady flow: no push lost for stable accounts, and pushes match the database afterwards |
 | `shutdown` | SIGTERM mid-burst with pushes held back exits cleanly |
+| `reshuffle` | 8 nodes go from 2 swarms to 4: the accounts that moved are subscribed on their new swarm's nodes, and nothing is sent to a node not of an account's swarm, then or after every connection is dropped and made again; then to 8, with one node 5 seconds behind: what it refuses meanwhile is subscribed once it catches up |
+| `retry` | one node stalls a monitor request until it times out, one fails one, one refuses every entry of one: all end up fully subscribed within a timeout of startup |
+| `redundancy` | with redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes within a request's worth of each other; a node that leaves has its accounts back on 3 nodes from the others' scans |
+| `rebalance` | with redundancy 3 and 10s renewals, a node that joins a swarm already covered takes its share as the accounts are renewed |
 
 Slow (`--slow`, or by name):
 
@@ -74,8 +78,11 @@ Docker's seccomp filter, which refuses the `setarch -R` it needs.
 
 ## The fakes
 
-- `fake_network`: the oxend that serves the service node list, and the storage nodes, which
-  answer `monitor` and send `notify`. It also measures each stream's unsent bytes.
+- `fake_network`: the oxend that serves the service node list and announces blocks, and the
+  storage nodes, which answer `monitor` (refusing accounts their swarm does not store), and send
+  `notify` and `monitor_ended`. It can move
+  nodes between swarms, drop connections, fail requests, and report what each node holds and has
+  been sent; it also measures each stream's unsent bytes.
 - `fake_notifier`: registers as the `dummy` notifier, accepts any `service_info.token` as the
   service id, answers `notifier.ack`, and records every push.
 - `fake_client`: signs subscribe and unsubscribe requests for deterministic `05` accounts.

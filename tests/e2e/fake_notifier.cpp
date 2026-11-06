@@ -8,7 +8,9 @@
 // reads commands on stdin, one per line:
 //
 //   count    {"pushes": N, "unique": N, "duplicates": N, "first_ms": T, "last_ms": T}
-//   dump     one line per push so far: "svcid hash ns has_data svcdata", then "end"
+//   dump     one line per push so far: "svcid hash ns body svcdata", body being the length of the
+//            body pushed (0 for none), marked "!" if it is not the start of the body fake_network
+//            makes for that hash; then "end"
 //   quit
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/oxenmq.h>
@@ -60,7 +62,11 @@ int main(int argc, char** argv) {
                         std::string svcid{d.require<std::string_view>("&")};
                         d.skip_until("n");
                         auto ns = d.consume_integer<int>();
-                        bool data = d.skip_until("~");
+                        auto body = d.maybe<std::string_view>("~");
+                        bool intact = true;
+                        if (body)
+                            for (size_t k = 0; intact && k < body->size(); ++k)
+                                intact = (*body)[k] == hash[k % hash.size()];
 
                         std::lock_guard lock{m};
                         auto t = now_ms();
@@ -72,8 +78,8 @@ int main(int argc, char** argv) {
                         if (log.size() < 1000)
                             log.push_back(
                                     svcid + ' ' + hash + ' ' + std::to_string(ns) + ' ' +
-                                    (data ? "1" : "0") + ' ' +
-                                    (svcdata ? std::string{*svcdata} : "-"));
+                                    std::to_string(body ? body->size() : 0) + (intact ? "" : "!") +
+                                    ' ' + (svcdata ? std::string{*svcdata} : "-"));
                     })
             .add_request_command("ack", [](oxenmq::Message& msg) { msg.send_reply(); })
             .add_request_command("validate", [](oxenmq::Message& msg) {

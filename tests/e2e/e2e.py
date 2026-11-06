@@ -16,6 +16,7 @@ libpq environment (PGHOST, PGUSER, ...).  Linux only: it reads process memory an
 import argparse
 import base64
 import hashlib
+import json
 import os
 import struct
 
@@ -148,6 +149,11 @@ SVCID_SQL = """CASE WHEN i % 2 = 0
     END"""
 
 
+def client_svcid(i):
+    """The service id fake_client gives client i."""
+    return f"client-{i}-".ljust(40, "a")
+
+
 def svcid(i, d=1):
     """The service id seed() gave device d of account i; see SVCID_SQL."""
     key = struct.pack(">ii", i, d)
@@ -225,7 +231,14 @@ class Proc:
 
 
 class Hivemind:
-    def __init__(self, build_dir, filter_lifetime=300, log_level="info"):
+    def __init__(
+        self,
+        build_dir,
+        filter_lifetime=300,
+        log_level="info",
+        config="",
+    ):
+        """`config`: more [hivemind] settings."""
         self.log_path = f"{WORK}/hivemind.log"
         key = f"{WORK}/hivemind.key"
         with open(key, "wb") as f:
@@ -243,6 +256,7 @@ max_connects = 1000
 filter_lifetime = {filter_lifetime}
 startup_wait = 30
 notifiers_expected = dummy
+{config}
 [keys]
 hivemind = {key}
 """
@@ -312,18 +326,15 @@ hivemind = {key}
 class Setup:
     """Hivemind, network and notifier, started in the order each needs the other."""
 
-    def __init__(self, build_dir, nodes, swarms=1, **hivemind_args):
+    def __init__(self, build_dir, nodes, swarms=1, network_args=(), **hivemind_args):
         os.makedirs(WORK, exist_ok=True)
+        self.nodes = nodes
         self.hivemind = self.notifier = self.client = None
         self.network = Proc(
             "network",
-            [
-                f"{FAKES}/fake_network",
-                str(nodes),
-                str(swarms),
-                str(OXEND_PORT),
-                str(FIRST_QUIC_PORT),
-            ],
+            [f"{FAKES}/fake_network"]
+            + list(network_args)
+            + [str(nodes), str(swarms), str(OXEND_PORT), str(FIRST_QUIC_PORT)],
         )
         try:
             self.hivemind = Hivemind(build_dir, **hivemind_args)
@@ -383,6 +394,63 @@ class Setup:
                 next_drop_check = time.time() + 2
             time.sleep(0.25)
 
+    def check(self, first, count):
+        """How accounts #first.. are subscribed on the nodes; see fake_network's check."""
+        import json
+
+        return json.loads(self.network.cmd(f"check {first} {count}"))
+
+    def net_counts(self):
+        import json
+
+        return json.loads(self.network.cmd("counts"))
+
+    def coverage(self, first, count):
+        """How many listed nodes hold each of accounts #first.., and how many each node holds."""
+        import json
+
+        return json.loads(self.network.cmd(f"coverage {first} {count}"))
+
+    def stats(self):
+        """The hivemind's get_stats."""
+        import json
+
+        return json.loads(self.client_proc().cmd("stats"))
+
+    def wait_for(self, what, timeout, done, interval=0.5):
+        """Polls `what()` until `done` holds for it, failing after `timeout` (scaled)."""
+        deadline = time.time() + timeout * TIME_SCALE
+        while True:
+            got = what()
+            if done(got):
+                return got
+            check(time.time() < deadline, f"timed out waiting: {got}")
+            time.sleep(interval)
+
+    def wait_subscribed(self, first, count, timeout, interval=0.5):
+        """Waits for accounts #first.. to be subscribed on every node of their swarm and none
+        other; returns the last check.  Each check holds up the fake network for a moment per
+        100,000 accounts."""
+        deadline = time.time() + timeout * TIME_SCALE
+        while True:
+            c = self.check(first, count)
+            if c["missing"] == 0 and c["extra"] == 0:
+                return c
+            check(time.time() < deadline, f"accounts not subscribed as they should be: {c}")
+            time.sleep(interval)
+
+    def max_in_flight(self):
+        """The most monitor requests the nodes have had outstanding at once since last asked."""
+        import json
+
+        return json.loads(self.network.cmd("inflight"))["max"]
+
+    def wait_conns(self, timeout):
+        deadline = time.time() + timeout * TIME_SCALE
+        while int(self.network.cmd("conns")) < self.nodes:
+            check(time.time() < deadline, "the hivemind did not reconnect to every node")
+            time.sleep(0.25)
+
     def dump(self):
         lines = []
         self.notifier.p.stdin.write("dump\n")
@@ -437,7 +505,7 @@ def scenario_correctness(build_dir):
         got = sorted(s.dump())
         want = sorted(
             [
-                f"{svcid(1)} hash-one-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 1 sd1",
+                f"{svcid(1)} hash-one-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 200 sd1",
                 f"{svcid(2, 1)} hash-three-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -",
                 f"{svcid(2, 2)} hash-three-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 0 -",
             ]
@@ -460,7 +528,7 @@ def scenario_correctness(build_dir):
         check(c["pushes"] == 5, f"phase 2: expected 5 pushes in all, got {c['pushes']}")
         got = sorted(s.dump())
         check(
-            "client-5-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa hash-six-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 1 -"
+            "client-5-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa hash-six-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0 200 -"
             in got,
             f"no push for the runtime subscription: {got}",
         )
@@ -747,6 +815,194 @@ def scenario_shutdown(build_dir):
     check_log(s.hivemind)
 
 
+def scenario_reshuffle(build_dir):
+    """A swarm split: the accounts that moved get subscribed on their new swarm's nodes, and
+    nothing is sent to a node not of an account's swarm, then or after every connection is lost
+    and made again (where the old per-node copies resubscribed moved accounts on their old
+    nodes for good).  Then another split, with one node seconds behind oxend's view of it: the
+    accounts it refuses as not its swarm's meanwhile are subscribed there once it catches up,
+    within the retry backoff rather than at their renewal."""
+    fresh_db()
+    seed(0, 4000)
+    # Late replies, so that the nodes see the hivemind's requests in flight together, under a cap
+    # smaller than the 8 nodes.
+    cap = 4
+    s = Setup(
+        build_dir,
+        nodes=8,
+        swarms=2,
+        network_args=["--reply-delay", "10"],
+        config=f"monitor_requests = {cap}",
+    )
+    try:
+        c = s.wait_subscribed(0, 4000, 60)
+        most = s.max_in_flight()
+        check(1 < most <= cap, f"{most} monitor requests in flight at once, with a cap of {cap}")
+        n = s.net_counts()
+        check(n["wrong_swarm"] == 0, f"subscriptions sent to the wrong swarm at startup: {n}")
+
+        s.network.cmd("mark")
+        s.network.cmd("swarms 4")
+        deadline = time.time() + 30 * TIME_SCALE
+        while len(changes := re.findall(r"Swarm list changed: (\d+) accounts moved", s.hivemind.log())) < 2:
+            check(time.time() < deadline, "the hivemind did not see the swarms change")
+            time.sleep(0.25)
+        moved = int(changes[-1])
+        check(moved > 0, "no account moved swarm")
+        c = s.wait_subscribed(0, 4000, 60)
+        n = s.net_counts()
+        check(n["wrong_swarm"] == 0, f"subscriptions sent to the wrong swarm after the move: {n}")
+        print(f"    {moved} of 4000 accounts moved swarm, and are subscribed where they now belong")
+
+        s.network.cmd("mark")
+        s.network.cmd("drop")
+        s.wait_conns(60)
+        c = s.wait_subscribed(0, 4000, 60)
+        time.sleep(2)
+        n = s.net_counts()
+        check(n["wrong_swarm"] == 0, f"subscriptions sent to the wrong swarm after reconnecting: {n}")
+        print(
+            f"    after reconnecting: {n['entries']} subscriptions sent for {c['expected']} "
+            f"(account, node) pairs, none to the wrong swarm"
+        )
+        check(n["entries"] >= c["expected"], f"the reconnections were not filled: {n}")
+
+        s.network.cmd("lag 1 5000")
+        s.network.cmd("mark")
+        start = time.time()
+        s.network.cmd("swarms 8")
+        deadline = time.time() + 30 * TIME_SCALE
+        while len(re.findall(r"Swarm list changed: \d+ accounts moved", s.hivemind.log())) < 3:
+            check(time.time() < deadline, "the hivemind did not see the swarms change again")
+            time.sleep(0.25)
+        c = s.wait_subscribed(0, 4000, 60)
+        n = s.net_counts()
+        check(n["wrong_swarm"] > 0, f"the lagging node refused nothing: {n}")
+        print(
+            f"    with node 1 five seconds behind the next split: {n['wrong_swarm']} refused as "
+            f"not its swarm's, and all subscribed {time.time() - start:.0f}s after the split"
+        )
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
+def scenario_redundancy(build_dir):
+    """With redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes each
+    holding within a request's worth of the others; when a node leaves the network, its
+    accounts are back on 3 nodes well within a renewal, from the other nodes' scans."""
+    accounts = 3000
+    fresh_db()
+    seed(0, accounts)
+    s = Setup(build_dir, nodes=6, swarms=1, config="redundancy = 3")
+    try:
+        cov = s.wait_for(
+            lambda: s.coverage(0, accounts), 60, lambda c: c["by_count"] == {"3": accounts}
+        )
+        loads = cov["per_node"]
+        check(max(loads) - min(loads) <= 500, f"uneven node loads: {loads}")
+        st = s.stats()
+        check(st["coverage"]["below_target"] == 0, f"coverage: {st['coverage']}")
+        print(f"    every account on 3 of 6 nodes; the nodes hold {loads}")
+
+        start = time.time()
+        s.network.cmd("leave 5")
+        cov = s.wait_for(
+            lambda: s.coverage(0, accounts), 60, lambda c: c["by_count"] == {"3": accounts}
+        )
+        loads = [n for n in cov["per_node"] if n is not None]
+        check(max(loads) - min(loads) <= 500, f"uneven node loads after a node left: {loads}")
+        print(
+            f"    node 5 left: every account back on 3 nodes {time.time() - start:.1f}s later, "
+            f"the 5 left holding {loads}"
+        )
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
+def scenario_rebalance(build_dir):
+    """With redundancy 3 and renewals every 10s, a node that joins a swarm whose accounts are all
+    on 3 nodes already takes its share as they are renewed, the lightest nodes getting each
+    renewal's placements."""
+    accounts = 3000
+    interval = 10
+    fresh_db()
+    seed(0, accounts)
+    s = Setup(
+        build_dir,
+        nodes=6,
+        swarms=1,
+        config=f"redundancy = 3\nrenewal_interval = {interval}",
+    )
+    try:
+
+        def covered(nodes):
+            return (
+                lambda st: st["node_load"]["nodes"] == nodes
+                and st["coverage"]["below_target"] == 0
+            )
+
+        s.network.cmd("leave 5")
+        st = s.wait_for(s.stats, 60, covered(5))
+        print(f"    node 5 away: every account on 3 of 5 nodes, loads {st['node_load']}")
+        start = time.time()
+        moved = st["placements"]["moved"]
+        s.network.cmd("join 5")
+        st = s.wait_for(s.stats, 60, covered(6))
+        check(st["node_load"]["min"] < 500, f"node 5 joined with accounts already: {st}")
+        st = s.wait_for(
+            s.stats,
+            4 * interval,
+            lambda st: covered(6)(st) and st["node_load"]["max"] - st["node_load"]["min"] <= 500,
+        )
+        print(
+            f"    node 5 back: loads {st['node_load']} {time.time() - start:.0f}s later, "
+            f"{st['placements']['moved'] - moved} monitors moved by renewals"
+        )
+        check(st["placements"]["moved"] > moved, "no renewal moved a monitor to node 5")
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
+def scenario_retry(build_dir):
+    """A node that times out a monitor request, one that fails one, and one that refuses every
+    subscription in one as not knowing the swarms all end up with every subscription, within a
+    request timeout of startup rather than at the next renewal 45-55 minutes on."""
+    accounts = 6000
+    fresh_db()
+    seed(0, accounts)
+    start = time.time()
+    # The stalled request would take the hivemind's 10 minutes to fail.
+    timeout = 15
+    s = Setup(
+        build_dir,
+        nodes=3,
+        network_args=["--fail", "0:stall:1", "--fail", "1:error:1", "--fail", "2:entries:1"],
+        config=f"monitor_timeout = {timeout}",
+        log_level="info,snode=debug",
+    )
+    try:
+        s.wait_subscribed(0, accounts, 120)
+        took = time.time() - start
+        log = s.hivemind.log()
+        print(f"    every node fully subscribed {took:.0f}s after startup")
+        check(
+            log.count("after their failure on") >= 3, "the hivemind did not retry every failure"
+        )
+        check("failed: timeout" in log, "the stalled request did not time out")
+        if not SANITIZED:
+            check(took < timeout + 30, f"took {took:.0f}s to subscribe everything")
+    finally:
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
 def scenario_stalled_notifier(build_dir):
     """A notifier that stops reading for good costs bounded memory and little CPU: its window
     stays full, and pushes beyond 50,000 waiting are dropped with a warning."""
@@ -848,7 +1104,8 @@ def scenario_scale(build_dir):
     seed(0, accounts, devices="CASE WHEN i % 10 = 0 THEN 3 ELSE 1 END")
     rows = query1("SELECT count(*) FROM subscriptions")
     start = time.time()
-    s = Setup(build_dir, nodes=nodes, swarms=swarms)
+    # Late replies, as from distant nodes, so that requests are seen in flight together.
+    s = Setup(build_dir, nodes=nodes, swarms=swarms, network_args=["--reply-delay", "20"])
     try:
         # A real account's notifications come from its own swarm of about 5 nodes.
         s.network.cmd("senders 5")
@@ -870,6 +1127,14 @@ def scenario_scale(build_dir):
             c["pushes"] == expected and c["duplicates"] == 0,
             f"expected {expected} unique pushes, got {c}",
         )
+        s.wait_subscribed(0, accounts, 900, interval=5)
+        most = s.max_in_flight()
+        print(
+            f"    every account subscribed on its swarm {time.time() - start:.0f}s after start; "
+            f"at most {most} monitor requests in flight at once"
+        )
+        # The hivemind's MONITOR_REQUESTS_IN_FLIGHT, which 50 nodes cannot reach.
+        check(most <= 64, f"{most} monitor requests in flight at once")
     finally:
         rc = s.stop()
     check(rc == 0, f"hivemind exit code {rc}")
@@ -885,6 +1150,10 @@ FAST = [
     "backlog",
     "churn",
     "shutdown",
+    "reshuffle",
+    "retry",
+    "redundancy",
+    "rebalance",
 ]
 SLOW = ["stalled_notifier", "sustained", "scale"]
 
@@ -974,7 +1243,13 @@ def main():
             flush=True,
         )
         if results[-1][1] != "PASS":
-            for log in ("hivemind.log", "network.err", "notifier.err", "client.err"):
+            for log in (
+                "hivemind.log",
+                "network.err",
+                "notifier.err",
+                "notifier2.err",
+                "client.err",
+            ):
                 path = os.path.join(WORK, log)
                 if os.path.exists(path):
                     with open(path, errors="replace") as f:

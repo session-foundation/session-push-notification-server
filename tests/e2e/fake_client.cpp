@@ -12,6 +12,7 @@
 //                           requests in flight together (default 1); "ok" if all succeed
 //   unsub I                 unsubscribe client I
 //   drop SVCID              drop the "dummy" registration SVCID
+//   stats                   the hivemind's get_stats, as one line of JSON
 //   churn FIRST COUNT ROUNDS
 //                           ROUNDS times, subscribe clients FIRST.. then unsubscribe them, each
 //                           step's requests in flight together; then subscribe the even ones.
@@ -149,6 +150,16 @@ int main(int argc, char** argv) {
                      sub ? c.subscribe_body(now_s()) : c.unsubscribe_body(now_s())});
             int ok = requests(reqs);
             std::cout << (ok == (int)reqs.size() ? "ok" : "failed") << std::endl;
+        } else if (cmd == "stats") {
+            std::promise<std::string> reply;
+            omq.request(
+                    conn,
+                    "admin.get_stats",
+                    [&reply](bool ok, std::vector<std::string> data) {
+                        reply.set_value(ok && !data.empty() ? data[0] : "null");
+                    },
+                    oxenmq::send_option::request_timeout{30s});
+            std::cout << reply.get_future().get() << std::endl;
         } else if (cmd == "drop") {
             std::string svcid;
             in >> svcid;
