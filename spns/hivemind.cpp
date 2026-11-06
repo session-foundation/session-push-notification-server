@@ -1336,6 +1336,14 @@ void HiveMind::on_service_stats(oxenmq::Message& m) {
     }
 }
 
+// Seconds since `t`, or null if there is none.  Absent values are written as nulls by hand: a
+// std::optional converts to a json value only from nlohmann::json 3.12.
+static nlohmann::json seconds_since(const std::optional<steady_time>& t, steady_time now) {
+    if (!t)
+        return nullptr;
+    return std::chrono::duration<double>(now - *t).count();
+}
+
 void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
     auto result = nlohmann::json{};
 
@@ -1383,11 +1391,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
             q["unacked"] = s.unacked;
             q["sent"] = s.sent;
             q["dropped"] = s.dropped_total;
-            q["blocked_for"] =
-                    s.blocked_since
-                            ? std::optional{std::chrono::duration<double>(now - *s.blocked_since)
-                                                    .count()}
-                            : std::nullopt;
+            q["blocked_for"] = seconds_since(s.blocked_since, now);
         }
         result["incoming"] = {
                 {"queue", notify_queue_.size()},
@@ -1461,17 +1465,14 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
                 {"max", load_max}};
         result["state"] = {
                 {"file", config.state_file},
-                {"saved_ago",
-                 state_saved_.when ? std::optional{std::chrono::duration<double>(
-                                                           steady_clock::now() - *state_saved_.when)
-                                                           .count()}
-                                   : std::nullopt},
+                {"saved_ago", seconds_since(state_saved_.when, steady_clock::now())},
                 {"bytes", state_saved_.bytes},
                 {"accounts", state_saved_.accounts},
                 {"snapshot_ms", state_saved_.snapshot_ms},
                 {"write_ms", state_saved_.write_ms.load()}};
         result["restored"] = {
-                {"age", restored_.age < 0 ? std::nullopt : std::optional{restored_.age}},
+                {"age",
+                 restored_.age < 0 ? nlohmann::json(nullptr) : nlohmann::json(restored_.age)},
                 {"accounts", restored_.accounts},
                 {"swarms", restored_.swarms},
                 {"nodes", restored_.slots},
@@ -1516,11 +1517,9 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
                 {"wrong_swarm", ms.wrong_swarm},
                 {"rejected", ms.rejected}};
         result["accounts_moved"] = moved_total_;
-        result["block_age"] = last_block_.second < 0
-                                    ? std::nullopt
-                                    : std::optional{std::chrono::duration<double>(
-                                                            steady_clock::now() - last_block_time_)
-                                                            .count()};
+        result["block_age"] = seconds_since(
+                last_block_.second < 0 ? std::nullopt : std::optional{last_block_time_},
+                steady_clock::now());
         result["connections"] = n_conns;
         result["pending_connections"] = pending_connects_.load();
         result["connections_established"] = connections_established_.load();
