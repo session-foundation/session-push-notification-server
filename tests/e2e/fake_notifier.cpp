@@ -1,11 +1,14 @@
 // A fake notifier: registers with the hivemind and records every notifier.push.
 //
-// usage: fake_notifier HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]
+// usage: fake_notifier [--protocol N] [--max-body BYTES] HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]
 //
 // MAX_QUEUE is the oxenmq queue limit of the "notifier" category (default -1, unlimited); SERVICE
-// is the service name it registers (default "dummy").  Answers
-// notifier.validate by accepting service_info.token as the service id.  Prints "registered", then
-// reads commands on stdin, one per line:
+// is the service name it registers (default "dummy").  It registers speaking notifier protocol N
+// (default 1; 0 sends the bare service name to the obsolete register_service), declaring BYTES as
+// the largest body it can deliver (default 2500), and exits with status 2 if the hivemind refuses
+// it or registering fails other than by timing out.  Answers notifier.validate by accepting
+// service_info.token as the service id.  Prints "registered", then reads commands on stdin, one per
+// line:
 //
 //   count    {"pushes": N, "unique": N, "duplicates": N, "first_ms": T, "last_ms": T}
 //   dump     one line per push so far: "svcid hash ns body svcdata", body being the length of the
@@ -13,6 +16,7 @@
 //            makes for that hash, with " full=SIZE" after it for a message over the hivemind's body
 //            limit; then "end"
 //   quit
+#include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
 #include <oxenmq/oxenmq.h>
 
@@ -38,13 +42,26 @@ int64_t now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "usage: fake_notifier HIVEMIND_ADDR [MAX_QUEUE [SERVICE]]\n";
+    int protocol = 1;
+    int64_t max_body = 2500;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--protocol" && i + 1 < argc)
+            protocol = std::stoi(argv[++i]);
+        else if (a == "--max-body" && i + 1 < argc)
+            max_body = std::stoll(argv[++i]);
+        else
+            args.push_back(std::move(a));
+    }
+    if (args.empty()) {
+        std::cerr << "usage: fake_notifier [--protocol N] [--max-body BYTES] HIVEMIND_ADDR "
+                     "[MAX_QUEUE [SERVICE]]\n";
         return 1;
     }
     // oxenmq's default: the hivemind's ack window must keep what it sends within it.
-    int max_queue = argc > 2 ? std::stoi(argv[2]) : 200;
-    std::string service = argc > 3 ? argv[3] : "dummy";
+    int max_queue = args.size() > 1 ? std::stoi(args[1]) : 200;
+    std::string service = args.size() > 2 ? args[2] : "dummy";
 
     std::mutex m;
     std::unordered_set<std::string> seen;
@@ -96,7 +113,7 @@ int main(int argc, char** argv) {
     for (int tries = 0; !connected && tries < 300; tries++) {
         std::promise<bool> p;
         conn = omq.connect_remote(
-                oxenmq::address{argv[1]},
+                oxenmq::address{args[0]},
                 [&p](auto) { p.set_value(true); },
                 [&p](auto, auto) { p.set_value(false); },
                 oxenmq::AuthLevel::basic);
@@ -105,10 +122,46 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(200ms);
     }
     if (!connected) {
-        std::cerr << "could not connect to " << argv[1] << "\n";
+        std::cerr << "could not connect to " << args[0] << "\n";
         return 1;
     }
-    omq.send(conn, "admin.register_service", service);
+    if (protocol == 0)
+        omq.send(conn, "admin.register_service", service);
+    else {
+        oxenc::bt_dict_producer reg;
+        reg.append("", protocol);
+        reg.append("max_body", max_body);
+        // A request that times out is tried again, as a real notifier's periodic re-registration
+        // would; a refusal, or any other failure, is final.
+        while (true) {
+            std::promise<std::pair<bool, std::vector<std::string>>> reply;
+            omq.request(
+                    conn,
+                    "admin.register_notifier",
+                    [&reply](bool ok, std::vector<std::string> data) {
+                        reply.set_value({ok, std::move(data)});
+                    },
+                    service,
+                    reg.view());
+            auto [ok, data] = reply.get_future().get();
+            if (!ok) {
+                if (data.size() == 1 && data[0] == "TIMEOUT") {
+                    std::cerr << "no reply to registration; retrying\n";
+                    continue;
+                }
+                std::cerr << "registration failed:";
+                for (const auto& d : data)
+                    std::cerr << ' ' << d;
+                std::cerr << "\n";
+                return 2;
+            }
+            if (!data.empty() && !data[0].empty()) {
+                std::cerr << "registration refused: " << data[0] << "\n";
+                return 2;
+            }
+            break;
+        }
+    }
     std::cout << "registered" << std::endl;
 
     std::string line;

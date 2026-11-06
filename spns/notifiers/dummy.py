@@ -8,7 +8,7 @@ import traceback
 import time
 import signal
 import systemd.daemon
-from .util import derive_notifier_key, warn_on_except
+from .util import derive_notifier_key, register_notifier, warn_on_except
 from .. import config
 from ..config import logger
 from spns_hivemind import SUBSCRIBE
@@ -83,7 +83,7 @@ def ping():
         notifies, failures = 0, 0
 
     logger.debug(f"dummy re-registering and reporting stats {report}")
-    omq.send(hivemind, "admin.register_service", "dummy")
+    register_notifier(omq, hivemind, "dummy")
     omq.send(hivemind, "admin.service_stats", "dummy", oxenc.bt_serialize(report))
     systemd.daemon.notify(
         f"WATCHDOG=1\nSTATUS=Running; {total_notifies} notifications, {total_failures} failures"
@@ -113,7 +113,7 @@ def connect_to_hivemind():
         Address(config.config.hivemind_sock), auth_level=AuthLevel.basic, ephemeral_routing_id=False
     )
 
-    omq.send(hivemind, "admin.register_service", "dummy")
+    register_notifier(omq, hivemind, "dummy")
 
 
 def disconnect():

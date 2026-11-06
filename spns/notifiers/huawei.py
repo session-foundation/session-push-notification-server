@@ -3,7 +3,13 @@
 from .. import config
 from ..config import logger
 from spns_hivemind import SUBSCRIBE
-from .util import encrypt_notify_payload, derive_notifier_key, warn_on_except, NotifyStats
+from .util import (
+    encrypt_notify_payload,
+    derive_notifier_key,
+    register_notifier,
+    warn_on_except,
+    NotifyStats,
+)
 
 from hms.src import push_admin
 from hms.src.push_admin import messaging as huawei_messaging
@@ -102,7 +108,7 @@ def send_pending():
 @warn_on_except
 def ping():
     global omq, hivemind, stats
-    omq.send(hivemind, "admin.register_service", "huawei")
+    register_notifier(omq, hivemind, "huawei")
     omq.send(hivemind, "admin.service_stats", "huawei", oxenc.bt_serialize(stats.collect()))
     systemd.daemon.notify(
         f"WATCHDOG=1\nSTATUS=Running; {stats.total_notifies} notifications, "
@@ -144,7 +150,7 @@ def start():
 
     huawei_push_admin = push_admin.initialize_app(conf["app_id"], conf["app_secret"])
 
-    omq.send(hivemind, "admin.register_service", "huawei")
+    register_notifier(omq, hivemind, "huawei")
 
 
 def disconnect(flush_pending=True):

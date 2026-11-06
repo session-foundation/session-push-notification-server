@@ -1242,6 +1242,69 @@ def scenario_body_limit(build_dir):
     check_log(s.hivemind)
 
 
+def scenario_registration(build_dir):
+    """A notifier is registered only if it speaks the hivemind's registration protocol and can
+    deliver bodies as large as the hivemind's limit.  One that declares less, or speaks another
+    version, is refused with a critical log line and exits on the refusal; one speaking protocol 0
+    (the bare service name to register_service, a plain command) cannot be answered, and is only
+    logged as using the obsolete interface."""
+    fresh_db()
+    seed(0, 10)
+    s = Setup(build_dir, nodes=3)
+    procs = []
+
+    def refused(line):
+        return re.search(rf"critical\S*\|[^\]]*\] {re.escape(line)}", s.hivemind.log())
+
+    try:
+        for name, opts, line in (
+            (
+                "small",
+                ["--max-body", "2000"],
+                "'small' notifier accepts bodies of at most 2000 B, below the hivemind's body "
+                "limit of 2500 B",
+            ),
+            (
+                "future",
+                ["--protocol", "2"],
+                "'future' notifier speaks protocol 2, this hivemind requires 1",
+            ),
+        ):
+            p = Proc(name, [f"{FAKES}/fake_notifier", *opts, HIVEMIND_SOCK, "200", name])
+            procs.append(p)
+            try:
+                rc = p.p.wait(30 * TIME_SCALE)
+            except subprocess.TimeoutExpired:
+                rc = None
+            check(rc == 2, f"the {name} notifier did not exit on being refused (exit {rc})")
+            check(refused(line), f"no critical refusal of the {name} notifier in the log")
+            print(f"    {name}: refused, and exited")
+
+        p = Proc("old", [f"{FAKES}/fake_notifier", "--protocol", "0", HIVEMIND_SOCK, "200", "old"])
+        procs.append(p)
+        deadline = time.time() + 30 * TIME_SCALE
+        while not refused(
+            "'old' notifier registered through the obsolete register_service interface "
+            "(protocol 0); this hivemind requires register_notifier protocol 1"
+        ):
+            check(time.time() < deadline, "no critical refusal of the protocol 0 notifier")
+            time.sleep(0.25)
+        print("    old: refused")
+
+        log = s.hivemind.log()
+        for name in ("small", "future", "old"):
+            check(
+                f"'{name}' notification service registered" not in log,
+                f"the {name} notifier was registered",
+            )
+    finally:
+        for p in procs:
+            p.stop()
+        rc = s.stop()
+    check(rc == 0, f"hivemind exit code {rc}")
+    check_log(s.hivemind)
+
+
 def scenario_redundancy(build_dir):
     """With redundancy 3 on a swarm of 6, every account ends on exactly 3 nodes, the nodes each
     holding within a request's worth of the others; when a node leaves the network, its
@@ -1508,6 +1571,7 @@ FAST = [
     "restart",
     "body_limit",
     "retry",
+    "registration",
     "redundancy",
     "rebalance",
 ]

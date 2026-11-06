@@ -86,8 +86,8 @@ inline constexpr size_t PUSH_BACKLOG_MAX = 50_k;
 // Push flow control.  Every PUSH_ACK_INTERVAL-th push to a service is followed by a notifier.ack
 // request, which the notifier answers once it has taken everything queued before it, and pushes to
 // the service stop while PUSH_WINDOW are unacknowledged.  The window plus two outstanding acks must
-// fit the notifier's oxenmq queue for its category (200 by default; see register_service), and sits
-// far below zmq's 1000-message send queue so that neither a push nor an ack is ever refused.
+// fit the notifier's oxenmq queue for its category (200 by default; see register_notifier), and
+// sits far below zmq's 1000-message send queue so that neither a push nor an ack is ever refused.
 inline constexpr size_t PUSH_ACK_INTERVAL = 95;
 inline constexpr size_t PUSH_WINDOW = 2 * PUSH_ACK_INTERVAL;
 
@@ -97,6 +97,10 @@ inline constexpr auto PUSH_BLOCKED_REPORT_INTERVAL = 30s;
 // A notifier whose connection failed has this long to register again before its backlog is
 // dropped and it is treated as any unregistered service.
 inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
+
+// The notifier registration protocol a notifier must speak to be registered (see
+// register_notifier).
+inline constexpr int NOTIFIER_PROTOCOL_VERSION = 1;
 
 // The most monitor requests in flight at once, across all nodes, unless configured otherwise.
 // Unthrottled, each node sends its next request as soon as its last is answered, so a cold start
@@ -205,7 +209,7 @@ class HiveMind {
 
     // Per-service push flow control and backlog.  Guarded by notify_mutex_.
     struct ServicePushes {
-        // The connection the counters refer to; on_reg_service() resets them when it changes.
+        // The connection the counters refer to; on_register_notifier() resets them when it changes.
         oxenmq::ConnectionID conn;
         // Pushes sent on conn not yet covered by a notifier.ack reply.
         size_t unacked = 0;
@@ -495,7 +499,8 @@ class HiveMind {
     ~HiveMind();
 
   private:
-    void on_reg_service(oxenmq::Message& m);
+    void on_register_notifier(oxenmq::Message& m);
+    void on_obsolete_register_service(oxenmq::Message& m);
 
     void process_notifications();
 

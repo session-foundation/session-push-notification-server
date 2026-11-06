@@ -160,10 +160,23 @@ HiveMind::HiveMind(Config conf_in) :
     // Commands for local services to talk to us:
     omq_.add_category("admin", oxenmq::AuthLevel::admin)
 
-            // Registers a notification service.  This gets called with a single argument containing
-            // the service name(s) (e.g. "apns", "firebase") that should be pushed to this
-            // connection when notifications or subscriptions arrive.  (If a single connection
-            // provides multiple services it should invoke this endpoint multiple times).
+            // Registers a notification service.  This is a request command taking two parts: the
+            // service name (e.g. "apns", "firebase") that should be pushed to this connection when
+            // notifications or subscriptions arrive, and a bencoded dict of:
+            //
+            // - '' -- the notifier registration protocol version, which must be the hivemind's
+            //   (NOTIFIER_PROTOCOL_VERSION, currently 1).
+            // - 'max_body' -- the largest message body, in bytes, the notifier can deliver, which
+            //   must be at least the hivemind's body limit (monitor_body_limit).
+            //
+            // Other keys are reserved, and ignored.  (Protocol 0 was register_service, below.)  The
+            // reply is empty if the service is registered.  Otherwise it
+            // is a message saying why not, which the hivemind also logs as critical: the notifier
+            // cannot work with this hivemind, and should not keep trying.  A notifier re-registers
+            // periodically, so that a restarted hivemind learns of it again, and should take no
+            // reply at all as the hivemind being unavailable rather than as a refusal.  (If a
+            // single connection provides multiple services it should invoke this endpoint multiple
+            // times).
             //
             // The invoking OMQ connection must accept two commands:
             //
@@ -217,9 +230,19 @@ HiveMind::HiveMind(Config conf_in) :
             // one).  A notifier without the command never answers, and its pushes stop for good
             // once the window fills.  Pushes the hivemind cannot send are held, in order, until it
             // can, including across a notifier restart.
+            .add_request_command(
+                    "register_notifier",
+                    ExcWrapper{*this, &HiveMind::on_register_notifier, "on_register_notifier"})
+
+            // Deprecated: protocol 0's registration, a plain command with the service name alone.
+            // It registers nothing, and only logs, as critical, that the notifier must move to
+            // register_notifier.
             .add_command(
                     "register_service",
-                    ExcWrapper{*this, &HiveMind::on_reg_service, "on_reg_service"})
+                    ExcWrapper{
+                            *this,
+                            &HiveMind::on_obsolete_register_service,
+                            "on_obsolete_register_service"})
 
             // Called periodically to notify us of notifier stats (notifications, failures, etc.)
             .add_command(
@@ -575,20 +598,46 @@ void ExcWrapper::operator()(quic::message& m) {
     }
 }
 
-void HiveMind::on_reg_service(oxenmq::Message& m) {
-    if (m.data.size() != 1) {
-        log::error(cat, "{}-part data, expected 1", m.data.size());
-        return;
-    }
+void HiveMind::on_obsolete_register_service(oxenmq::Message& m) {
+    log::critical(
+            cat,
+            "'{}' notifier registered through the obsolete register_service interface (protocol "
+            "0); this hivemind requires register_notifier protocol {}",
+            m.data.empty() ? "unnamed"sv : m.data[0],
+            NOTIFIER_PROTOCOL_VERSION);
+}
+
+void HiveMind::on_register_notifier(oxenmq::Message& m) {
+    auto refuse = [&m](std::string why) {
+        log::critical(cat, "{}", why);
+        m.send_reply(std::move(why));
+    };
+
+    if (m.data.size() != 2)
+        return refuse("malformed {}-part notifier registration, expected 2"_format(m.data.size()));
     std::string service{m.data[0]};
-    if (service.empty()) {
-        log::error(cat, "service registration used illegal empty service name");
-        return;
+    if (service.empty())
+        return refuse("notifier registration used illegal empty service name");
+    if (service.size() > 32)
+        return refuse("notifier service name too long ({})"_format(service.size()));
+
+    int version;
+    int64_t max_body;
+    try {
+        oxenc::bt_dict_consumer d{m.data[1]};
+        version = d.require<int>("");
+        max_body = d.require<int64_t>("max_body");
+    } catch (const std::exception& e) {
+        return refuse("'{}' notifier sent an invalid registration: {}"_format(service, e.what()));
     }
-    if (service.size() > 32) {
-        log::error(cat, "service name too long ({})", service.size());
-        return;
-    }
+    if (version != NOTIFIER_PROTOCOL_VERSION)
+        return refuse(
+                "'{}' notifier speaks protocol {}, this hivemind requires {}"_format(
+                        service, version, NOTIFIER_PROTOCOL_VERSION));
+    if (max_body < config.monitor_body_limit)
+        return refuse(
+                "'{}' notifier accepts bodies of at most {} B, below the hivemind's body limit of "
+                "{} B"_format(service, max_body, config.monitor_body_limit));
 
     {
         std::lock_guard lock{services_mutex_};
@@ -601,6 +650,7 @@ void HiveMind::on_reg_service(oxenmq::Message& m) {
             log::info(cat, "'{}' notification service reconnected/reregistered", service);
         } else {
             log::trace(cat, "'{}' notification service confirmed (already registered)", service);
+            m.send_reply();
             return;
         }
     }
@@ -614,6 +664,7 @@ void HiveMind::on_reg_service(oxenmq::Message& m) {
         drain_ = true;
     }
     notify_cv_.notify_one();
+    m.send_reply();
 }
 
 void HiveMind::service_gone(const std::string& service, oxenmq::ConnectionID conn) {
@@ -745,7 +796,8 @@ void HiveMind::request_ack(const std::string& service, const oxenmq::ConnectionI
                     log::critical(
                             cat,
                             "'{}' notifier did not answer notifier.ack ({}); it must provide it "
-                            "(see register_service), or its pushes stop once {} are unacknowledged",
+                            "(see register_notifier), or its pushes stop once {} are "
+                            "unacknowledged",
                             service,
                             "{}"_format(fmt::join(data, " ")),
                             PUSH_WINDOW);
@@ -769,7 +821,7 @@ void HiveMind::request_ack(const std::string& service, const oxenmq::ConnectionI
                     notify_cv_.notify_one();
             },
             // Effectively none: the notifier answers whenever it gets there, and a connection that
-            // dies first is replaced by on_reg_service(), after which the reply is ignored.
+            // dies first is replaced by on_register_notifier(), after which the reply is ignored.
             oxenmq::send_option::request_timeout{24h});
 }
 

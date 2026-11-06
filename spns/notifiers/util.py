@@ -8,6 +8,7 @@ from nacl.bindings import (
 )
 from oxenc import bt_serialize, bt_deserialize, to_base64
 import json
+import os
 from threading import Lock
 import time
 from collections import deque
@@ -25,6 +26,50 @@ def derive_notifier_key(name):
             digest_size=32,
             encoder=RawEncoder,
         )
+    )
+
+
+# The notifier registration protocol we speak (see the hivemind's register_notifier).
+NOTIFIER_PROTOCOL_VERSION = 1
+
+# The largest body we can deliver: the most the push services' payload caps leave room for, once it
+# is encrypted and encoded.
+MAX_BODY = 2500
+
+
+def register_notifier(omq, hivemind, service: str):
+    """
+    Registers `service` with the hivemind.  A refusal, or any failure but a timeout, means this
+    notifier cannot work with this hivemind, so it ends the process; a timeout (which a lost
+    connection also gives) is only a warning, as the hivemind may be down or restarting, and the
+    periodic re-registration tries again.
+    """
+
+    def on_reply(data):
+        if data:
+            config.logger.critical(
+                f"The hivemind refused the {service} notifier: {bytes(data[0]).decode(errors='replace')}"
+            )
+            # This runs on an oxenmq thread, where sys.exit() would end only the thread.
+            os._exit(1)
+
+    def on_reply_failure(data):
+        reason = [bytes(d) for d in data]
+        if reason == [b"TIMEOUT"]:
+            config.logger.warning(
+                f"No reply from the hivemind to the {service} notifier's registration"
+            )
+            return
+        config.logger.critical(f"The {service} notifier's registration failed: {reason}")
+        os._exit(1)
+
+    omq.request(
+        hivemind,
+        "admin.register_notifier",
+        service,
+        bt_serialize({"": NOTIFIER_PROTOCOL_VERSION, "max_body": MAX_BODY}),
+        on_reply=on_reply,
+        on_reply_failure=on_reply_failure,
     )
 
 
