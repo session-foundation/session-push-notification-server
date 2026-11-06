@@ -131,10 +131,12 @@ void SNode::on_connected(quic::Connection& c) {
 
     hivemind_.finished_connect();
 
-    if (!no_conn)
+    if (!no_conn) {
+        hivemind_.count_connection();
         sub_jq_.call_soon([this, self = shared_from_this(), gen = conn_gen_] {
             hivemind_.on_node_connected(*this, gen);
         });
+    }
 }
 
 void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
@@ -178,6 +180,18 @@ void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
 
     if (hivemind_.has_quic_out() && is_failed_connect)
         hivemind_.finished_connect();
+}
+
+uint64_t SNode::take_sent_bytes() {
+    assert(jq_.inside());
+    if (sampled_gen_ != conn_gen_) {
+        sampled_gen_ = conn_gen_;
+        sampled_acked_ = 0;
+    }
+    uint64_t acked = stream_ ? stream_->acked_bytes() : sampled_acked_;
+    auto sent = acked - sampled_acked_;
+    sampled_acked_ = acked;
+    return sent;
 }
 
 bool SNode::connection_up(int gen) {
@@ -242,7 +256,8 @@ void SNode::send_request(
             timeout,
             [wself = weak_from_this(), gen, on_reply = std::move(on_reply)](
                     quic::message response) mutable {
-                if (auto self = wself.lock())
+                if (auto self = wself.lock()) {
+                    self->hivemind_.count_received(response.body().size());
                     self->sub_jq_.call_soon([self = std::move(self),
                                              gen,
                                              on_reply = std::move(on_reply),
@@ -250,6 +265,7 @@ void SNode::send_request(
                         if (self->up_ && gen == self->gen_)
                             on_reply(*self, std::move(response));
                     });
+                }
             });
 }
 
@@ -525,6 +541,7 @@ void SNode::retry_later(std::vector<const SwarmPubkey*> accounts) {
 }
 
 void SNode::on_notify(quic::message msg) {
+    hivemind_.count_received(msg.body().size());
     hivemind_.on_message_notification(std::move(msg));
 }
 

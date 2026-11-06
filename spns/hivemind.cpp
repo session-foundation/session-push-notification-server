@@ -713,6 +713,7 @@ ON CONFLICT (service, name) DO UPDATE
 void HiveMind::on_message_notification(quic::message m) {
     {
         std::lock_guard lock{notify_mutex_};
+        notifications_received_++;
         if (notify_queue_bytes_ >= NOTIFY_QUEUE_MAX_BYTES) {
             notifications_dropped_++;
             return;
@@ -830,6 +831,7 @@ void HiveMind::backlog_push(const std::string& service, std::string push) {
     auto& s = service_pushes_[service];
     if (s.backlog.size() >= PUSH_BACKLOG_MAX) {
         s.dropped++;
+        s.dropped_total++;
         return;
     }
     s.backlog.push_back(std::move(push));
@@ -930,6 +932,7 @@ void HiveMind::process_notifications() {
                     conn_it != services.end() && conn_it->second == s.conn) {
                     while (!s.backlog.empty() && s.unacked < PUSH_WINDOW) {
                         ++s.unacked;
+                        ++s.sent;
                         drain.emplace_back(
                                 service,
                                 s.conn,
@@ -1150,6 +1153,7 @@ WHERE account IN ({}))"_format(placeholders),
                 }
             }
         } catch (const std::exception& e) {
+            lookup_failures_++;
             // Nothing has been marked seen or sent, so the whole batch can go back, ahead of
             // whatever arrived since, to be tried again once the database is back.
             log::warning(
@@ -1247,6 +1251,7 @@ WHERE account IN ({}))"_format(placeholders),
                         s.backlog.empty() && s.unacked < PUSH_WINDOW) {
                         send = true;
                         ack = ++s.unacked % PUSH_ACK_INTERVAL == 0;
+                        ++s.sent;
                     } else if (s.unacked >= PUSH_WINDOW && !s.blocked_since) {
                         s.blocked_since = steady_clock::now();
                         ++s.blocks;
@@ -1280,6 +1285,9 @@ WHERE account IN ({}))"_format(placeholders),
             log::warning(cat, "Failed to update notification stats: {}", e.what());
         }
         pushes_processed_ += process.size();
+        notifications_unique_ += parsed.size();
+        pushes_produced_ += notify_count;
+        lookup_batches_++;
     }
 }
 
@@ -1378,10 +1386,42 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
 
     {
         std::lock_guard lock{notify_mutex_};
+        auto now = steady_clock::now();
         for (const auto& [service, s] : service_pushes_) {
-            result["notifier_queue"][service]["backlog"] = s.backlog.size();
-            result["notifier_queue"][service]["unacked"] = s.unacked;
+            auto& q = result["notifier_queue"][service];
+            q["backlog"] = s.backlog.size();
+            q["unacked"] = s.unacked;
+            q["sent"] = s.sent;
+            q["dropped"] = s.dropped_total;
+            q["blocked_for"] =
+                    s.blocked_since
+                            ? std::optional{std::chrono::duration<double>(now - *s.blocked_since)
+                                                    .count()}
+                            : std::nullopt;
         }
+        result["incoming"] = {
+                {"queue", notify_queue_.size()},
+                {"queue_bytes", notify_queue_bytes_},
+                {"received", notifications_received_.load()},
+                {"unique", notifications_unique_.load()},
+                {"pushes", pushes_produced_.load()},
+                {"dropped", notifications_dropped_.load()},
+                {"lookup_batches", lookup_batches_.load()},
+                {"lookup_failures", lookup_failures_.load()}};
+    }
+    {
+        std::lock_guard lock{services_mutex_};
+        for (const auto& [service, dropped] : registrations_dropped_)
+            result["registrations_dropped"][service] = {
+                    {"ids", dropped.first}, {"subscriptions", dropped.second}};
+    }
+    auto [db_idle, db_in_use] = pool_.usage();
+    result["db_connections"] = {{"idle", db_idle}, {"in_use", db_in_use}};
+    {
+        std::ifstream statm{"/proc/self/statm"};
+        size_t pages = 0, resident = 0;
+        if (statm >> pages >> resident)
+            result["rss"] = resident * sysconf(_SC_PAGESIZE);
     }
 
     sub_jq_.call_soon([when_ready = std::move(when_ready),
@@ -1486,13 +1526,178 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
                 {"wrong_swarm", ms.wrong_swarm},
                 {"rejected", ms.rejected}};
         result["accounts_moved"] = moved_total_;
+        result["block_age"] = last_block_.second < 0
+                                    ? std::nullopt
+                                    : std::optional{std::chrono::duration<double>(
+                                                            steady_clock::now() - last_block_time_)
+                                                            .count()};
         result["connections"] = n_conns;
         result["pending_connections"] = pending_connects_.load();
+        result["connections_established"] = connections_established_.load();
         result["uptime"] =
                 std::chrono::duration<double>(system_clock::now() - startup_time).count();
 
-        when_ready(std::move(result));
+        // The last of it is the QUIC loop's, for its nodes' cooldowns and sent bytes.
+        jq_.call_soon(
+                [this, when_ready = std::move(when_ready), result = std::move(result)]() mutable {
+                    int64_t cooling = 0;
+                    for (const auto& sn : conns_) {
+                        cooling += sn->cooling_down();
+                        bytes_sent_ += sn->take_sent_bytes();
+                    }
+                    result["cooling_down"] = cooling;
+                    result["bytes_sent"] = bytes_sent_;
+                    result["bytes_received"] = bytes_received_.load();
+                    when_ready(std::move(result));
+                });
     });
+}
+
+// The multi-line periodic status report, from the stats now and at the previous report `dt`
+// seconds ago (null at the first), as rates over the interval for what counts up.
+static std::string status_report(const nlohmann::json& s, const nlohmann::json& prev, double dt) {
+    auto num = [](const nlohmann::json& j, const auto&... path) -> double {
+        const nlohmann::json* p = &j;
+        for (std::string_view k : {std::string_view{path}...}) {
+            if (!p->is_object() || !p->contains(k))
+                return 0;
+            p = &(*p)[k];
+        }
+        return p->is_number() ? p->get<double>() : 0;
+    };
+    auto delta = [&](const auto&... path) { return num(s, path...) - num(prev, path...); };
+    auto rate = [&](const auto&... path) { return dt > 0 ? delta(path...) / dt : 0.0; };
+    auto duration = [](double secs) {
+        auto t = static_cast<int64_t>(secs);
+        return t >= 3600 ? "{}h{:02}m"_format(t / 3600, t / 60 % 60)
+             : t >= 60   ? "{}m{:02}s"_format(t / 60, t % 60)
+                         : "{}s"_format(t);
+    };
+
+    std::string out = "Status report, over the last {}:"_format(duration(dt));
+
+    out += "\n  Notifiers:";
+    if (!s.contains("notifier_queue") && !s.contains("notifier"))
+        out += " none";
+    std::set<std::string> services;
+    for (const auto* key : {"notifier_queue", "notifier", "registrations_dropped"})
+        if (s.contains(key))
+            for (const auto& [service, v] : s[key].items())
+                services.insert(service);
+    for (const auto& service : services) {
+        out += "\n    {}: {:.1f} pushes/s, {} unacked, {} backlogged, {} dropped"_format(
+                service,
+                rate("notifier_queue", service, "sent"),
+                num(s, "notifier_queue", service, "unacked"),
+                num(s, "notifier_queue", service, "backlog"),
+                delta("notifier_queue", service, "dropped"));
+        if (auto b = s["notifier_queue"][service]["blocked_for"]; b.is_number())
+            out += "; window blocked for {}"_format(duration(b.get<double>()));
+        if (s.contains("notifier") && s["notifier"].contains(service))
+            for (const auto& [stat, v] : s["notifier"][service].items())
+                if (v.is_number_integer())
+                    out += "; {} {:.1f}/s"_format(stat, rate("notifier", service, stat));
+        if (auto ids = delta("registrations_dropped", service, "ids"); ids > 0)
+            out += "; registrations dropped: {} ids / {} subscriptions"_format(
+                    ids, delta("registrations_dropped", service, "subscriptions"));
+    }
+
+    auto batches = delta("incoming", "lookup_batches");
+    out += "\n  Incoming: {:.1f} notifications/s from nodes, {:.1f}/s unique, {:.1f} pushes/s; "
+           "queue {} ({} B); {} dropped; {:.2f} lookup batches/s of {:.1f} on average; {} lookup "
+           "failures"_format(
+                   rate("incoming", "received"),
+                   rate("incoming", "unique"),
+                   rate("incoming", "pushes"),
+                   num(s, "incoming", "queue"),
+                   num(s, "incoming", "queue_bytes"),
+                   delta("incoming", "dropped"),
+                   rate("incoming", "lookup_batches"),
+                   batches > 0 ? delta("incoming", "unique") / batches : 0.0,
+                   delta("incoming", "lookup_failures"));
+
+    out += "\n  Subscriptions: {} accounts, {} subscriptions; swarm index {} accounts in {} "
+           "swarms; "
+           "schedule {}; {} placed to send; {}/{} requests in flight, "
+           "{} nodes waiting; over the interval {} requests ({} answered, {} failed, {} timed "
+           "out), {} refused for the wrong swarm, {} accounts moved, {} monitor sessions "
+           "resumed"_format(
+                   num(s, "accounts_monitored"),
+                   num(s, "subscriptions_distinct"),
+                   num(s, "swarm_index", "accounts"),
+                   num(s, "swarm_index", "swarms"),
+                   num(s, "schedule"),
+                   num(s, "pending", "accounts"),
+                   num(s, "pending", "requests"),
+                   num(s, "pending", "request_cap"),
+                   num(s, "pending", "waiting_nodes"),
+                   delta("monitor_requests", "sent"),
+                   delta("monitor_requests", "answered"),
+                   delta("monitor_requests", "failed"),
+                   delta("monitor_requests", "timed_out"),
+                   delta("monitor_requests", "wrong_swarm"),
+                   delta("accounts_moved"),
+                   delta("monitor_sessions", "resumed"));
+
+    out += "\n  Coverage: {}/{} accounts on their target number of nodes (redundancy {}), {} below "
+           "it, {} on none; node load {}/{:.0f}/{} accounts (min/avg/max); over the interval {} "
+           "placements, {} more by nodes' scans, {} moving a monitor to another node"_format(
+                   num(s, "coverage", "at_target"),
+                   num(s, "coverage", "accounts"),
+                   num(s, "coverage", "redundancy"),
+                   num(s, "coverage", "below_target"),
+                   num(s, "coverage", "at_zero"),
+                   num(s, "node_load", "min"),
+                   num(s, "node_load", "avg"),
+                   num(s, "node_load", "max"),
+                   delta("placements", "placed"),
+                   delta("placements", "by_scans"),
+                   delta("placements", "moved"));
+
+    out += "\n  State: {}; at startup {}; over the interval {} monitor sessions resumed, {} missed "
+           "notifications for {} accounts discarded beyond the replay budget"_format(
+                   s.contains("state") && s["state"]["saved_ago"].is_number()
+                           ? "saved {} ago, {} accounts in {:.1f} MB (snapshot {:.0f} ms, write "
+                             "{:.0f} ms)"_format(
+                                     duration(s["state"]["saved_ago"].get<double>()),
+                                     num(s, "state", "accounts"),
+                                     num(s, "state", "bytes") / 1e6,
+                                     num(s, "state", "snapshot_ms"),
+                                     num(s, "state", "write_ms"))
+                           : "not saved yet"s,
+                   s.contains("restored") && s["restored"]["age"].is_number()
+                           ? "restored {} accounts on {} nodes from a save {} old ({} nodes "
+                             "dropped)"_format(
+                                     num(s, "restored", "accounts"),
+                                     num(s, "restored", "nodes"),
+                                     duration(s["restored"]["age"].get<double>()),
+                                     num(s, "restored", "nodes_dropped"))
+                           : "nothing restored"s,
+                   delta("monitor_sessions", "resumed"),
+                   delta("monitor_sessions", "replay_discarded"),
+                   delta("monitor_sessions", "replay_discarded_accounts"));
+
+    out += "\n  Nodes: {}/{} connected, {} connecting, {} cooling down; {} connections made; "
+           "{:.1f} kB/s sent, {:.1f} kB/s received"_format(
+                   num(s, "connections"),
+                   num(s, "snodes"),
+                   num(s, "pending_connections"),
+                   num(s, "cooling_down"),
+                   delta("connections_established"),
+                   rate("bytes_sent") / 1000,
+                   rate("bytes_received") / 1000);
+
+    out += "\n  Process: RSS {:.0f} MB; block {} ({}); up {}; database connections {} idle, {} in "
+           "use"_format(
+                   num(s, "rss") / 1e6,
+                   num(s, "block_height"),
+                   s.contains("block_age") && s["block_age"].is_number()
+                           ? "hash changed {} ago"_format(duration(s["block_age"].get<double>()))
+                           : "none yet"s,
+                   duration(num(s, "uptime")),
+                   num(s, "db_connections", "idle"),
+                   num(s, "db_connections", "in_use"));
+    return out;
 }
 
 void HiveMind::on_get_stats(oxenmq::Message& m) {
@@ -1532,7 +1737,16 @@ void HiveMind::log_stats(std::string pre_cmd) {
         sd_notify(0, sd_out.c_str());
 
         if (auto now = std::chrono::steady_clock::now(); now - last_stats_logged >= 4min + 55s) {
-            log::info(stats, "Status: {}", stat_line);
+            double dt = !last_report_
+                              ? std::chrono::duration<double>(system_clock::now() - startup_time)
+                                        .count()
+                              : std::chrono::duration<double>(now - last_report_time_).count();
+            log::info(
+                    stats,
+                    "{}",
+                    status_report(s, last_report_ ? *last_report_ : nlohmann::json{}, dt));
+            last_report_ = std::make_unique<nlohmann::json>(std::move(s));
+            last_report_time_ = now;
             last_stats_logged = now;
         } else {
             log::debug(stats, "Status: {}", stat_line);
@@ -1579,7 +1793,13 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
         return;
     }
 
-    log::info(
+    {
+        std::lock_guard lock{services_mutex_};
+        auto& [ids, subs] = registrations_dropped_[std::string{service}];
+        ids += matched;
+        subs += deleted;
+    }
+    log::debug(
             cat,
             "Dropped {} (of {} requested) {} service IDs, totalling {} account subscriptions",
             matched,
@@ -2098,6 +2318,7 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
             }
 
             last_block_ = {std::move(new_hash), new_height};
+            last_block_time_ = steady_clock::now();
         }
 
         using Version = std::optional<std::array<uint16_t, 3>>;

@@ -218,6 +218,8 @@ class HiveMind {
         std::deque<std::string> backlog;
         // Dropped for exceeding PUSH_BACKLOG_MAX, since last reported.
         int64_t dropped = 0;
+        // Pushes sent, and dropped for exceeding PUSH_BACKLOG_MAX, since startup.
+        int64_t sent = 0, dropped_total = 0;
         // Times the window filled since last reported, and since when it has been full.
         int64_t blocks = 0;
         std::optional<steady_time> blocked_since;
@@ -264,6 +266,21 @@ class HiveMind {
 
     std::thread notify_proc_thread_;
     std::atomic<int64_t> pushes_processed_{0};
+
+    // Counts since startup, for get_stats and the periodic status report: notifications from the
+    // nodes, those left after de-duplication, the pushes they made, the batches they were looked
+    // up in and the lookups that failed; connections established to nodes, and the bytes of the
+    // messages they sent us.
+    std::atomic<int64_t> notifications_received_{0}, notifications_unique_{0}, pushes_produced_{0},
+            lookup_batches_{0}, lookup_failures_{0}, connections_established_{0},
+            bytes_received_{0};
+    // The bytes the nodes have acknowledged receiving from us, as sampled; QUIC loop (jq_) only.
+    int64_t bytes_sent_ = 0;
+
+    // The previous status report's stats, and when it was made.  (Behind a pointer only because
+    // this header has nlohmann::json just declared.)
+    std::unique_ptr<nlohmann::json> last_report_;
+    steady_time last_report_time_{};
 
     // Every node, for make_conns(); QUIC loop (jq_) only.
     std::vector<std::shared_ptr<hive::SNode>> conns_;
@@ -434,8 +451,9 @@ class HiveMind {
     // Clears the node's bits across its swarm's accounts, keeping its slot.
     void clear_slot(Swarm& swarm, hive::SNode& node);
 
-    // last block hash & height
+    // last block hash & height, and when the hash last changed
     std::pair<std::string, int64_t> last_block_{"", -1};
+    steady_time last_block_time_{};
 
     // How many distinct subscriptions subscribers_ holds.
     size_t subscription_count_ = 0;
@@ -466,6 +484,8 @@ class HiveMind {
     // Services whose connection failed, and since when: their pushes wait in service_pushes_ for
     // the notifier to register again.
     std::unordered_map<std::string, steady_time> services_gone_;
+    // service -> the service ids and subscriptions its notifier has dropped since startup.
+    std::unordered_map<std::string, std::pair<int64_t, int64_t>> registrations_dropped_;
     std::mutex services_mutex_;
     void service_gone(const std::string& service, oxenmq::ConnectionID conn);
 
@@ -672,6 +692,11 @@ class HiveMind {
         monitor_session_stats_.replay_discarded += discarded;
         monitor_session_stats_.replay_discarded_accounts += accounts;
     }
+
+    // Called by an SNode, on the QUIC loop, for each connection it establishes and each message
+    // it receives.
+    void count_connection() { connections_established_++; }
+    void count_received(size_t bytes) { bytes_received_ += bytes; }
 
     void load_saved_subscriptions();
 

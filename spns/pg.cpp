@@ -31,6 +31,7 @@ PGConn PGConnPool::get() {
 
     if (!conn)
         conn = make_conn();
+    in_use_++;
     return PGConn{*this, std::move(conn)};
 }
 
@@ -74,7 +75,13 @@ std::unique_ptr<pqxx::connection> PGConnPool::make_conn() {
     return conn;
 }
 
+std::pair<size_t, int> PGConnPool::usage() {
+    std::lock_guard lock{mutex_};
+    return {idle_conns_.size(), in_use_.load()};
+}
+
 PGConn::~PGConn() {
+    pool_.in_use_--;
     if (conn_)
         pool_.release(std::move(conn_));
 }

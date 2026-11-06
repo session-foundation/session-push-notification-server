@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <mutex>
@@ -48,6 +49,10 @@ class PGConnPool {
     std::deque<std::pair<std::unique_ptr<pqxx::connection>, steady_time>> idle_conns_;
     std::mutex mutex_;
     int count_ = 0;
+    // Connections handed out by get() and not yet given back (or closed).
+    std::atomic<int> in_use_ = 0;
+
+    friend class PGConn;
 
   public:
     /// After how long of being unused before we kill off idle connections.  (This isn't an active
@@ -93,6 +98,9 @@ class PGConnPool {
     /// automatically whenever `release` or `get` are called, but can be called externally (e.g. on
     /// a timer) if more strict idle time management is desired.
     void clear_idle_conns();
+
+    /// The connections idle in the pool, and those in use.
+    std::pair<size_t, int> usage();
 
   protected:
     std::unique_ptr<pqxx::connection> pop_conn();

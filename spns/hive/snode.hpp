@@ -112,6 +112,9 @@ class SNode : public std::enable_shared_from_this<SNode> {
     // Incremented as each connection is lost, and handed to the subscription thread with each
     // connection's events, so that it can tell which connection one is about.
     int conn_gen_ = 0;
+    // The connection whose stream take_sent_bytes() last sampled, and its acknowledged bytes then.
+    int sampled_gen_ = 0;
+    uint64_t sampled_acked_ = 0;
 
     // Read anywhere, written on the QUIC loop.
     std::atomic<bool> connected_ = false;
@@ -176,6 +179,13 @@ class SNode : public std::enable_shared_from_this<SNode> {
     void connect();
 
     void disconnect();
+
+    /// Whether the node is waiting out a cooldown before it is connected to again.
+    bool cooling_down() const { return cooldown_until_ && *cooldown_until_ > steady_clock::now(); }
+
+    /// The bytes the node has acknowledged receiving from us since the last call; what was sent
+    /// on a connection since lost after the last call is not counted.
+    uint64_t take_sent_bytes();
 
     // --- Callable from any thread ---
 
