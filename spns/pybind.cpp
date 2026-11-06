@@ -115,11 +115,10 @@ PYBIND11_MODULE(spns_hivemind, m) {
             .def_readwrite(
                     "quic_keys",
                     &Config::quic_keys,
-                    "Ed25519 combined secret key + pubkey value (64 bytes), used for QUIC.")
+                    "Ed25519 combined secret key + pubkey value (64 bytes), used for QUIC; must be "
+                    "set (the default value will not work)")
             .def_readwrite(
-                    "quic_listen",
-                    &Config::quic_listen,
-                    "Optional listen addresses for quic (requires that `quic_key` is set)")
+                    "quic_listen", &Config::quic_listen, "Optional listen addresses for quic")
             .def_property(
                     "filter_lifetime",
                     [](Config& self) { return self.filter_lifetime.count(); },

@@ -631,9 +631,8 @@ class HiveMind {
     // The subscription thread's queue; see sub_loop_.
     quic::JobQueue& sub_jq() { return sub_jq_; }
 
-    // Returns the creds object for establishing outbound connections.  TODO: This isn't needed once
-    // all nodes are running an updated libquic, but older libquic doesn't allow no-creds
-    // connections.
+    // Returns the creds object for establishing outbound connections: our configured QUIC key,
+    // which storage servers recognise as the privileged push server's.
     const std::shared_ptr<quic::TLSCreds>& creds_out() { return creds_out_; }
 
     // Called by an SNode once its connection numbered `gen` is established, to fill and send its

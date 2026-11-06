@@ -248,13 +248,23 @@ class Hivemind:
         filter_lifetime=300,
         log_level="info",
         name="hivemind",
+        quic_key=None,
         config="",
     ):
-        """`config`: more [hivemind] settings."""
+        """`quic_key`: the path of the QUIC key of an earlier instance, to start one the storage
+        nodes take for the same; by default a new key.  `config`: more [hivemind] settings."""
+        from nacl.signing import SigningKey
+
         self.log_path = f"{WORK}/{name}.log"
         key = f"{WORK}/hivemind.key"
         with open(key, "wb") as f:
             f.write(os.urandom(32))
+        if not quic_key:
+            quic_key = f"{WORK}/{name}-quic.key"
+            sk = SigningKey.generate()
+            with open(quic_key, "wb") as f:
+                f.write(bytes(sk) + bytes(sk.verify_key))
+        self.quic_key = quic_key
         with open(f"{WORK}/spns.ini", "w") as f:
             f.write(
                 f"""[db]
@@ -271,6 +281,7 @@ notifiers_expected = dummy
 {config}
 [keys]
 hivemind = {key}
+quic = {quic_key}
 """
             )
         env = dict(
@@ -372,15 +383,18 @@ class Setup:
 
     def restart_hivemind(self, name):
         """Stops the hivemind and its notifier, then yields, for the scenario to act while it is
-        down; resumed, starts a new one with the same settings, and a new notifier, and waits for it
-        to connect to every node."""
+        down; resumed, starts a new one as the same QUIC instance with the same settings, and a new
+        notifier, and waits for it to connect to every node."""
         rc = self.hivemind.stop()
         check(rc == 0, f"hivemind exit code {rc}")
         self.stopped.append(self.hivemind)
         self.notifier.stop()
         yield
         self.network.cmd("mark")
-        self.hivemind = Hivemind(self.build_dir, **{**self.hivemind_args, "name": name})
+        self.hivemind = Hivemind(
+            self.build_dir,
+            **{**self.hivemind_args, "name": name, "quic_key": self.hivemind.quic_key},
+        )
         self.hivemind.wait_socket()
         self.notifier = Proc(f"notifier-{name}", [f"{FAKES}/fake_notifier", HIVEMIND_SOCK])
         check(self.notifier.readline(120) == "registered", "new notifier did not register")

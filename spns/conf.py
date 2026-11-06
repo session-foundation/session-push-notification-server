@@ -247,7 +247,11 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
     config.omq_privkey = PRIVKEYS["hivemind"].encode()
     config.omq_pubkey = PUBKEYS["hivemind"].encode()
 
-    if "quic" in PRIVKEYS:
-        config.quic_keys = PRIVKEYS["quic"].encode() + PUBKEYS["quic"].encode()
+    if "quic" not in PRIVKEYS:
+        raise RuntimeError(
+            f"[keys] quic is required in {conf_ini}: the hivemind's Ed25519 key, whose pubkey "
+            "storage servers recognise as the privileged push server's"
+        )
+    config.quic_keys = PRIVKEYS["quic"].encode() + PUBKEYS["quic"].encode()
 
     return config

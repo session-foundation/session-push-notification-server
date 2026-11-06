@@ -269,11 +269,13 @@ HiveMind::HiveMind(Config conf_in) :
     const auto out_alpn = quic::opt::outbound_alpn("oxenstorage");
     const auto in_alpn = quic::opt::inbound_alpn("spns");
 
+    // Outbound connections present our configured key whether or not we listen: storage servers
+    // recognise its pubkey as the privileged push server's, whose monitor sessions get the large
+    // limits and a pool of missed notifications of their own.
+    creds_out_ = quic::GNUTLSCreds::make_from_ed_seckey(config.quic_keys.sv());
+
     if (!config.quic_listen.empty()) {
-        if (!config.quic_keys)
-            throw std::runtime_error{"Configuration error: quic_listen requires quic_keys"};
-        creds_in_ = quic::GNUTLSCreds::make_from_ed_seckey(config.quic_keys->sv());
-        creds_out_ = creds_in_;
+        creds_in_ = creds_out_;
 
         for (const auto& addr : config.quic_listen) {
             // We only use one address for outbound connections, but it needs to be IPv4 capable
@@ -303,18 +305,6 @@ HiveMind::HiveMind(Config conf_in) :
                 quic_out_ = ep;
             quic_in_.push_back(std::move(ep));
         }
-    } else {
-        // TODO: Once all nodes are running the SS version that comes with 11.6.0+ we can just get
-        // rid of creds_out_ and remove it from the `connect()` calls to do unauthenticated
-        // connections (which are allowed in SS 2.11.1+, which comes with 11.6.0+), but in earlier
-        // versions of quic that results in stateless reset-rejected connections.
-        //
-        // Thus for now, this randomly generated key:
-        std::array<unsigned char, crypto_sign_ed25519_PUBLICKEYBYTES> pk;
-        std::array<unsigned char, crypto_sign_ed25519_SECRETKEYBYTES> sk;
-        crypto_sign_ed25519_keypair(pk.data(), sk.data());
-        creds_out_ = quic::GNUTLSCreds::make_from_ed_seckey(
-                std::string_view{reinterpret_cast<const char*>(sk.data()), sk.size()});
     }
     if (!quic_out_) {
         // Either we aren't listening, or aren't listening on any IPv4 capable address so add

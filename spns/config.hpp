@@ -34,8 +34,11 @@ struct Config {
     std::vector<oxen::quic::Address> quic_listen;
 
     // The Ed25519 keypair to use for QUIC connections.  This is the 64-byte libsodium secret key
-    // value (i.e. the 32 byte seed followed by 32 byte pubkey).
-    std::optional<Ed25519Secret> quic_keys;
+    // value (i.e. the 32 byte seed followed by 32 byte pubkey).  Must be set: it is presented on
+    // every connection to a storage server, and its pubkey is what nodes recognise as the
+    // privileged push server's, whose monitor sessions get the large limits and their own pool of
+    // missed notifications (an unrecognised key gets a small anonymous session).
+    Ed25519Secret quic_keys;
 
     std::chrono::seconds filter_lifetime = 10min;
 

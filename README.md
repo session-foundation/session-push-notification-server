@@ -132,7 +132,8 @@ start from the `cmake ..` step).
 A `spns.ini.example` file is included in the project root; you should copy this to `spns.ini` and
 edit it to suite your requirements.  The settings inside it are full of comments to guide you
 further in this initial setup, including details on how to create the necessary key for receiving
-onion requests.
+onion requests, and the required QUIC key (`[keys]` `quic`) the hivemind presents to storage
+servers: its pubkey is what storage servers recognise as the privileged push server's.
 
 The notifiers require various magic special files obtained after pleading with the powers that be to
 oh-please-let-us-into-your-blessed-walled-garden!  Here there be dragons because the business model

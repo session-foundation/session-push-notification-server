@@ -104,9 +104,12 @@ startup_wait = 8.0
 hivemind = key_x25519
 onionreq = onionreq_x25519
 
-# This key is the Ed25519 used for the QUIC listener, if QUIC listening is enabled via the
-# [hivemind] quic_listen option.  You can create it using `session-router-config --key FILENAME`
-# (from the session-router-bin package).
+# This key is required: the Ed25519 key used for our connections to storage servers, and for the
+# QUIC listener, if QUIC listening is enabled via the [hivemind] quic_listen option.  Its pubkey is
+# what storage servers recognise as the privileged push server's: its monitor sessions get the large
+# limits and their own pool of missed notifications, where an unrecognised key gets a small
+# anonymous session.  You can create it using `session-router-config --key FILENAME` (from the
+# session-router-bin package).
 quic = key_ed25519
 
 [notify-firebase]
