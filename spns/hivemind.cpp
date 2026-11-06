@@ -1442,13 +1442,24 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         result["snodes"] = sns_.size();
         result["accounts_monitored"] = subscribers_.size();
         result["swarm_index"] = {{"swarms", holding}, {"accounts", indexed}};
-        auto c = coverage();
+        auto c = coverage(true);
         result["coverage"] = {
                 {"redundancy", config.redundancy},
                 {"accounts", c.accounts},
                 {"at_target", c.at_target},
-                {"below_target", c.accounts - c.at_target},
-                {"at_zero", c.at_zero}};
+                {"below_target", c.accounts - c.at_target - c.unsendable},
+                {"partial", c.partial},
+                {"partial_down_only", c.partial_down_only},
+                {"at_zero", c.at_zero},
+                {"on_none",
+                 {{"rejected", c.rejected},
+                  {"retrying", c.retrying},
+                  {"no_node", c.no_node},
+                  {"unacknowledged", c.claimed},
+                  {"other", c.other}}},
+                {"unsendable", c.unsendable},
+                {"lapsed", c.lapsed},
+                {"on_none_accounts", c.described}};
         // How many accounts each connected node holds.
         size_t load_nodes = 0, load_min = 0, load_max = 0, load_total = 0;
         for (const auto& [pk, sn] : sns_)
@@ -1641,13 +1652,24 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    delta("monitor_sessions", "resumed"));
 
     out += "\n  Coverage: {}/{} accounts on their target number of nodes (redundancy {}), {} below "
-           "it, {} on none; node load {}/{:.0f}/{} accounts (min/avg/max); over the interval {} "
-           "placements, {} more by nodes' scans, {} moving a monitor to another node"_format(
+           "it ({} partially, {} of them only on down nodes), {} on none ({} rejected, {} "
+           "retrying, {} no node, {} unacknowledged, {} other), {} unsendable, {} lapsed; node "
+           "load {}/{:.0f}/{} accounts (min/avg/max); over the interval {} placements, {} more by "
+           "nodes' scans, {} moving a monitor to another node"_format(
                    num(s, "coverage", "at_target"),
                    num(s, "coverage", "accounts"),
                    num(s, "coverage", "redundancy"),
                    num(s, "coverage", "below_target"),
+                   num(s, "coverage", "partial"),
+                   num(s, "coverage", "partial_down_only"),
                    num(s, "coverage", "at_zero"),
+                   num(s, "coverage", "on_none", "rejected"),
+                   num(s, "coverage", "on_none", "retrying"),
+                   num(s, "coverage", "on_none", "no_node"),
+                   num(s, "coverage", "on_none", "unacknowledged"),
+                   num(s, "coverage", "on_none", "other"),
+                   num(s, "coverage", "unsendable"),
+                   num(s, "coverage", "lapsed"),
                    num(s, "node_load", "min"),
                    num(s, "node_load", "avg"),
                    num(s, "node_load", "max"),
@@ -1698,6 +1720,13 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    duration(num(s, "uptime")),
                    num(s, "db_connections", "idle"),
                    num(s, "db_connections", "in_use"));
+
+    if (const auto& accounts = get(s, "coverage", "on_none_accounts");
+        accounts.is_array() && !accounts.empty()) {
+        out += "\n  Accounts on no node, or unsendable:";
+        for (const auto& line : accounts)
+            out += "\n    {}"_format(line.get<std::string>());
+    }
     return out;
 }
 
@@ -2560,6 +2589,10 @@ void HiveMind::place(const SwarmPubkey& account, uint16_t prev_acked, bool by_sc
         send_pending(node);
     }
     (by_scan ? scan_placements_ : placements_) += chosen;
+    if (chosen > 0 && account.unplaced != SwarmPubkey::Unplaced::none) {
+        account.unplaced = SwarmPubkey::Unplaced::none;
+        unplaced_detail_.erase(&account);
+    }
     // A node that did not hold the account before takes the place of one that did, while any of
     // those is left out; beyond them it is an addition, not a move.
     moved_placements_ += std::min(fresh, std::popcount<uint16_t>(prev_acked & ~chosen_bits));
@@ -2699,6 +2732,23 @@ void HiveMind::unclaim(hive::SNode& node, const SwarmPubkey& account) {
     if (node.slot < 0 || account.swarm != node.swarm)
         return;
     release(account, swarms_.at(node.swarm), node.slot);
+}
+
+void HiveMind::refused(hive::SNode& node, const SwarmPubkey& account, std::string error) {
+    unclaim(node, account);
+    account.unplaced = SwarmPubkey::Unplaced::rejected;
+    unplaced_detail_[&account] = std::move(error);
+}
+
+void HiveMind::retrying(
+        hive::SNode& node,
+        const std::vector<const SwarmPubkey*>& accounts,
+        std::chrono::milliseconds backoff) {
+    auto why = "{} failed, placed again after {}"_format(node.pubkey, backoff);
+    for (const auto* account : accounts) {
+        account->unplaced = SwarmPubkey::Unplaced::retrying;
+        unplaced_detail_[account] = why;
+    }
 }
 
 const SwarmPubkey* HiveMind::next_claim(hive::SNode& node) {
@@ -2872,37 +2922,147 @@ void HiveMind::check_subs() {
     }
 }
 
-HiveMind::Coverage HiveMind::coverage() const {
+HiveMind::Coverage HiveMind::coverage(bool detail) const {
     Coverage c;
+    // The window send_next sends subscriptions in.
+    auto now = system_clock::now();
+    auto sig_min = now - hive::Subscription::SIGNATURE_EXPIRY + 10s;
+    auto sig_max = now + hive::Subscription::SIGNATURE_EARLY;
+    auto ago = [&](system_time t) {
+        return "{:.1f}h"_format(std::chrono::duration<double, std::ratio<3600>>(now - t).count());
+    };
+    // The accounts on none described, by class, in the order they are listed.
+    enum { other, rejected, retrying, no_node, claimed, unsendable, classes };
+    constexpr size_t LISTED = 20;
+    std::array<std::vector<std::string>, classes> described;
+    auto describe = [&](int cls, const SwarmPubkey& account, std::string why) {
+        if (detail && described[cls].size() < LISTED)
+            described[cls].push_back("{}: {}"_format(account.id.hex(), why));
+    };
+
     for (const auto& [id, swarm] : swarms_) {
         int goal = target(swarm);
+        int up = 0;
+        uint16_t up_slots = 0;
+        for (int i = 0; i < SWARM_SLOTS; i++)
+            if (const auto* node = swarm.slots[i]; node && node->up()) {
+                up++;
+                up_slots |= static_cast<uint16_t>(1u << i);
+            }
         for (const auto* account : swarm.members) {
-            if (account->next_due == SwarmPubkey::UNSCHEDULED)
+            if (account->next_due == SwarmPubkey::UNSCHEDULED) {
+                c.lapsed++;
                 continue;
+            }
             c.accounts++;
             int count = std::popcount(account->acked);
-            c.at_target += goal > 0 && count >= goal;
-            c.at_zero += count == 0;
+            if (goal > 0 && count >= goal) {
+                c.at_target++;
+                continue;
+            }
+            if (count > 0) {
+                c.partial++;
+                c.partial_down_only += (up_slots & ~account->acked) == 0;
+                continue;
+            }
+
+            auto subs = subscribers_.find(*account);
+            if (subs == subscribers_.end() || subs->second.empty()) {
+                c.unsendable++;
+                describe(unsendable, *account, "unsendable: no subscriptions");
+                continue;
+            }
+            if (std::none_of(subs->second.begin(), subs->second.end(), [&](const auto& sub) {
+                    return sub.sig_ts >= sig_min && sub.sig_ts <= sig_max;
+                })) {
+                c.unsendable++;
+                describe(
+                        unsendable,
+                        *account,
+                        "unsendable: none of its {} subscriptions signed within the window"_format(
+                                subs->second.size()));
+                continue;
+            }
+
+            c.at_zero++;
+            auto text = [&] {
+                auto it = unplaced_detail_.find(account);
+                return it == unplaced_detail_.end() ? ""s : it->second;
+            };
+            if (account->unplaced == SwarmPubkey::Unplaced::rejected) {
+                c.rejected++;
+                describe(rejected, *account, "every entry rejected: {}"_format(text()));
+            } else if (account->unplaced == SwarmPubkey::Unplaced::retrying) {
+                c.retrying++;
+                describe(retrying, *account, "retrying: {}"_format(text()));
+            } else if (up == 0) {
+                c.no_node++;
+                describe(
+                        no_node,
+                        *account,
+                        "no connected node with a slot in swarm {:x} ({} nodes)"_format(
+                                id, swarm.nodes));
+            } else if (account->sent) {
+                c.claimed++;
+                describe(
+                        claimed,
+                        *account,
+                        "sent to {} nodes, not yet acknowledged"_format(
+                                std::popcount(account->sent)));
+            } else {
+                c.other++;
+                if (detail && described[other].size() < LISTED) {
+                    std::vector<std::string> signed_;
+                    for (const auto& sub : subs->second)
+                        signed_.push_back(
+                                "signed {} ago{}, {} namespaces"_format(
+                                        ago(sub.sig_ts),
+                                        sub.want_data ? " with data" : "",
+                                        sub.namespaces.size()));
+                    describe(
+                            other,
+                            *account,
+                            "unexplained: sent {:04x}, acked {:04x}, swarm {:x} ({} nodes, {} up), "
+                            "due in {}, {} subscriptions ({})"_format(
+                                    account->sent,
+                                    account->acked,
+                                    id,
+                                    swarm.nodes,
+                                    up,
+                                    std::chrono::floor<std::chrono::seconds>(
+                                            account->next_due - now),
+                                    subs->second.size(),
+                                    fmt::join(signed_, "; ")));
+                }
+            }
         }
     }
+    for (auto& list : described)
+        for (auto& line : list)
+            if (c.described.size() < LISTED)
+                c.described.push_back(std::move(line));
     return c;
 }
 
 void HiveMind::log_coverage_progress() {
     auto c = coverage();
-    bool below = c.at_target < c.accounts,
-         was_below = coverage_logged_.at_target < coverage_logged_.accounts;
+    const auto& was = coverage_logged_;
+    bool below = c.partial + c.at_zero > 0, was_below = was.partial + was.at_zero > 0;
     if ((below || was_below) &&
-        (c.accounts != coverage_logged_.accounts || c.at_target != coverage_logged_.at_target ||
-         c.at_zero != coverage_logged_.at_zero))
+        (c.accounts != was.accounts || c.at_target != was.at_target || c.partial != was.partial ||
+         c.partial_down_only != was.partial_down_only || c.at_zero != was.at_zero))
         log::info(
                 cat,
-                "{}/{} accounts ({:.1f}%) are subscribed on their target number of nodes; {} on "
-                "none; {}/{} requests in flight, {} nodes waiting for one",
+                "{}/{} accounts ({:.1f}%) are subscribed on their target number of nodes, {} "
+                "partially ({} of them only on down nodes); {} on none; {} unsendable; {}/{} "
+                "requests in flight, {} nodes waiting for one",
                 c.at_target,
                 c.accounts,
                 c.accounts ? 100.0 * c.at_target / c.accounts : 100.0,
+                c.partial,
+                c.partial_down_only,
                 c.at_zero,
+                c.unsendable,
                 requests_in_flight_,
                 config.monitor_requests,
                 send_queue_.size());

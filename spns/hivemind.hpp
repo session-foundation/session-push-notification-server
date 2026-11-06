@@ -391,10 +391,27 @@ class HiveMind {
 
     // Accounts' coverage, over the accounts with subscriptions to renew: how many there are, how
     // many are acknowledged on as many nodes as their swarm's target, and how many on none.
+    //
+    // Accounts on none are classed by why, the first that applies: no subscription with a signature
+    // within its window, or none at all (unsendable, and not counted as on none); every entry
+    // refused for good; waiting out a node's backoff after a failure; no connected node with a slot
+    // in its swarm; sent to a node and not yet acknowledged; and anything else.  With `detail`,
+    // up to 20 of them are described, one line each, the rarer classes first.
+    //
+    // Of the accounts on some nodes but fewer than their target, those acknowledged on every
+    // connected node of their swarm are short only because the rest are down, or have no slot; any
+    // others are waiting for placement to catch up.
     struct Coverage {
-        size_t accounts = 0, at_target = 0, at_zero = 0;
+        size_t accounts = 0, at_target = 0, at_zero = 0, partial = 0, partial_down_only = 0;
+        size_t unsendable = 0, rejected = 0, retrying = 0, no_node = 0, claimed = 0, other = 0;
+        // Accounts in the index with nothing scheduled (lapsed), which are not counted at all.
+        size_t lapsed = 0;
+        std::vector<std::string> described;
     };
-    Coverage coverage() const;
+    Coverage coverage(bool detail = false) const;
+    // What a node said when it last gave up an account (Unplaced): the last refusal's text, or the
+    // node and its backoff; until the account is placed again.
+    std::unordered_map<const SwarmPubkey*, std::string> unplaced_detail_;
     // What log_coverage_progress() last reported, to report only changes.
     Coverage coverage_logged_;
     // While accounts are below their target, logs how many are at it; runs every few seconds.
@@ -632,6 +649,14 @@ class HiveMind {
     // claim it gives up, refused, failed, or with nothing to send.
     void subscribed(hive::SNode& node, const SwarmPubkey& account);
     void unclaim(hive::SNode& node, const SwarmPubkey& account);
+    // Called by an SNode for an account whose every entry it refused for good, `error` being the
+    // last refusal's text; and for accounts it is to place again after `backoff`, following a
+    // failure.
+    void refused(hive::SNode& node, const SwarmPubkey& account, std::string error);
+    void retrying(
+            hive::SNode& node,
+            const std::vector<const SwarmPubkey*>& accounts,
+            std::chrono::milliseconds backoff);
 
     // Called by an SNode whose connection is gone: its claims go with it, and the accounts it held
     // become the other nodes' to cover.

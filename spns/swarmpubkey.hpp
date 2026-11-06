@@ -24,6 +24,11 @@ struct SwarmPubkey {
     // node claims the account while either of its bits is set.
     mutable uint16_t sent = 0, acked = 0;
     static_assert(SWARM_SLOTS == 16);
+    // Why a node last gave the account up, for the status report's accounts on no node: it refused
+    // every entry for good, or the request failed and the account waits out the node's backoff to
+    // be placed again.  Cleared when the account is placed.
+    enum class Unplaced : uint8_t { none, rejected, retrying };
+    mutable Unplaced unplaced = Unplaced::none;
     // When a node last acknowledged a subscription for the account (unix seconds; 0 for never):
     // what is saved of its renewals, for a restarted hivemind to know how long its monitors last.
     mutable uint32_t acked_at = 0;

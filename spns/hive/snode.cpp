@@ -437,6 +437,8 @@ void SNode::on_monitor_response(std::vector<const SwarmPubkey*> entries, quic::m
 
     size_t i = 0, good = 0, wrong_swarm = 0, rejected = 0, failed = 0;
     std::string first_rejection;
+    // Each rejected entry's error text; sized only once one is rejected.
+    std::vector<std::string> errors;
     if (!response) {
         log::warning(
                 cat,
@@ -456,8 +458,11 @@ void SNode::on_monitor_response(std::vector<const SwarmPubkey*> entries, quic::m
                         failed++;
                     else {
                         outcome[i] = Outcome::rejected;
+                        if (errors.empty())
+                            errors.resize(entries.size());
+                        errors[i] = r.maybe<std::string>("error").value_or("");
                         if (!rejected++)
-                            first_rejection = r.maybe<std::string>("error").value_or("");
+                            first_rejection = errors[i];
                     }
                 } else if (r.skip_until("success")) {
                     good++;
@@ -477,9 +482,11 @@ void SNode::on_monitor_response(std::vector<const SwarmPubkey*> entries, quic::m
     for (size_t j = 0; j < entries.size();) {
         const auto* acct = entries[j];
         bool any_retry = false, any_success = false;
+        size_t last = j;
         for (; j < entries.size() && entries[j] == acct; j++) {
             any_retry |= outcome[j] == Outcome::retry;
             any_success |= outcome[j] == Outcome::success;
+            last = j;
         }
         if (any_retry) {
             hivemind_.unclaim(*this, *acct);
@@ -487,7 +494,7 @@ void SNode::on_monitor_response(std::vector<const SwarmPubkey*> entries, quic::m
         } else if (any_success)
             hivemind_.subscribed(*this, *acct);
         else
-            hivemind_.unclaim(*this, *acct);
+            hivemind_.refused(*this, *acct, std::move(errors[last]));
     }
 
     hivemind_.count_monitor_reply(bool(response), response.timed_out, wrong_swarm, rejected);
@@ -528,6 +535,7 @@ void SNode::retry_later(std::vector<const SwarmPubkey*> accounts) {
             accounts.size(),
             retry_backoff_,
             pubkey);
+    hivemind_.retrying(*this, accounts, retry_backoff_);
     retry_wait_ = true;
     sub_jq_.call_later(
             retry_backoff_, [wself = weak_from_this(), gen = gen_, accounts = std::move(accounts)] {
