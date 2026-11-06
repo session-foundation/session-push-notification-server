@@ -1369,7 +1369,9 @@ def scenario_redundancy(build_dir):
         loads = cov["per_node"]
         check(max(loads) - min(loads) <= 500, f"uneven node loads: {loads}")
         st = s.stats()
-        check(st["coverage"]["below_target"] == 0, f"coverage: {st['coverage']}")
+        check(
+            st["coverage"]["covered"] == st["coverage"]["accounts"], f"coverage: {st['coverage']}"
+        )
         print(f"    every account on 3 of 6 nodes; the nodes hold {loads}")
 
         start = time.time()
@@ -1408,7 +1410,7 @@ def scenario_rebalance(build_dir):
         def covered(nodes):
             return (
                 lambda st: st["node_load"]["nodes"] == nodes
-                and st["coverage"]["below_target"] == 0
+                and st["coverage"]["covered"] == st["coverage"]["accounts"]
             )
 
         s.network.cmd("leave 5")

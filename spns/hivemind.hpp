@@ -14,6 +14,7 @@
 #include <oxenmq/message.h>
 #include <oxenmq/oxenmq.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -297,6 +298,8 @@ class HiveMind {
     int target(const Swarm& swarm) const {
         return config.redundancy > 0 ? std::min(config.redundancy, swarm.nodes) : swarm.nodes;
     }
+    // The acknowledged nodes an account in `swarm` is reported covered on (see Coverage).
+    int covered_threshold(const Swarm& swarm) const { return std::clamp(target(swarm), 1, 4); }
 
     // Sorted list of all swarm ids
     std::vector<uint64_t> swarm_ids_;
@@ -398,11 +401,14 @@ class HiveMind {
     // in its swarm; sent to a node and not yet acknowledged; and anything else.  With `detail`,
     // up to 20 of them are described, one line each, the rarer classes first.
     //
-    // Of the accounts on some nodes but fewer than their target, those acknowledged on every
-    // connected node of their swarm are short only because the rest are down, or have no slot; any
-    // others are waiting for placement to catch up.
+    // What is reported as covered is acknowledged on at least the swarm's target number of nodes or
+    // 4, whichever is fewer (covered_threshold()): beyond 4 nodes an account's coverage makes no
+    // difference worth reporting, though placement still aims at the target.  Of the accounts on
+    // some nodes but fewer, the under-covered, those acknowledged on every connected node of their
+    // swarm are short only because the rest are down or have no slot; any others mean placement
+    // is lagging.
     struct Coverage {
-        size_t accounts = 0, at_target = 0, at_zero = 0, partial = 0, partial_down_only = 0;
+        size_t accounts = 0, covered = 0, under = 0, under_down_only = 0, at_zero = 0;
         size_t unsendable = 0, rejected = 0, retrying = 0, no_node = 0, claimed = 0, other = 0;
         // Accounts in the index with nothing scheduled (lapsed), which are not counted at all.
         size_t lapsed = 0;

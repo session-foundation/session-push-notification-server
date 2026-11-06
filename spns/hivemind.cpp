@@ -1445,11 +1445,12 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
         auto c = coverage(true);
         result["coverage"] = {
                 {"redundancy", config.redundancy},
+                {"covered_threshold",
+                 config.redundancy >= 1 && config.redundancy <= 3 ? config.redundancy : 4},
                 {"accounts", c.accounts},
-                {"at_target", c.at_target},
-                {"below_target", c.accounts - c.at_target - c.unsendable},
-                {"partial", c.partial},
-                {"partial_down_only", c.partial_down_only},
+                {"covered", c.covered},
+                {"under_covered", c.under},
+                {"under_covered_down_only", c.under_down_only},
                 {"at_zero", c.at_zero},
                 {"on_none",
                  {{"rejected", c.rejected},
@@ -1651,17 +1652,17 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    delta("accounts_moved"),
                    delta("monitor_sessions", "resumed"));
 
-    out += "\n  Coverage: {}/{} accounts on their target number of nodes (redundancy {}), {} below "
-           "it ({} partially, {} of them only on down nodes), {} on none ({} rejected, {} "
-           "retrying, {} no node, {} unacknowledged, {} other), {} unsendable, {} lapsed; node "
-           "load {}/{:.0f}/{} accounts (min/avg/max); over the interval {} placements, {} more by "
-           "nodes' scans, {} moving a monitor to another node"_format(
-                   num(s, "coverage", "at_target"),
+    out += "\n  Coverage: {}/{} accounts covered (on {} nodes or their swarm's target, if fewer; "
+           "redundancy {}), {} under-covered ({} of them only on down nodes), {} on none ({} "
+           "rejected, {} retrying, {} no node, {} unacknowledged, {} other), {} unsendable, {} "
+           "lapsed; node load {}/{:.0f}/{} accounts (min/avg/max); over the interval {} "
+           "placements, {} more by nodes' scans, {} moving a monitor to another node"_format(
+                   num(s, "coverage", "covered"),
                    num(s, "coverage", "accounts"),
+                   num(s, "coverage", "covered_threshold"),
                    num(s, "coverage", "redundancy"),
-                   num(s, "coverage", "below_target"),
-                   num(s, "coverage", "partial"),
-                   num(s, "coverage", "partial_down_only"),
+                   num(s, "coverage", "under_covered"),
+                   num(s, "coverage", "under_covered_down_only"),
                    num(s, "coverage", "at_zero"),
                    num(s, "coverage", "on_none", "rejected"),
                    num(s, "coverage", "on_none", "retrying"),
@@ -2941,7 +2942,7 @@ HiveMind::Coverage HiveMind::coverage(bool detail) const {
     };
 
     for (const auto& [id, swarm] : swarms_) {
-        int goal = target(swarm);
+        int goal = covered_threshold(swarm);
         int up = 0;
         uint16_t up_slots = 0;
         for (int i = 0; i < SWARM_SLOTS; i++)
@@ -2956,13 +2957,13 @@ HiveMind::Coverage HiveMind::coverage(bool detail) const {
             }
             c.accounts++;
             int count = std::popcount(account->acked);
-            if (goal > 0 && count >= goal) {
-                c.at_target++;
+            if (count >= goal) {
+                c.covered++;
                 continue;
             }
             if (count > 0) {
-                c.partial++;
-                c.partial_down_only += (up_slots & ~account->acked) == 0;
+                c.under++;
+                c.under_down_only += (up_slots & ~account->acked) == 0;
                 continue;
             }
 
@@ -3047,20 +3048,20 @@ HiveMind::Coverage HiveMind::coverage(bool detail) const {
 void HiveMind::log_coverage_progress() {
     auto c = coverage();
     const auto& was = coverage_logged_;
-    bool below = c.partial + c.at_zero > 0, was_below = was.partial + was.at_zero > 0;
+    bool below = c.under + c.at_zero > 0, was_below = was.under + was.at_zero > 0;
     if ((below || was_below) &&
-        (c.accounts != was.accounts || c.at_target != was.at_target || c.partial != was.partial ||
-         c.partial_down_only != was.partial_down_only || c.at_zero != was.at_zero))
+        (c.accounts != was.accounts || c.covered != was.covered || c.under != was.under ||
+         c.under_down_only != was.under_down_only || c.at_zero != was.at_zero))
         log::info(
                 cat,
-                "{}/{} accounts ({:.1f}%) are subscribed on their target number of nodes, {} "
-                "partially ({} of them only on down nodes); {} on none; {} unsendable; {}/{} "
-                "requests in flight, {} nodes waiting for one",
-                c.at_target,
+                "{}/{} accounts ({:.1f}%) covered, {} under-covered ({} of them only on down "
+                "nodes); {} on none; {} unsendable; {}/{} requests in flight, {} nodes waiting for "
+                "one",
+                c.covered,
                 c.accounts,
-                c.accounts ? 100.0 * c.at_target / c.accounts : 100.0,
-                c.partial,
-                c.partial_down_only,
+                c.accounts ? 100.0 * c.covered / c.accounts : 100.0,
+                c.under,
+                c.under_down_only,
                 c.at_zero,
                 c.unsendable,
                 requests_in_flight_,
