@@ -17,6 +17,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstring>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <oxen/log.hpp>
 #include <oxen/quic/btstream.hpp>
@@ -1328,6 +1329,25 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
                 {"requests", requests_in_flight_},
                 {"request_cap", max_requests_},
                 {"waiting_nodes", send_queue_.size()}};
+        int64_t supported = 0, unsupported = 0;
+        for (const auto& [pk, sn] : sns_) {
+            supported += sn->monitor_sessions() == hive::SNode::MonitorSessions::supported;
+            unsupported += sn->monitor_sessions() == hive::SNode::MonitorSessions::unsupported;
+        }
+        const auto& ss = monitor_session_stats_;
+        result["monitor_sessions"] = {
+                {"nodes_supporting", supported},
+                {"nodes_not_supporting", unsupported},
+                {"old_version", ss.old_version},
+                {"created", ss.created},
+                {"resumed", ss.resumed},
+                {"unsupported", ss.unsupported},
+                {"failed", ss.failed},
+                {"resumed_live", ss.kept},
+                {"resumed_ended", ss.ended},
+                {"missed_overflow", ss.overflow},
+                {"replay_discarded", ss.replay_discarded},
+                {"replay_discarded_accounts", ss.replay_discarded_accounts}};
         result["subscriptions_distinct"] = subscription_count_;
         const auto& ms = monitor_stats_;
         result["monitor_requests"] = {
@@ -1944,20 +1964,26 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
             last_block_ = {std::move(new_hash), new_height};
         }
 
-        std::unordered_map<Ed25519PK, std::tuple<std::string, uint16_t, uint64_t>> sns;
+        using Version = std::optional<std::array<uint16_t, 3>>;
+        std::unordered_map<Ed25519PK, std::tuple<std::string, uint16_t, uint64_t, Version>> sns;
         sns.reserve(sn_st.size());
         for (const auto& s : sn_st) {
             auto pked = s.at("pubkey_ed25519").get<std::string_view>();
             auto ip = s.at("public_ip").get<std::string_view>();
             auto port = s.at("storage_lmq_port").get<uint16_t>();
             auto swarm = s.at("swarm_id").get<uint64_t>();
+            // Absent for a node whose uptime proof oxend has not seen.
+            Version version;
+            if (auto v = s.find("storage_server_version");
+                v != s.end() && v->is_array() && v->size() == 3)
+                version = v->get<std::array<uint16_t, 3>>();
 
             if (pked.size() == 64 && !ip.empty() && ip != "0.0.0.0" && port > 0 &&
                 swarm != INVALID_SWARM_ID)
                 sns.emplace(
                         std::piecewise_construct,
                         std::forward_as_tuple(from_hex_or_b64<Ed25519PK>(pked)),
-                        std::forward_as_tuple(std::move(ip), port, swarm));
+                        std::forward_as_tuple(std::move(ip), port, swarm, version));
         }
 
         // auto missing_count = sn_st.size() - sns.size();
@@ -1990,7 +2016,7 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
         int new_or_changed = 0;
 
         for (const auto& [pk, details] : sns) {
-            const auto& [ip, port, swarm] = details;
+            const auto& [ip, port, swarm, version] = details;
             quic::RemoteAddress addr{pk.span<unsigned char>(), ip, port};
 
             if (auto it = sns_.find(pk); it != sns_.end()) {
@@ -1998,6 +2024,7 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
                 // have changed address or swarm.  A node whose swarm changed loses its claims on
                 // the old one's accounts, and scans its new one's.
                 auto& snode = it->second;
+                snode->version = version;
                 if (snode->swarm != swarm) {
                     leave_swarm(*snode);
                     snode->swarm = swarm;
@@ -2009,6 +2036,7 @@ void HiveMind::on_sns_response(std::vector<std::string> data) {
             } else {
                 // New snode; it scans its swarm once it connects.
                 auto snode = loop_.make_shared<hive::SNode>(*this, addr, swarm);
+                snode->version = version;
                 sns_.emplace(pk, snode);
                 join_swarm(*snode);
                 addrs.emplace_back(std::move(snode), std::move(addr));
@@ -2144,7 +2172,7 @@ void HiveMind::place(const SwarmPubkey& account, uint16_t prev_acked, bool by_sc
     std::array<Candidate, SWARM_SLOTS> candidates;
     int n = 0;
     for (int s = 0; s < SWARM_SLOTS; s++)
-        if (auto* node = swarm.slots[s]; node && node->up() && !(claimed_by >> s & 1))
+        if (auto* node = swarm.slots[s]; node && node->settled() && !(claimed_by >> s & 1))
             candidates[n++] = {node, bool(prev_acked >> s & 1), rng()};
     int chosen = std::min(short_by, n);
     std::partial_sort(
@@ -2250,6 +2278,7 @@ void HiveMind::leave_swarm(hive::SNode& node) {
     swarm.slots[node.slot] = nullptr;
     swarm.nodes--;
     node.slot = -1;
+    node.resuming = false;
     node.scan.done = true;
     if (swarm.nodes == 0 && swarm.members.empty())
         swarms_.erase(it);
@@ -2265,6 +2294,26 @@ void HiveMind::drop_claims(hive::SNode& node) {
     auto& swarm = swarms_.at(node.swarm);
     node.scan.cursor = scan_start(swarm.members);
     node.scan.generation = UINT64_MAX;
+
+    // A node keeps a monitor session, and the monitors on it, while it has no connection: the
+    // claims it acknowledged are held for the session to be resumed.  Those it was sent and had
+    // not answered go, as the request may never have reached it.  Without a session on the
+    // connection (its monitor_session failed), its monitors were the connection's, and went with
+    // it, even though our token may still resume the session.
+    if (node.resuming || node.session_bound()) {
+        node.resuming = true;
+        auto bit = static_cast<uint16_t>(1u << node.slot);
+        bool released = false;
+        for (const auto* account : swarm.members)
+            if (account->sent & bit) {
+                release(*account, swarm, node.slot);
+                released = true;
+            }
+        if (released)
+            wake(swarm, &node);
+        return;
+    }
+
     clear_slot(swarm, node);
     // The accounts it held are below their target now, for the others' scans to find.
     wake(swarm, &node);
@@ -2494,6 +2543,114 @@ void HiveMind::log_coverage_progress() {
     coverage_logged_ = c;
 }
 
+void HiveMind::abandon_resume(hive::SNode& node) {
+    if (!node.resuming)
+        return;
+    node.resuming = false;
+    if (node.slot < 0 || node.claimed == 0)
+        return;
+    auto& swarm = swarms_.at(node.swarm);
+    clear_slot(swarm, node);
+    wake(swarm, &node);
+}
+
+void HiveMind::monitor_session_started(
+        hive::SNode& node,
+        const MonitorToken& token,
+        bool resumed,
+        std::string_view monitors,
+        int64_t overflow) {
+    auto [it, inserted] = monitor_tokens_.try_emplace(node.pubkey, token);
+    bool had_token = !inserted;
+    it->second = token;
+    if (overflow > 0) {
+        log::warning(
+                cat,
+                "{} discarded {} notifications for us while we were away, more than it holds",
+                node.pubkey,
+                overflow);
+        monitor_session_stats_.overflow += overflow;
+    }
+
+    if (!resumed) {
+        if (had_token)
+            log::info(
+                    cat,
+                    "{} could not resume our monitor session (it had ended, or our token was "
+                    "out of date); subscribing everything in a new one",
+                    node.pubkey);
+        monitor_session_stats_.created++;
+        abandon_resume(node);
+        wake(node);
+        return;
+    }
+
+    // Asked for without its listing: only the monitors that have ended since are listed, and the
+    // claims the node holds for the session, kept across a lost connection, stand.
+    monitor_session_stats_.resumed++;
+    node.resuming = false;
+    size_t ended = 0;
+    try {
+        oxenc::bt_list_consumer list{monitors};
+        while (!list.is_finished()) {
+            auto m = list.consume_dict_consumer();
+            auto account = m.require<std::string_view>("@");
+            if (!m.maybe<int>("errcode"))
+                continue;
+            ended++;
+            if (auto swarm = m.maybe<std::string_view>("swarm"))
+                check_moved(account, *swarm);
+            AccountID id;
+            if (account.size() != id.size())
+                continue;
+            std::memcpy(id.data(), account.data(), id.size());
+            if (auto acct =
+                        subscribers_.find(SwarmPubkey{id, std::nullopt, /*_skip_validation=*/true});
+                acct != subscribers_.end())
+                unclaim(node, acct->first);
+        }
+    } catch (const std::exception& e) {
+        log::warning(
+                cat,
+                "Invalid monitor list in {}'s monitor_session response ({}); subscribing "
+                "everything",
+                node.pubkey,
+                e.what());
+        node.resuming = true;
+        abandon_resume(node);
+    }
+    monitor_session_stats_.kept += node.claimed;
+    monitor_session_stats_.ended += ended;
+    log::debug(
+            cat,
+            "Resumed monitor session with {}: {} accounts still subscribed; {} monitors ended",
+            node.pubkey,
+            node.claimed,
+            ended);
+    wake(node);
+}
+
+void HiveMind::monitor_session_unsupported(hive::SNode& node) {
+    monitor_session_stats_.unsupported++;
+    abandon_resume(node);
+    wake(node);
+}
+
+void HiveMind::monitor_session_failed(hive::SNode& node) {
+    // The node rotates the token as it composes its reply, so a reply that failed after that
+    // leaves us holding a dead token.  One never composed is indistinguishable from it, so the
+    // token goes either way, and the next connection starts a new session: one full placement for
+    // the node, accepted as rare.
+    if (monitor_tokens_.erase(node.pubkey))
+        log::info(
+                cat,
+                "Forgot our monitor session token for {}: its next one starts afresh",
+                node.pubkey);
+    monitor_session_stats_.failed++;
+    abandon_resume(node);
+    wake(node);
+}
+
 void HiveMind::make_conns() {
     assert(loop_.inside());
 
@@ -2506,8 +2663,18 @@ void HiveMind::make_conns() {
 }
 
 void HiveMind::on_node_connected(hive::SNode& snode, int gen) {
-    if (snode.connection_up(gen))
+    if (!snode.connection_up(gen))
+        return;
+    if (!snode.offers_monitor_sessions()) {
+        monitor_session_stats_.old_version++;
+        abandon_resume(snode);
         wake(snode);
+        return;
+    }
+    std::optional<MonitorToken> token;
+    if (auto it = monitor_tokens_.find(snode.pubkey); it != monitor_tokens_.end())
+        token = it->second;
+    snode.start_monitor_session(token);
 }
 
 void HiveMind::send_pending(hive::SNode& snode) {

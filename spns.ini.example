@@ -61,6 +61,11 @@ startup_wait = 8.0
 # fewest.
 #redundancy = -1
 
+# The most notifications per account a storage server keeps while our monitor session with it is
+# detached, and replays when it is resumed, after a reconnection or a quick restart: the newest of
+# them, the rest being lost, as push notifications are best effort.
+#resume_replay = 10
+
 # For testing only: seconds between an account's renewals, within a tenth either side, instead of
 # 45-55 minutes; it must stay well below the 65 minutes a storage server keeps a monitor.
 #renewal_interval = 60

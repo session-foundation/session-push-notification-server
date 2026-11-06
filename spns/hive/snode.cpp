@@ -1,6 +1,7 @@
 #include "snode.hpp"
 
 #include <fmt/chrono.h>
+#include <fmt/ranges.h>
 #include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
 
@@ -200,7 +201,7 @@ void SNode::connection_down(int gen) {
 void SNode::drop_connection_work() {
     hivemind_.drop_claims(*this);
     finish_request();
-    retry_wait_ = false;
+    retry_wait_ = handshake_ = session_bound_ = false;
 }
 
 void SNode::finish_request() {
@@ -250,6 +251,89 @@ void SNode::send_request(
                             on_reply(*self, std::move(response));
                     });
             });
+}
+
+void SNode::start_monitor_session(const std::optional<MonitorToken>& token) {
+    assert(sub_jq_.inside());
+    handshake_ = true;
+    oxenc::bt_dict_producer req;
+    if (token)
+        req.append("l", 0);
+    req.append("m", hivemind_.config.resume_replay);
+    if (token)
+        req.append("t", token->sv());
+    // On the stream the node's notifications arrive on, which is what puts its reply ahead of the
+    // notifications it replays.
+    request("monitor_session",
+            std::move(req).str(),
+            MONITOR_SESSION_TIMEOUT,
+            [](SNode& self, quic::message response) {
+                self.on_monitor_session_response(std::move(response));
+            });
+}
+
+void SNode::on_monitor_session_response(quic::message response) {
+    handshake_ = false;
+    if (!response) {
+        // A node without monitor sessions answers with libquic's unknown endpoint error.
+        if (!response.timed_out && response.body().starts_with("Invalid endpoint")) {
+            if (monitor_sessions_ != MonitorSessions::unsupported)
+                log::warning(
+                        cat,
+                        "{} reports storage server version {} but does not support monitor "
+                        "sessions",
+                        pubkey,
+                        fmt::join(*version, "."));
+            monitor_sessions_ = MonitorSessions::unsupported;
+            hivemind_.monitor_session_unsupported(*this);
+        } else {
+            log::warning(
+                    cat,
+                    "monitor_session request to {} failed ({}); subscribing without a monitor "
+                    "session",
+                    pubkey,
+                    response.timed_out ? "timeout"sv : response.body());
+            hivemind_.monitor_session_failed(*this);
+        }
+        return;
+    }
+
+    try {
+        oxenc::bt_dict_consumer d{response.body()};
+        // The accounts with more missed notifications than the request's budget, and how many of
+        // each it discarded.
+        int64_t discarded = 0, discarded_accounts = 0;
+        if (d.skip_until("m"))
+            for (auto list = d.consume_list_consumer(); !list.is_finished();) {
+                auto e = list.consume_dict_consumer();
+                e.require<std::string_view>("@");
+                discarded += e.require<int64_t>("o");
+                discarded_accounts++;
+            }
+        auto overflow = d.maybe<int64_t>("o").value_or(0);
+        auto resumed = d.maybe<int>("r").value_or(0) != 0;
+        auto monitors = "le"sv;
+        if (d.skip_until("s"))
+            monitors = d.consume_list_data();
+        auto token_str = d.require<std::string_view>("t");
+        MonitorToken token;
+        if (token_str.size() != token.size())
+            throw std::invalid_argument{"invalid token size {}"_format(token_str.size())};
+        std::memcpy(token.data(), token_str.data(), token.size());
+
+        monitor_sessions_ = MonitorSessions::supported;
+        session_bound_ = true;
+        hivemind_.count_replay_discarded(discarded, discarded_accounts);
+        hivemind_.monitor_session_started(*this, token, resumed, monitors, overflow);
+    } catch (const std::exception& e) {
+        log::warning(
+                cat,
+                "Invalid monitor_session response from {} ({}); subscribing without a "
+                "monitor session",
+                pubkey,
+                e.what());
+        hivemind_.monitor_session_failed(*this);
+    }
 }
 
 bool SNode::send_next(

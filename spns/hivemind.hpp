@@ -129,7 +129,8 @@ inline constexpr auto _get_sns_params = R"({
     "storage_lmq_port": true,
     "swarm_id": true,
     "block_hash": true,
-    "height": true
+    "height": true,
+    "storage_server_version": true
   }
 })";
 
@@ -317,6 +318,26 @@ class HiveMind {
     void check_moved(std::string_view account, std::string_view swarm_hex);
     int64_t moved_agree_ = 0, moved_disagree_ = 0;
 
+    // The token each node last issued us for resuming our monitor session with it.
+    std::unordered_map<Ed25519PK, MonitorToken> monitor_tokens_;
+
+    // Gives up the claims a node holds for its monitor session to be resumed, when it was not
+    // resumed after all.
+    void abandon_resume(hive::SNode& node);
+
+    // How the nodes' connections have gone for monitor sessions since startup: not offered one for
+    // their version; and for monitor_session requests, a new session, a resumed one, a node without
+    // sessions (despite its version), or no answer; and for resumed ones, the accounts whose claims
+    // stood, the monitors the node reported ended, and the notifications it discarded for overflow
+    // while we were away.
+    struct {
+        int64_t old_version = 0, created = 0, resumed = 0, unsupported = 0, failed = 0;
+        int64_t kept = 0, ended = 0, overflow = 0;
+        // Missed notifications nodes discarded beyond Config::resume_replay, and the accounts they
+        // were for.
+        int64_t replay_discarded = 0, replay_discarded_accounts = 0;
+    } monitor_session_stats_;
+
     // The dispatcher of monitor requests: the nodes waiting for one of the max_requests_ slots, in
     // the order they asked, so that slots go round the nodes; and how many are taken.
     std::deque<std::shared_ptr<hive::SNode>> send_queue_;
@@ -353,11 +374,11 @@ class HiveMind {
     // Releases every claim on the account by a node of swarm `swarm` (its own, or the one it is
     // leaving).
     void release_all(const SwarmPubkey& account, uint64_t swarm);
-    // Places `account` on its swarm's connected nodes until it is claimed on its target number: the
-    // lightest of those not claiming it, ties going first to a node in `prev_acked` (its acked mask
-    // before a renewal cleared it, so that a balanced swarm keeps its placements), then at random.
-    // Each is queued with the dispatcher to send it.  `by_scan` counts the placements as a node's
-    // scan's.
+    // Places `account` on its swarm's connected nodes, their monitor sessions settled, until it is
+    // claimed on its target number: the lightest of those not claiming it, ties going first to a
+    // node in `prev_acked` (its acked mask before a renewal cleared it, so that a balanced swarm
+    // keeps its placements), then at random.  Each is queued with the dispatcher to send it.
+    // `by_scan` counts the placements as a node's scan's.
     void place(const SwarmPubkey& account, uint16_t prev_acked = 0, bool by_scan = false);
     // Clears the account's placements and places it afresh.
     void replace(const SwarmPubkey& account);
@@ -582,6 +603,18 @@ class HiveMind {
     // Called by an SNode when a request of its ends, freeing its slot.
     void request_finished();
 
+    // Called by an SNode with the answer to its monitor_session request: a session, resumed or new,
+    // with its token, the list of its monitors (when resumed) and its count of notifications lost
+    // to overflow; or no session, because the node does not support them, or did not answer.
+    void monitor_session_started(
+            hive::SNode& snode,
+            const MonitorToken& token,
+            bool resumed,
+            std::string_view monitors,
+            int64_t overflow);
+    void monitor_session_unsupported(hive::SNode& snode);
+    void monitor_session_failed(hive::SNode& snode);
+
     // Called by an SNode with a monitor request's outcome: answered, or else timed out or failed;
     // and for an answer, its subscriptions refused for the wrong swarm and rejected.
     void count_monitor_reply(bool answered, bool timed_out, size_t wrong_swarm, size_t rejected) {
@@ -589,6 +622,13 @@ class HiveMind {
         (answered ? m.answered : timed_out ? m.timed_out : m.failed)++;
         m.wrong_swarm += wrong_swarm;
         m.rejected += rejected;
+    }
+
+    // Called by an SNode with what a monitor_session answer said was discarded beyond the replay
+    // budget: notifications, and the accounts they were for.
+    void count_replay_discarded(int64_t discarded, int64_t accounts) {
+        monitor_session_stats_.replay_discarded += discarded;
+        monitor_session_stats_.replay_discarded_accounts += accounts;
     }
 
     void load_saved_subscriptions();

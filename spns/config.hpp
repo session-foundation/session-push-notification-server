@@ -60,6 +60,11 @@ struct Config {
     // monitor.
     std::optional<std::chrono::seconds> renewal_interval;
 
+    // The most notifications for an account a node keeps while our monitor session with it is
+    // detached, and replays when it is resumed, after a reconnection or a quick restart: the
+    // newest, the rest being lost, as push notifications are best effort.
+    int resume_replay = 10;
+
     // The most monitor requests in flight at once, across all nodes, if not the hivemind's default
     // (MONITOR_REQUESTS_IN_FLIGHT).
     std::optional<int> monitor_requests;

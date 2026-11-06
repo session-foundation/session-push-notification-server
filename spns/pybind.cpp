@@ -144,6 +144,11 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     &Config::redundancy,
                     "how many of its swarm's nodes each account is subscribed on, at most the "
                     "swarm's size: -1 for all of them, or a positive number")
+            .def_readwrite(
+                    "resume_replay",
+                    &Config::resume_replay,
+                    "most notifications per account a node replays when our monitor session with "
+                    "it is resumed: the newest, the rest lost")
             .def_property(
                     "renewal_interval",
                     [](Config& self) -> std::optional<int64_t> {

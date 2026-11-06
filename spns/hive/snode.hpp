@@ -41,6 +41,16 @@ using namespace std::literals;
 // evenly.
 inline constexpr size_t SUBS_REQUEST_LIMIT = 500;
 
+// The first storage server version with monitor sessions (oxen-storage-server 2.13.0, the release
+// after 2.12.1 that brings the monitor protocol additions).  Only a node reporting at least this in
+// its uptime proof is asked for one; an older one, or one whose version oxend does not know, is
+// filled in full straight away.
+inline constexpr std::array<uint16_t, 3> MONITOR_SESSION_MIN_VERSION = {2, 13, 0};
+
+// How long a monitor_session request may take to be answered; without an answer the connection
+// goes on without a monitor session.
+inline constexpr auto MONITOR_SESSION_TIMEOUT = 30s;
+
 // A failed or timed out monitor request, and the entries of one that a node could not take for now,
 // are queued again after this long, doubling with each consecutive failure up to the maximum.
 inline constexpr auto RETRY_BACKOFF_MIN = 2s;
@@ -113,6 +123,20 @@ class SNode : public std::enable_shared_from_this<SNode> {
     // sent meanwhile.  The backoff is zero after a request that succeeded.
     bool retry_wait_ = false;
     std::chrono::milliseconds retry_backoff_{0};
+    // Set while monitor_session awaits its reply on a new connection: monitor requests wait for
+    // it, as the node handles requests concurrently and makes a monitor it handles first
+    // connection-bound, lost with the connection.
+    bool handshake_ = false;
+    // Set once monitor_session has answered on the current connection: the monitors sent on it
+    // since are the session's, kept by the node when the connection goes.
+    bool session_bound_ = false;
+
+  public:
+    // What the node's last answer to monitor_session showed of its support for monitor sessions.
+    enum class MonitorSessions { unknown, supported, unsupported };
+
+  private:
+    MonitorSessions monitor_sessions_ = MonitorSessions::unknown;
 
   public:
     const Ed25519PK pubkey;
@@ -120,6 +144,15 @@ class SNode : public std::enable_shared_from_this<SNode> {
     // The node's swarm; subscription thread (sub_jq_) only.  HiveMind changes it, keeping its
     // swarms_ index in step.
     uint64_t swarm;
+
+    // The storage server version oxend reports for the node, if any; subscription thread
+    // (sub_jq_) only.
+    std::optional<std::array<uint16_t, 3>> version;
+
+    /// Whether the node's reported version is one with monitor sessions.
+    bool offers_monitor_sessions() const {
+        return version && *version >= MONITOR_SESSION_MIN_VERSION;
+    }
 
     // Does not connect: the QUIC loop does, by calling connect().
     SNode(HiveMind& hivemind, quic::RemoteAddress addr, uint64_t swarm);
@@ -151,12 +184,19 @@ class SNode : public std::enable_shared_from_this<SNode> {
     /// loss.
     bool up() const { return up_; }
 
+    /// Whether the node is up and its monitor session settled: until a resumed session's answer
+    /// has recorded what the node still holds, anything placed on it might be sent again.
+    bool settled() const { return up_ && !handshake_; }
+
     /// The node's part in its swarm's placements, kept by the hivemind: its slot (its bit in the
     /// swarm's accounts' sent and acked masks), or -1 for none; how many of the swarm's accounts
     /// it claims, always the number with its bit set in either mask; the accounts placed on it,
     /// to send before anything its scan finds; and its coverage scan (see HiveMind::next_claim).
     int slot = -1;
     size_t claimed = 0;
+    /// Set while the node's claims are held for its monitor session to be resumed, kept across a
+    /// lost connection: they stand until the session's resumption confirms or refutes them.
+    bool resuming = false;
     std::deque<const SwarmPubkey*> due;
     struct {
         // The swarm_space the scan has reached, so that changes to the swarm's members leave its
@@ -171,11 +211,22 @@ class SNode : public std::enable_shared_from_this<SNode> {
         bool done = true;
     } scan;
 
+    MonitorSessions monitor_sessions() const { return monitor_sessions_; }
+
+    /// Whether the current connection's monitors are on a monitor session, which outlives it.
+    bool session_bound() const { return session_bound_; }
+
+    /// Asks the node, on a connection just up, for a monitor session: to resume the one `token`
+    /// names, if given, or else a new one.  A resumed session's answer lists only the monitors that
+    /// have ended, as the hivemind knows the rest.  Nothing is sent until it answers, after which
+    /// the hivemind settles what the session holds and sets the node scanning.
+    void start_monitor_session(const std::optional<MonitorToken>& token);
+
     /// Whether the node may have accounts to send and can send a request for them: it has some
-    /// placed on it or its scan has more to look at, it is up, and it is neither awaiting a reply
-    /// nor backing off after a failure.
+    /// placed on it or its scan has more to look at, it is up, its monitor session settled, and it
+    /// is neither awaiting a reply nor backing off after a failure.
     bool ready_to_send() const {
-        return up_ && !in_flight_ && !retry_wait_ && (!due.empty() || !scan.done);
+        return up_ && !handshake_ && !in_flight_ && !retry_wait_ && (!due.empty() || !scan.done);
     }
 
     /// If ready_to_send(), encodes a monitor request of up to SUBS_REQUEST_LIMIT subscriptions for
@@ -231,6 +282,8 @@ class SNode : public std::enable_shared_from_this<SNode> {
             std::chrono::milliseconds timeout,
             ReplyHandler on_reply);
 
+    void on_monitor_session_response(quic::message response);
+
     // `entries` holds the account of each subscription in the request, in order: an account
     // with several subscriptions has several consecutive entries.  An account answered with
     // success is acknowledged on this node; one refused as not stored by the node's swarm, or for
@@ -243,7 +296,8 @@ class SNode : public std::enable_shared_from_this<SNode> {
 
     // Drops what belonged to the connection that is gone: its claims on its swarm's accounts, as a
     // new connection's monitors start from nothing, and the request awaiting a reply, which never
-    // comes, so its slot goes back to the in-flight cap; and with them the retry state.
+    // comes, so its slot goes back to the in-flight cap; and with them the retry, handshake and
+    // session state.
     void drop_connection_work();
 
     // Has the hivemind place `accounts` again once the backoff has passed.
