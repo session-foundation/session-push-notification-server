@@ -4,8 +4,12 @@ Runs the real hivemind against Postgres, a fake oxend and a fake swarm of storag
 notifier and a fake subscribing client. CI (`.woodpecker/build.star`) runs the fast scenarios on
 every event and the slow ones on pushes, tags, manual and cron runs.
 
+Every scenario runs twice: against storage nodes without monitor sessions, as today's network is
+(`legacy`: `monitor_session` is an unknown endpoint), and against nodes with them
+(`monitor`). `E2E_ARGS="--mode legacy"` (or `monitor`) runs one.
+
 ```
-make e2e-fast                             # the fast scenarios, about 2 minutes
+make e2e-fast                             # the fast scenarios, about 5 minutes
 make e2e                                  # all of them, about 15 minutes
 make e2e-burst                            # one scenario: e2e-<name> for each in the tables below
 make e2e-slow                             # the three slow ones
@@ -79,8 +83,8 @@ Docker's seccomp filter, which refuses the `setarch -R` it needs.
 ## The fakes
 
 - `fake_network`: the oxend that serves the service node list and announces blocks, and the
-  storage nodes, which answer `monitor` (refusing accounts their swarm does not store), and send
-  `notify` and `monitor_ended`. It can move
+  storage nodes, which answer `monitor` (refusing accounts their swarm does not store) and, with
+  `--monitor-sessions`, `monitor_session`, and send `notify` and `monitor_ended`. It can move
   nodes between swarms, drop connections, fail requests, and report what each node holds and has
   been sent; it also measures each stream's unsent bytes.
 - `fake_notifier`: registers as the `dummy` notifier, accepts any `service_info.token` as the

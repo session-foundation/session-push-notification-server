@@ -4,13 +4,16 @@
 The hivemind runs for real, against Postgres, a fake oxend and a fake swarm of storage nodes
 (fake_network), a fake notifier (fake_notifier) and a fake subscribing client (fake_client).
 
-usage: e2e.py [--build-dir DIR] [--slow] [--sanitizer thread|address] [options] [SCENARIO...]
+usage: e2e.py [--build-dir DIR] [--slow] [--sanitizer thread|address] [--mode MODE] [options]
+              [SCENARIO...]
 
 Normally run through the build's e2e targets (`make e2e`, `make e2e-burst`, ...), which build the
 hivemind and the fakes and pass the build directory.  With no SCENARIO, runs every fast scenario,
-plus the slow ones with --slow.  Needs an existing Postgres database it may empty (see --db), found through the usual
-libpq environment (PGHOST, PGUSER, ...).  Linux only: it reads process memory and CPU use from
-/proc.  tests/e2e/run.sh does all of this inside a container.
+plus the slow ones with --slow.  Each runs once against a network without monitor sessions, as
+today's is ("legacy"), and once against one with them ("monitor"), unless --mode picks one.  Needs
+an existing Postgres database it may empty (see --db), found through the usual libpq environment
+(PGHOST, PGUSER, ...).  Linux only: it reads process memory and CPU use from /proc.
+tests/e2e/run.sh does all of this inside a container.
 """
 
 import argparse
@@ -47,6 +50,8 @@ HIVEMIND_SOCK = "ipc://hivemind.sock"
 # timing limits (they look for memory and threading errors; every push must still arrive).
 TIME_SCALE = 1
 SANITIZED = False
+# "legacy" or "monitor": whether the fake storage nodes support monitor sessions.
+MODE = None
 SANITIZER_REPORT = re.compile(
     r"WARNING: ThreadSanitizer|ERROR: AddressSanitizer|ERROR: LeakSanitizer"
 )
@@ -333,6 +338,7 @@ class Setup:
         self.network = Proc(
             "network",
             [f"{FAKES}/fake_network"]
+            + (["--monitor-sessions"] if MODE == "monitor" else [])
             + list(network_args)
             + [str(nodes), str(swarms), str(OXEND_PORT), str(FIRST_QUIC_PORT)],
         )
@@ -824,6 +830,10 @@ def scenario_reshuffle(build_dir):
     within the retry backoff rather than at their renewal."""
     fresh_db()
     seed(0, 4000)
+    # Monitor session support goes by the version oxend reports: with monitor sessions one node
+    # reports none, and gets none; without, one reports a version with monitor sessions that it
+    # lacks, and falls back.
+    version = "7:none" if MODE == "monitor" else "0:2.13.0"
     # Late replies, so that the nodes see the hivemind's requests in flight together, under a cap
     # smaller than the 8 nodes.
     cap = 4
@@ -831,7 +841,7 @@ def scenario_reshuffle(build_dir):
         build_dir,
         nodes=8,
         swarms=2,
-        network_args=["--reply-delay", "10"],
+        network_args=["--version", version, "--reply-delay", "10"],
         config=f"monitor_requests = {cap}",
     )
     try:
@@ -840,6 +850,16 @@ def scenario_reshuffle(build_dir):
         check(1 < most <= cap, f"{most} monitor requests in flight at once, with a cap of {cap}")
         n = s.net_counts()
         check(n["wrong_swarm"] == 0, f"subscriptions sent to the wrong swarm at startup: {n}")
+        if MODE == "monitor":
+            check(
+                n["created"] == 7,
+                f"expected monitor sessions on all but the unversioned node: {n}",
+            )
+        else:
+            check(
+                "but does not support monitor sessions" in s.hivemind.log(),
+                "the node reporting a version with monitor sessions was not found to lack them",
+            )
 
         s.network.cmd("mark")
         s.network.cmd("swarms 4")
@@ -863,9 +883,13 @@ def scenario_reshuffle(build_dir):
         check(n["wrong_swarm"] == 0, f"subscriptions sent to the wrong swarm after reconnecting: {n}")
         print(
             f"    after reconnecting: {n['entries']} subscriptions sent for {c['expected']} "
-            f"(account, node) pairs, none to the wrong swarm"
+            f"(account, node) pairs, {n['resumed']} monitor sessions resumed, none to the wrong "
+            f"swarm"
         )
-        check(n["entries"] >= c["expected"], f"the reconnections were not filled: {n}")
+        if MODE == "legacy":
+            check(n["entries"] >= c["expected"], f"the reconnections were not filled: {n}")
+        else:
+            check(n["resumed"] == 7, f"expected 7 monitor sessions resumed: {n}")
 
         s.network.cmd("lag 1 5000")
         s.network.cmd("mark")
@@ -1197,6 +1221,13 @@ def main():
         help="first of the fake storage nodes' consecutive QUIC ports (default: %(default)s)",
     )
     ap.add_argument(
+        "--mode",
+        choices=["legacy", "monitor", "both"],
+        default="both",
+        help="run each scenario against fake storage nodes without monitor sessions (legacy), "
+        "with them (monitor), or once each (default: %(default)s)",
+    )
+    ap.add_argument(
         "scenarios",
         nargs="*",
         metavar="SCENARIO",
@@ -1209,6 +1240,7 @@ def main():
     names = args.scenarios or (FAST + SLOW if args.slow else FAST)
 
     global TIME_SCALE, SANITIZED, SANITIZER, BUILD, FAKES, WORK, DB, OXEND_PORT, FIRST_QUIC_PORT
+    global MODE
     SANITIZER = args.sanitizer
     TIME_SCALE = {None: 1, "address": 3, "thread": 10}[SANITIZER]
     SANITIZED = SANITIZER is not None
@@ -1223,21 +1255,23 @@ def main():
     FIRST_QUIC_PORT = args.quic_port
     build_dir = BUILD
     wait_db()
+    modes = ["legacy", "monitor"] if args.mode == "both" else [args.mode]
     results = []
-    for name in names:
+    for name, MODE in ((n, m) for n in names for m in modes):
         # A scenario that failed badly can leave a child holding the ports the next one needs.
         kill_leftovers()
         shutil.rmtree(WORK, ignore_errors=True)
         os.makedirs(WORK)
-        print(f"== {name}", flush=True)
+        label = f"{name}[{MODE}]"
+        print(f"== {label}", flush=True)
         start = time.time()
         try:
             globals()[f"scenario_{name}"](build_dir)
-            results.append((name, "PASS", ""))
+            results.append((label, "PASS", ""))
         except Failure as e:
-            results.append((name, "FAIL", str(e)))
+            results.append((label, "FAIL", str(e)))
         except Exception:
-            results.append((name, "ERROR", traceback.format_exc()))
+            results.append((label, "ERROR", traceback.format_exc()))
         print(
             f"   {results[-1][1]} in {time.time() - start:.0f}s {results[-1][2]}",
             flush=True,
