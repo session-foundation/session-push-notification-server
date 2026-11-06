@@ -1545,14 +1545,26 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready) {
 // The multi-line periodic status report, from the stats now and at the previous report `dt`
 // seconds ago (null at the first), as rates over the interval for what counts up.
 static std::string status_report(const nlohmann::json& s, const nlohmann::json& prev, double dt) {
-    auto num = [](const nlohmann::json& j, const auto&... path) -> double {
+    // The value at `path`, or null where any of it is absent.  Every lookup goes through this: a
+    // const json's operator[] asserts that its key exists, and the parts of the stats need not
+    // agree on which services there are (one whose stats are left in the database from an earlier
+    // run has none of the rest while it is not registered).
+    auto get = [](const nlohmann::json& j, const auto&... path) -> const nlohmann::json& {
+        static const nlohmann::json null;
         const nlohmann::json* p = &j;
         for (std::string_view k : {std::string_view{path}...}) {
-            if (!p->is_object() || !p->contains(k))
-                return 0;
-            p = &(*p)[k];
+            if (!p->is_object())
+                return null;
+            auto it = p->find(k);
+            if (it == p->end())
+                return null;
+            p = &*it;
         }
-        return p->is_number() ? p->get<double>() : 0;
+        return *p;
+    };
+    auto num = [&](const nlohmann::json& j, const auto&... path) -> double {
+        const nlohmann::json& v = get(j, path...);
+        return v.is_number() ? v.get<double>() : 0;
     };
     auto delta = [&](const auto&... path) { return num(s, path...) - num(prev, path...); };
     auto rate = [&](const auto&... path) { return dt > 0 ? delta(path...) / dt : 0.0; };
@@ -1570,8 +1582,8 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         out += " none";
     std::set<std::string> services;
     for (const auto* key : {"notifier_queue", "notifier", "registrations_dropped"})
-        if (s.contains(key))
-            for (const auto& [service, v] : s[key].items())
+        if (const auto& by_service = get(s, key); by_service.is_object())
+            for (const auto& [service, v] : by_service.items())
                 services.insert(service);
     for (const auto& service : services) {
         out += "\n    {}: {:.1f} pushes/s, {} unacked, {} backlogged, {} dropped"_format(
@@ -1580,10 +1592,10 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                 num(s, "notifier_queue", service, "unacked"),
                 num(s, "notifier_queue", service, "backlog"),
                 delta("notifier_queue", service, "dropped"));
-        if (auto b = s["notifier_queue"][service]["blocked_for"]; b.is_number())
+        if (const auto& b = get(s, "notifier_queue", service, "blocked_for"); b.is_number())
             out += "; window blocked for {}"_format(duration(b.get<double>()));
-        if (s.contains("notifier") && s["notifier"].contains(service))
-            for (const auto& [stat, v] : s["notifier"][service].items())
+        if (const auto& stats = get(s, "notifier", service); stats.is_object())
+            for (const auto& [stat, v] : stats.items())
                 if (v.is_number_integer())
                     out += "; {} {:.1f}/s"_format(stat, rate("notifier", service, stat));
         if (auto ids = delta("registrations_dropped", service, "ids"); ids > 0)
@@ -1645,21 +1657,21 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
 
     out += "\n  State: {}; at startup {}; over the interval {} monitor sessions resumed, {} missed "
            "notifications for {} accounts discarded beyond the replay budget"_format(
-                   s.contains("state") && s["state"]["saved_ago"].is_number()
+                   get(s, "state", "saved_ago").is_number()
                            ? "saved {} ago, {} accounts in {:.1f} MB (snapshot {:.0f} ms, write "
                              "{:.0f} ms)"_format(
-                                     duration(s["state"]["saved_ago"].get<double>()),
+                                     duration(num(s, "state", "saved_ago")),
                                      num(s, "state", "accounts"),
                                      num(s, "state", "bytes") / 1e6,
                                      num(s, "state", "snapshot_ms"),
                                      num(s, "state", "write_ms"))
                            : "not saved yet"s,
-                   s.contains("restored") && s["restored"]["age"].is_number()
+                   get(s, "restored", "age").is_number()
                            ? "restored {} accounts on {} nodes from a save {} old ({} nodes "
                              "dropped)"_format(
                                      num(s, "restored", "accounts"),
                                      num(s, "restored", "nodes"),
-                                     duration(s["restored"]["age"].get<double>()),
+                                     duration(num(s, "restored", "age")),
                                      num(s, "restored", "nodes_dropped"))
                            : "nothing restored"s,
                    delta("monitor_sessions", "resumed"),
@@ -1680,8 +1692,8 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
            "use"_format(
                    num(s, "rss") / 1e6,
                    num(s, "block_height"),
-                   s.contains("block_age") && s["block_age"].is_number()
-                           ? "hash changed {} ago"_format(duration(s["block_age"].get<double>()))
+                   get(s, "block_age").is_number()
+                           ? "hash changed {} ago"_format(duration(num(s, "block_age")))
                            : "none yet"s,
                    duration(num(s, "uptime")),
                    num(s, "db_connections", "idle"),
