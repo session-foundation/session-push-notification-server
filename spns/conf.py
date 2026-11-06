@@ -18,6 +18,13 @@ coloredlogs.install(milliseconds=True, isatty=True, logger=logger)
 PRIVKEYS = {}
 PUBKEYS = {}
 
+# The keys an onion request may be encrypted to, as (key name, X25519 pubkey bytes, X25519 privkey
+# bytes), in the order they are tried: "onionreq", then the X25519 conversion of the "quic" Ed25519
+# key, which lets a client use the hivemind's one Ed25519 pubkey for session-router, QUIC and onion
+# requests.  Today's clients all use the first, so only those that have moved to the second pay
+# for a failed trial.
+ONIONREQ_KEYS = []
+
 # We stash anything in a `[notify-xyz]` into `NOTIFY['xyz']` for notifiers to piggyback on the
 # config.
 NOTIFY = {}
@@ -170,6 +177,8 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
         logger.debug(f"Set config.{conf[0]} = {value}")
         setattr(config, conf[0], value)
 
+    PRIVKEYS.clear()
+    PUBKEYS.clear()
     for s in cp.sections():
         if s == "keys":
             for opt in cp["keys"]:
@@ -219,6 +228,11 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
                     logger.info(
                         f"Loaded {opt} keypair with pubkey {PUBKEYS[opt].encode().hex()}"
                     )
+                    if opt == "quic":
+                        x_pub = PRIVKEYS[opt].to_curve25519_private_key().public_key
+                        logger.info(
+                            f"... which is onion request X25519 pubkey {x_pub.encode().hex()}"
+                        )
         elif s == "log":
             for opt in cp["log"]:
                 if opt == "level":
@@ -253,5 +267,13 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
             "storage servers recognise as the privileged push server's"
         )
     config.quic_keys = PRIVKEYS["quic"].encode() + PUBKEYS["quic"].encode()
+
+    ONIONREQ_KEYS.clear()
+    if "onionreq" in PRIVKEYS:
+        ONIONREQ_KEYS.append(
+            ("onionreq", PUBKEYS["onionreq"].encode(), PRIVKEYS["onionreq"].encode())
+        )
+    x_priv = PRIVKEYS["quic"].to_curve25519_private_key()
+    ONIONREQ_KEYS.append(("quic", x_priv.public_key.encode(), x_priv.encode()))
 
     return config

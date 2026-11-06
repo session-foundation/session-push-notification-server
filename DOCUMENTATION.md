@@ -6,6 +6,11 @@
 
 via a v4 onion request.  The onion req pubkey is: d7557fe563e2610de876c0ac7341b62f3c82d5eea4b62c702392ea4368f51b3b
 
+The server also accepts onion requests encrypted to the X25519 conversion of its QUIC key
+(`[keys] quic`, which every server has), so that a client can use the single Ed25519 pubkey it uses
+for the server's session-router and QUIC connections for onion requests too, instead of the
+separate X25519 key above; both keys work while both are configured.
+
 - The JSON payload looks like this:
 
         {

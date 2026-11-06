@@ -108,7 +108,10 @@ onionreq = onionreq_x25519
 # QUIC listener, if QUIC listening is enabled via the [hivemind] quic_listen option.  Its pubkey is
 # what storage servers recognise as the privileged push server's: its monitor sessions get the large
 # limits and their own pool of missed notifications, where an unrecognised key gets a small
-# anonymous session.  You can create it using `session-router-config --key FILENAME` (from the
+# anonymous session.  Its pubkey also serves as an Ed25519 onion request key, alongside `onionreq`:
+# clients encrypt to its X25519 conversion, so that they can use the one Ed25519 pubkey for
+# session-router, QUIC and onion requests.  Each onion request is tried with `onionreq` first, if
+# set, then with this.  You can create it using `session-router-config --key FILENAME` (from the
 # session-router-bin package).
 quic = key_ed25519
 
