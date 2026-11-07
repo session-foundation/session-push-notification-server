@@ -1580,6 +1580,26 @@ def scenario_status_report(build_dir):
             f"no ack round trip on the busy notifier's line: {busy.group(0)}",
         )
         check("unacked" not in log, "a report shows unacked pushes below a full window")
+        # The unique notifications and pushes, split by the kind of account, add up to their totals
+        # (within rounding to 0.1/s each); the seeded accounts are all groups (03).
+        incoming = re.findall(r"^  Incoming: .*", log, re.M)
+        check(incoming, "no Incoming line in the reports")
+        for line in incoming:
+            for total, split in re.findall(r"([\d.]+)(?:/s unique| pushes/s) \(([^)]*)\)", line):
+                parts = [float(x) for x in re.findall(r"([\d.]+)/s \w+", split)]
+                check(
+                    abs(sum(parts) - float(total)) <= 0.05 * (len(parts) + 1),
+                    f"the split does not add up: {line}",
+                )
+        check(
+            any(re.search(r"[1-9][\d.]*/s groups", line) for line in incoming),
+            f"no group notifications counted: {incoming}",
+        )
+        check(
+            re.search(r"^  Processing: peak \d+ queued \(\d+ bytes\), \d+ dropped, \d+ lookup "
+                      r"failures$", log, re.M),
+            "no Processing line in the reports",
+        )
         supporting = 3 if MODE == "monitor" else 0
         sessions = re.search(r"sessions: (\d+)/(\d+) nodes support them, (\d+) created", log)
         check(
@@ -1592,7 +1612,7 @@ def scenario_status_report(build_dir):
             "the quiet notifier is not listed as idle",
         )
         check("retired" not in log, "the unregistered notifier is in the report")
-        check("failures" not in log, "lifetime failures reported as the interval's")
+        check("failures/s" not in log, "lifetime failures reported as the interval's")
         print(f"    {reports} status reports logged, with the busy, quiet and retired notifiers")
         print(f"    {busy.group(0).strip()}")
     finally:

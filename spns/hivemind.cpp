@@ -75,6 +75,15 @@ namespace log = oxen::log;
 static auto cat = log::Cat("hivemind");
 static auto stats = log::Cat("stats");
 
+// The kinds of account a notification can be for, by the account's first byte: a Session account
+// (05), a group (03), or anything else; as indices into the counters by kind.
+enum AccountKind : size_t { SESSION_ACCOUNT, GROUP_ACCOUNT, OTHER_ACCOUNT };
+static AccountKind account_kind(const AccountID& account) {
+    return account[0] == std::byte{0x05} ? SESSION_ACCOUNT
+         : account[0] == std::byte{0x03} ? GROUP_ACCOUNT
+                                         : OTHER_ACCOUNT;
+}
+
 // A duration as hours and minutes, minutes and seconds, whole seconds, or under a second as
 // milliseconds, as fits.
 static std::string friendly_duration(double secs) {
@@ -754,6 +763,8 @@ void HiveMind::on_message_notification(quic::message m) {
         }
         notify_queue_bytes_ += m.body().size();
         notify_queue_.push_back(std::move(m));
+        notify_queue_peak_ = std::max(notify_queue_peak_, notify_queue_.size());
+        notify_queue_peak_bytes_ = std::max(notify_queue_peak_bytes_, notify_queue_bytes_);
     }
     notify_cv_.notify_one();
 }
@@ -1205,8 +1216,12 @@ WHERE account IN ({}))"_format(placeholders),
             for (auto& m : notify_queue_)
                 process.push_back(std::move(m));
             notify_queue_ = std::move(process);
+            // Recounted whole: what arrived since the batch was taken is counted already.
+            notify_queue_bytes_ = 0;
             for (const auto& m : notify_queue_)
                 notify_queue_bytes_ += m.body().size();
+            notify_queue_peak_ = std::max(notify_queue_peak_, notify_queue_.size());
+            notify_queue_peak_bytes_ = std::max(notify_queue_peak_bytes_, notify_queue_bytes_);
             notify_cv_.wait_for(lock, NOTIFY_LOOKUP_RETRY, [this] { return notify_quit_; });
             continue;
         }
@@ -1215,9 +1230,12 @@ WHERE account IN ({}))"_format(placeholders),
             filter_.insert(p.filt_hash);
 
         size_t notify_count = 0;
+        std::array<int64_t, 3> unique_by_kind{}, pushes_by_kind{};
 
         for (const auto& [account, hash, ns, timestamp_ms, expiry_ms, data, full_size, filt_hash] :
              parsed) {
+            auto kind = account_kind(account);
+            unique_by_kind[kind]++;
             auto subs_it = subs.find(account);
             if (subs_it == subs.end() || subs_it->second.empty()) {
                 log::debug(cat, "No active notifications match, ignoring notification");
@@ -1304,6 +1322,7 @@ WHERE account IN ({}))"_format(placeholders),
                 } else
                     backlog_push(service, std::string{dict.view()});
                 notify_count++;
+                pushes_by_kind[kind]++;
             }
         }
 
@@ -1326,6 +1345,10 @@ WHERE account IN ({}))"_format(placeholders),
         pushes_processed_ += process.size();
         notifications_unique_ += parsed.size();
         pushes_produced_ += notify_count;
+        for (size_t k = 0; k < unique_by_kind.size(); k++) {
+            unique_by_kind_[k] += unique_by_kind[k];
+            pushes_by_kind_[k] += pushes_by_kind[k];
+        }
         lookup_batches_++;
     }
 }
@@ -1454,12 +1477,25 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
         result["incoming"] = {
                 {"queue", notify_queue_.size()},
                 {"queue_bytes", notify_queue_bytes_},
+                {"queue_peak", notify_queue_peak_},
+                {"queue_peak_bytes", notify_queue_peak_bytes_},
                 {"received", notifications_received_.load()},
                 {"unique", notifications_unique_.load()},
                 {"pushes", pushes_produced_.load()},
+                {"unique_by_type",
+                 {{"accounts", unique_by_kind_[SESSION_ACCOUNT].load()},
+                  {"groups", unique_by_kind_[GROUP_ACCOUNT].load()},
+                  {"other", unique_by_kind_[OTHER_ACCOUNT].load()}}},
+                {"pushes_by_type",
+                 {{"accounts", pushes_by_kind_[SESSION_ACCOUNT].load()},
+                  {"groups", pushes_by_kind_[GROUP_ACCOUNT].load()},
+                  {"other", pushes_by_kind_[OTHER_ACCOUNT].load()}}},
                 {"dropped", notifications_dropped_.load()},
                 {"lookup_batches", lookup_batches_.load()},
                 {"lookup_failures", lookup_failures_.load()}};
+        // The peaks over each report's interval.
+        if (audit)
+            notify_queue_peak_ = notify_queue_peak_bytes_ = 0;
     }
     {
         std::lock_guard lock{services_mutex_};
@@ -1789,21 +1825,29 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     if (!idle.empty())
         out += "\n    idle: {}"_format(fmt::join(idle, ", "));
 
-    auto batches = delta("incoming", "lookup_batches");
-    auto queue_bytes = num(s, "incoming", "queue_bytes");
+    // A rate, split by the kind of account: Session accounts and groups, and others if any.
+    auto by_type = [&](const char* key) {
+        auto split = "{:.1f}/s accounts, {:.1f}/s groups"_format(
+                value(rate("incoming", key, "accounts")), value(rate("incoming", key, "groups")));
+        if (delta("incoming", key, "other") > 0)
+            split += ", {:.1f}/s other"_format(value(rate("incoming", key, "other")));
+        return split;
+    };
+    out += "\n  Incoming: {:.1f}/s from nodes, {:.1f}/s unique ({}), {:.1f} pushes/s ({})"_format(
+            value(rate("incoming", "received")),
+            value(rate("incoming", "unique")),
+            by_type("unique_by_type"),
+            value(rate("incoming", "pushes")),
+            by_type("pushes_by_type"));
+
+    auto peak_bytes = num(s, "incoming", "queue_peak_bytes");
     auto incoming_dropped = delta("incoming", "dropped"),
          lookup_failures = delta("incoming", "lookup_failures");
-    out += "\n  Incoming: {:.1f}/s from nodes, {:.1f}/s unique, {:.1f} pushes/s; queue {} ({} B), "
-           "{} dropped; lookups {:.2f}/s, {:.1f} per batch, {} failed"_format(
-                   value(rate("incoming", "received")),
-                   value(rate("incoming", "unique")),
-                   value(rate("incoming", "pushes")),
-                   value(num(s, "incoming", "queue")),
-                   value(queue_bytes, mark(queue_bytes > INCOMING_QUEUE_LOOK, false)),
-                   value(incoming_dropped, mark(false, incoming_dropped > 0)),
-                   value(rate("incoming", "lookup_batches")),
-                   value(batches > 0 ? delta("incoming", "unique") / batches : 0.0),
-                   value(lookup_failures, mark(lookup_failures > 0, false)));
+    out += "\n  Processing: peak {} queued ({} bytes), {} dropped, {} lookup failures"_format(
+            value(num(s, "incoming", "queue_peak")),
+            value(peak_bytes, mark(peak_bytes > INCOMING_QUEUE_LOOK, false)),
+            value(incoming_dropped, mark(false, incoming_dropped > 0)),
+            value(lookup_failures, mark(lookup_failures > 0, false)));
 
     auto requests = delta("monitor_requests", "sent"),
          request_failed = delta("monitor_requests", "failed"),

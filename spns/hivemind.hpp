@@ -186,6 +186,9 @@ class HiveMind {
     std::condition_variable notify_cv_;
     std::vector<quic::message> notify_queue_;
     size_t notify_queue_bytes_ = 0;
+    // The most notifications, and bytes, the queue has held since the last status report (which
+    // resets them).
+    size_t notify_queue_peak_ = 0, notify_queue_peak_bytes_ = 0;
     std::atomic<int64_t> notifications_dropped_{0};
     bool notify_quit_ = false;
 
@@ -260,6 +263,9 @@ class HiveMind {
     std::atomic<int64_t> notifications_received_{0}, notifications_unique_{0}, pushes_produced_{0},
             lookup_batches_{0}, lookup_failures_{0}, connections_established_{0},
             bytes_received_{0};
+    // The unique notifications and pushes again, by the kind of account they were for (a Session
+    // account, a group, or other; see account_kind()).
+    std::array<std::atomic<int64_t>, 3> unique_by_kind_{}, pushes_by_kind_{};
     // The bytes the nodes have acknowledged receiving from us, as sampled; QUIC loop (jq_) only.
     int64_t bytes_sent_ = 0;
 
