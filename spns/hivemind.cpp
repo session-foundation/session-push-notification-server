@@ -84,6 +84,14 @@ static AccountKind account_kind(const AccountID& account) {
                                          : OTHER_ACCOUNT;
 }
 
+// What the coverage lines count as covered: acknowledged on `threshold` nodes or more, under the
+// redundancy setting (-1 for every node of a swarm).  `figure` formats each number.
+static std::string coverage_basis(double threshold, double redundancy, auto figure) {
+    return "on {}+ nodes ({})"_format(
+            figure(threshold),
+            redundancy < 0 ? "full redundancy"s : "redundancy {}"_format(figure(redundancy)));
+}
+
 // A duration as hours and minutes, minutes and seconds, whole seconds, or under a second as
 // milliseconds, as fits.
 static std::string friendly_duration(double secs) {
@@ -1554,7 +1562,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                  {std::tuple{"accounts", index.accounts, c.accounts},
                   std::tuple{"covered accounts", index.covered, c.covered},
                   std::tuple{"under-covered accounts", index.under, c.under},
-                  std::tuple{"accounts on none", index.at_zero, c.at_zero},
+                  std::tuple{"uncovered accounts", index.at_zero, c.at_zero},
                   std::tuple{"unsendable accounts", index.unsendable, c.unsendable}})
                 if (kept != counted)
                     log::warning(
@@ -1568,14 +1576,13 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
         result["coverage"] = {
                 {"filling", depth != StatsDepth::tick && filling(c)},
                 {"redundancy", config.redundancy},
-                {"covered_threshold",
-                 config.redundancy >= 1 && config.redundancy <= 3 ? config.redundancy : 4},
+                {"covered_threshold", covered_threshold()},
                 {"accounts", c.accounts},
                 {"covered", c.covered},
                 {"under_covered", c.under},
                 {"under_covered_down_only", c.under_down_only},
                 {"at_zero", c.at_zero},
-                {"on_none",
+                {"uncovered",
                  {{"rejected", c.rejected},
                   {"retrying", c.retrying},
                   {"no_node", c.no_node},
@@ -1583,7 +1590,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                   {"other", c.other}}},
                 {"unsendable", c.unsendable},
                 {"lapsed", c.lapsed},
-                {"on_none_accounts", c.described}};
+                {"uncovered_accounts", c.described}};
         // How many accounts each connected node holds.
         size_t load_nodes = 0, load_min = 0, load_max = 0, load_total = 0;
         for (const auto& [pk, sn] : sns_)
@@ -1655,6 +1662,17 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                 {"replay_discarded", ss.replay_discarded},
                 {"replay_discarded_accounts", ss.replay_discarded_accounts}};
         result["subscriptions_distinct"] = subscription_count_;
+        result["client_requests"] = {
+                {"new_subscriptions", subscriptions_added_.load()},
+                {"renewals", subscriptions_renewed_.load()},
+                {"unsubscribes", unsubscribes_.load()},
+                {"rejected", subscribes_rejected_.load()}};
+        for (auto [key, counts] : {std::pair{"accounts_by_type", &accounts_by_kind_},
+                                   std::pair{"subscriptions_by_type", &subscriptions_by_kind_}})
+            result[key] = {
+                    {"accounts", (*counts)[SESSION_ACCOUNT]},
+                    {"groups", (*counts)[GROUP_ACCOUNT]},
+                    {"other", (*counts)[OTHER_ACCOUNT]}};
         const auto& ms = monitor_stats_;
         result["monitor_requests"] = {
                 {"sent", ms.sent},
@@ -1705,7 +1723,7 @@ constexpr double REQUESTS_FAILED_LOOK = 0.005, REQUESTS_FAILED_WRONG = 0.05;
 constexpr double WRONG_SWARM_LOOK = 0.005, WRONG_SWARM_WRONG = 0.05;
 constexpr double NODES_CONNECTED_LOOK = 0.98, NODES_CONNECTED_WRONG = 0.90;
 constexpr double COVERED_LOOK = 0.99, COVERED_WRONG = 0.90;
-constexpr double ON_NONE_WRONG = 0.05;  // any account on no node is worth a look
+constexpr double UNCOVERED_WRONG = 0.05;  // any uncovered account is worth a look
 constexpr auto SAVE_AGE_LOOK = 2 * DUMP_INTERVAL;
 
 static Mark mark(bool look, bool wrong) {
@@ -1854,13 +1872,26 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
          timed_out = delta("monitor_requests", "timed_out"),
          entries = delta("monitor_requests", "entries"),
          wrong_swarm = delta("monitor_requests", "wrong_swarm");
-    out += "\n  Subscriptions: {} accounts, {} subscriptions, {} swarms; schedule {}; {} to send; "
-           "requests {}/{} in flight, {} nodes waiting, {} sent ({} answered, {} failed, {} timed "
-           "out), {} wrong swarm; {} accounts moved"_format(
+    // A count split by the kind of account: Session accounts and groups, and others if any.
+    auto split_counts = [&](const char* key) {
+        auto split = "{} accounts, {} groups"_format(
+                value(num(s, key, "accounts")), value(num(s, key, "groups")));
+        if (num(s, key, "other") > 0)
+            split += ", {} other"_format(value(num(s, key, "other")));
+        return split;
+    };
+    out += "\n  Subscriptions: {} accounts ({}), {} subscriptions ({}) in {} swarms; {} schedule "
+           "entries"_format(
                    value(num(s, "accounts_monitored")),
+                   split_counts("accounts_by_type"),
                    value(num(s, "subscriptions_distinct")),
+                   split_counts("subscriptions_by_type"),
                    value(num(s, "swarm_index", "swarms")),
-                   value(num(s, "schedule")),
+                   value(num(s, "schedule")));
+
+    out += "\n  Monitor requests: {} accounts to send, {}/{} in flight, {} nodes waiting; {} "
+           "sent, {} answered, {} failed, {} timed out; {} wrong swarm; {} accounts moved "
+           "swarm"_format(
                    value(num(s, "pending", "accounts")),
                    value(num(s, "pending", "requests")),
                    value(num(s, "pending", "request_cap")),
@@ -1877,36 +1908,40 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                          mark(wrong_swarm > WRONG_SWARM_LOOK * entries,
                               wrong_swarm > WRONG_SWARM_WRONG * entries)),
                    value(delta("accounts_moved")));
+    if (auto moved = delta("placements", "moved"); moved > 0)
+        out += "; {} monitors moved between nodes"_format(value(moved));
+
+    out += "\n  Client requests: {} new subscriptions, {} renewals, {} unsubscribes"_format(
+            value(delta("client_requests", "new_subscriptions")),
+            value(delta("client_requests", "renewals")),
+            value(delta("client_requests", "unsubscribes")));
+    if (auto rejected = delta("client_requests", "rejected"); rejected > 0)
+        out += ", {} rejected"_format(value(rejected));
 
     auto accounts = num(s, "coverage", "accounts"), covered = num(s, "coverage", "covered"),
-         on_none = num(s, "coverage", "at_zero");
+         uncovered = num(s, "coverage", "at_zero");
     auto covered_share = accounts > 0 ? covered / accounts : 1;
-    auto redundancy = num(s, "coverage", "redundancy");
-    out += "\n  Coverage: {}/{} covered (on {}+ nodes; {}), {} under-covered ({} only "
-           "on down nodes), {} on none ({} rejected, {} retrying, {} no node, {} sent but never "
-           "acknowledged, {} other), {} unsendable, {} lapsed; node load min/avg/max "
-           "{}/{:.0f}/{}; placements: {} direct, {} by scans, {} moved"_format(
-                   value(covered,
+    out += "\n  Coverage: {} {}; {} under-covered ({} only on down nodes); {} uncovered; {} "
+           "unsendable; {} lapsed"_format(
+                   value("{}/{} ({:.1f}%)"_format(covered, accounts, 100 * covered_share),
                          mark(covered_share < COVERED_LOOK, covered_share < COVERED_WRONG)),
-                   value(accounts),
-                   value(num(s, "coverage", "covered_threshold")),
-                   redundancy < 0 ? "full redundancy"s : "redundancy {}"_format(value(redundancy)),
+                   coverage_basis(
+                           num(s, "coverage", "covered_threshold"),
+                           num(s, "coverage", "redundancy"),
+                           value),
                    value(num(s, "coverage", "under_covered")),
                    value(num(s, "coverage", "under_covered_down_only")),
-                   value(on_none, mark(on_none > 0, on_none >= ON_NONE_WRONG * accounts)),
-                   value(num(s, "coverage", "on_none", "rejected")),
-                   value(num(s, "coverage", "on_none", "retrying")),
-                   value(num(s, "coverage", "on_none", "no_node")),
-                   value(num(s, "coverage", "on_none", "sent_never_acked")),
-                   value(num(s, "coverage", "on_none", "other")),
+                   value(uncovered, mark(uncovered > 0, uncovered >= UNCOVERED_WRONG * accounts)),
                    value(num(s, "coverage", "unsendable")),
-                   value(num(s, "coverage", "lapsed")),
-                   value(num(s, "node_load", "min")),
-                   value(num(s, "node_load", "avg")),
-                   value(num(s, "node_load", "max")),
-                   value(delta("placements", "placed")),
-                   value(delta("placements", "by_scans")),
-                   value(delta("placements", "moved")));
+                   value(num(s, "coverage", "lapsed")));
+    if (uncovered > 0)
+        out += "\n    uncovered: {} rejected, {} retrying, {} no node, {} sent but never "
+               "acknowledged, {} other"_format(
+                       value(num(s, "coverage", "uncovered", "rejected")),
+                       value(num(s, "coverage", "uncovered", "retrying")),
+                       value(num(s, "coverage", "uncovered", "no_node")),
+                       value(num(s, "coverage", "uncovered", "sent_never_acked")),
+                       value(num(s, "coverage", "uncovered", "other")));
 
     std::string saved = "not saved yet";
     if (get(s, "state", "saved_ago").is_number()) {
@@ -1927,7 +1962,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     auto unsupported = delta("monitor_sessions", "unsupported"),
          session_failed = delta("monitor_sessions", "failed"),
          discarded = delta("monitor_sessions", "replay_discarded");
-    auto sessions = "{}/{} nodes support them, {} created, {} resumed"_format(
+    auto sessions = "{}/{} nodes support them; {} created, {} resumed"_format(
             value(num(s, "monitor_sessions", "nodes_supporting")),
             value(num(s, "snodes")),
             value(delta("monitor_sessions", "created")),
@@ -1936,7 +1971,6 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         sessions += ", {} unsupported"_format(value(unsupported, Mark::look));
     if (session_failed > 0)
         sessions += ", {} failed"_format(value(session_failed, Mark::look));
-    sessions += " over the interval";
     if (discarded > 0)
         sessions += ", {} replays discarded for {} accounts"_format(
                 value(discarded), value(delta("monitor_sessions", "replay_discarded_accounts")));
@@ -1955,7 +1989,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     auto snodes = num(s, "snodes"), connected = num(s, "connections");
     auto connected_share = snodes > 0 ? connected / snodes : 1;
     out += "\n  Nodes: {}/{} connected, {} connecting, {} cooling down, {} connections made; "
-           "{:.1f}/{:.1f} kB/s out/in"_format(
+           "{:.1f}/{:.1f} kB/s out/in; load min/avg/max {}/{:.0f}/{} accounts"_format(
                    value(connected,
                          mark(connected_share < NODES_CONNECTED_LOOK,
                               connected_share < NODES_CONNECTED_WRONG)),
@@ -1964,7 +1998,10 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    value(num(s, "cooling_down")),
                    value(delta("connections_established")),
                    value(rate("bytes_sent") / 1000),
-                   value(rate("bytes_received") / 1000));
+                   value(rate("bytes_received") / 1000),
+                   value(num(s, "node_load", "min")),
+                   value(num(s, "node_load", "avg")),
+                   value(num(s, "node_load", "max")));
 
     auto db_idle = num(s, "db_connections", "idle"), db_in_use = num(s, "db_connections", "in_use");
     out += "\n  Process: RSS {:.0f} MB; block {}{}; up {}; db connections {} idle, {} busy"_format(
@@ -1977,10 +2014,10 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             value(db_idle),
             value(db_in_use, mark(db_idle == 0 && db_in_use > 0, false)));
 
-    // During a fill, every account not yet reached is on none, as expected.
-    if (const auto& accounts = get(s, "coverage", "on_none_accounts");
+    // During a fill, every account not yet reached is uncovered, as expected.
+    if (const auto& accounts = get(s, "coverage", "uncovered_accounts");
         get(s, "coverage", "filling") != true && accounts.is_array() && !accounts.empty()) {
-        out += "\n  Accounts on no node, or unsendable:";
+        out += "\n  Uncovered or unsendable accounts:";
         for (const auto& line : accounts)
             out += "\n    {}"_format(line.get<std::string>());
     }
@@ -2193,6 +2230,7 @@ void HiveMind::on_notifier_validation(
                         want_truncated,
                         std::move(*sub));
 
+                (newsub ? subscriptions_added_ : subscriptions_renewed_)++;
                 response[newsub ? "added" : "updated"] = true;
                 message = newsub ? "Subscription successful" : "Resubscription successful";
             } else {  // Unsubscribe
@@ -2201,6 +2239,7 @@ void HiveMind::on_notifier_validation(
                 bool removed = remove_subscription(
                         pubkey, subaccount, std::move(service), std::move(service_id), sig, sig_ts);
 
+                unsubscribes_++;
                 response["removed"] = removed;
                 message = removed ? "Device unsubscribed from push notifications"
                                   : "Device was not subscribed to push notifications";
@@ -2208,6 +2247,8 @@ void HiveMind::on_notifier_validation(
         } else {
             // leave code at whatever the notifier set it to
             message = std::move(data[1]);
+            if (!unsub)
+                subscribes_rejected_++;
         }
     } catch (const hive::subscribe_error& e) {
         code = e.numeric_code();
@@ -2215,6 +2256,8 @@ void HiveMind::on_notifier_validation(
     } catch (const hive::signature_verify_failure& e) {
         code = static_cast<int>(hive::SUBSCRIBE::ERROR);
         message = e.what();
+        if (!unsub)
+            subscribes_rejected_++;
     } catch (const std::exception& e) {
         code = static_cast<int>(hive::SUBSCRIBE::ERROR);
         log::warning(cat, "Exception encountered during sub/unsub handling: {}", e.what());
@@ -2462,6 +2505,8 @@ void HiveMind::on_sub_unsub_impl(Message& msg, bool subscribe) {
         }
 
         if (error) {
+            if (subscribe)
+                subscribes_rejected_++;
             int code = static_cast<int>(error->first);
             log::debug(
                     cat,
@@ -3495,11 +3540,12 @@ void HiveMind::log_coverage_progress() {
 
     auto now = steady_clock::now();
     auto figures =
-            "{}/{} accounts ({:.1f}%) covered, {} under-covered ({} only on down nodes), {} "
-            "on none, {} unsendable"_format(
+            "{}/{} ({:.1f}%) {}; {} under-covered ({} only on down nodes), {} uncovered, {} "
+            "unsendable"_format(
                     c.covered,
                     c.accounts,
                     c.accounts ? 100.0 * c.covered / c.accounts : 100.0,
+                    coverage_basis(covered_threshold(), config.redundancy, std::identity{}),
                     c.under,
                     c.under_down_only,
                     c.at_zero,
@@ -4213,6 +4259,11 @@ WHERE id % {0} = {1})"_format(n, i))) {
             unique,
             subscribers_.size());
     subscription_count_ = unique;
+    for (const auto& [account, subs] : subscribers_) {
+        auto kind = account_kind(account.id);
+        accounts_by_kind_[kind]++;
+        subscriptions_by_kind_[kind] += subs.size();
+    }
 }
 
 bool HiveMind::add_subscription(
@@ -4285,6 +4336,9 @@ RETURNING id, xmax = 0
     sub_jq_.call_soon([this, new_sub, pubkey = std::move(pubkey), sub = std::move(sub)]() mutable {
         auto [it, inserted] = subscribers_.try_emplace(std::move(pubkey));
         const auto& account = it->first;
+        auto kind = account_kind(account.id);
+        if (inserted)
+            accounts_by_kind_[kind]++;
         // Before the first swarm list the account stays unplaced, and reassign_swarms() places it
         // along with every other.
         if (inserted && account.update_swarm(swarm_ids_))
@@ -4306,6 +4360,7 @@ RETURNING id, xmax = 0
         if (!found_existing) {
             subscriptions.push_back(std::move(sub));
             subscription_count_++;
+            subscriptions_by_kind_[kind]++;
             changed = true;
         }
 

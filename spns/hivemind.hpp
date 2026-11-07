@@ -266,6 +266,10 @@ class HiveMind {
     // The unique notifications and pushes again, by the kind of account they were for (a Session
     // account, a group, or other; see account_kind()).
     std::array<std::atomic<int64_t>, 3> unique_by_kind_{}, pushes_by_kind_{};
+    // Clients' requests since startup: subscriptions added and renewed, unsubscribes done, and
+    // subscribe requests refused, as invalid or by the notifier's validation.
+    std::atomic<int64_t> subscriptions_added_{0}, subscriptions_renewed_{0}, unsubscribes_{0},
+            subscribes_rejected_{0};
     // The bytes the nodes have acknowledged receiving from us, as sampled; QUIC loop (jq_) only.
     int64_t bytes_sent_ = 0;
 
@@ -310,6 +314,10 @@ class HiveMind {
     }
     // The acknowledged nodes an account in `swarm` is reported covered on (see Coverage).
     int covered_threshold(const Swarm& swarm) const { return std::clamp(target(swarm), 1, 4); }
+    // The same for a swarm of more nodes than that, as the coverage lines describe it.
+    int covered_threshold() const {
+        return config.redundancy >= 1 && config.redundancy <= 3 ? config.redundancy : 4;
+    }
 
     // Sorted list of all swarm ids
     std::vector<uint64_t> swarm_ids_;
@@ -425,7 +433,8 @@ class HiveMind {
     bool hold_dispatch_ = false;
 
     // Accounts' coverage, over the accounts with subscriptions to renew: how many there are, how
-    // many are acknowledged on as many nodes as their swarm's target, and how many on none.
+    // many are acknowledged on as many nodes as their swarm's target, and how many on none (shown
+    // as uncovered).
     //
     // Accounts on none are classed by why, the first that applies: no subscription with a signature
     // within its window, or none at all (unsendable, and not counted as on none); every entry
@@ -528,6 +537,9 @@ class HiveMind {
 
     // How many distinct subscriptions subscribers_ holds.
     size_t subscription_count_ = 0;
+    // The accounts subscribers_ holds, and their subscriptions, by kind of account (a Session
+    // account, a group, or other; see account_kind()).
+    std::array<size_t, 3> accounts_by_kind_{}, subscriptions_by_kind_{};
 
     // The database's subscription rows (devices' registrations) per service: counted once at
     // startup and kept in step with every insert and delete since, so that the status tick need

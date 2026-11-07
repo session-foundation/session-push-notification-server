@@ -795,6 +795,12 @@ def scenario_correctness(build_dir):
         )
         left = sorted(sid for (sid,) in query("SELECT svcid FROM subscriptions"))
         check(left == sorted([svcid(1), svcid(2, 2)]), f"subscriptions left: {left}")
+        # The concurrent subscribes made one subscription and renewed it the rest of the times.
+        cr = s.stats()["client_requests"]
+        check(
+            cr == {"new_subscriptions": 1, "renewals": 7, "unsubscribes": 1, "rejected": 0},
+            f"client requests counted: {cr}",
+        )
         check(c["duplicates"] == 0, f"{c['duplicates']} duplicate pushes")
     finally:
         rc = s.stop()
@@ -1600,8 +1606,53 @@ def scenario_status_report(build_dir):
                       r"failures$", log, re.M),
             "no Processing line in the reports",
         )
+        check(
+            re.search(
+                r"^  Coverage: \d+/\d+ \([\d.]+%\) on \d\+ nodes \(full redundancy\); \d+ "
+                r"under-covered \(\d+ only on down nodes\); \d+ uncovered; ",
+                log,
+                re.M,
+            ),
+            "no Coverage line of the expected form in the reports",
+        )
+        check(
+            re.search(r"^  Nodes: .*; load min/avg/max \d+/\d+/\d+ accounts$", log, re.M),
+            "no node load on the Nodes line of the reports",
+        )
+        # The accounts and subscriptions, split by kind of account, add up to their totals; the
+        # seeded accounts are all groups (03).
+        subscriptions = re.search(
+            r"^  Subscriptions: (\d+) accounts \((\d+) accounts, (\d+) groups\), (\d+) "
+            r"subscriptions \((\d+) accounts, (\d+) groups\) in \d+ swarms",
+            log,
+            re.M,
+        )
+        check(subscriptions, "no Subscriptions line of the expected form in the reports")
+        n = [int(x) for x in subscriptions.groups()]
+        check(
+            n[0] == n[1] + n[2] == 10 and n[3] == n[4] + n[5] and n[2] == 10,
+            f"the Subscriptions line's split: {subscriptions.group(0)}",
+        )
+        check(
+            re.search(
+                r"^  Monitor requests: \d+ accounts to send, \d+/\d+ in flight, \d+ nodes waiting; \d+ "
+                r"sent, \d+ answered, \d+ failed, \d+ timed out; \d+ wrong swarm; \d+ accounts "
+                r"moved swarm",
+                log,
+                re.M,
+            ),
+            "no Monitor requests line of the expected form in the reports",
+        )
+        check(
+            re.search(
+                r"^  Client requests: \d+ new subscriptions, \d+ renewals, \d+ unsubscribes$",
+                log,
+                re.M,
+            ),
+            "no Client requests line of the expected form in the reports",
+        )
         supporting = 3 if MODE == "monitor" else 0
-        sessions = re.search(r"sessions: (\d+)/(\d+) nodes support them, (\d+) created", log)
+        sessions = re.search(r"sessions: (\d+)/(\d+) nodes support them; (\d+) created", log)
         check(
             sessions and sessions.groups() == (str(supporting), "3", str(supporting)),
             f"the first report's sessions, expected {supporting}/3 supporting and created: "
