@@ -68,14 +68,6 @@ startup_wait = 8.0
 # fewest.
 #redundancy = -1
 
-# The file the hivemind saves which nodes hold each account in, along with its monitor session
-# tokens, every 5 minutes and when it stops.  A hivemind started within 10 minutes of the last save
-# resumes its monitor sessions without the nodes listing every monitor; otherwise, or without the
-# file, every node starts a new session and is subscribed afresh.  After a crash, the tokens nodes
-# rotated since the last save are lost, and those nodes start afresh.  By default
-# hivemind-state.bin next to this file; empty to save nothing.
-#state_file = /var/lib/spns/hivemind-state.bin
-
 # The most notifications per account a storage server keeps while our monitor session with it is
 # detached, and replays when it is resumed, after a reconnection or a quick restart: the newest of
 # them, the rest being lost, as push notifications are best effort.

@@ -1,13 +1,11 @@
 #include "hivemind.hpp"
 
-#include <fcntl.h>
 #include <fmt/chrono.h>
 #include <fmt/ranges.h>
 #include <fmt/std.h>
 #include <oxenc/base32z.h>
 #include <oxenc/bt_producer.h>
 #include <oxenc/bt_serialize.h>
-#include <oxenc/endian.h>
 #include <oxenmq/message.h>
 #include <sodium/crypto_sign_ed25519.h>
 #include <spdlog/common.h>
@@ -16,7 +14,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <concepts>
@@ -1512,10 +1509,10 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                 {"avg", load_nodes ? double(load_total) / load_nodes : 0.0},
                 {"max", load_max}};
         result["state"] = {
-                {"file", config.state_file},
                 {"saved_ago", seconds_since(state_saved_.when, steady_clock::now())},
-                {"bytes", state_saved_.bytes},
                 {"accounts", state_saved_.accounts},
+                {"nodes", state_saved_.nodes},
+                {"sessions", state_saved_.sessions},
                 {"snapshot_ms", state_saved_.snapshot_ms},
                 {"write_ms", state_saved_.write_ms.load()}};
         result["restored"] = {
@@ -1728,11 +1725,12 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
 
     out += "\n  State: {}; {}; sessions: {} resumed, {} replays discarded for {} accounts"_format(
             get(s, "state", "saved_ago").is_number()
-                    ? "saved {} ago, {} accounts, {:.1f} MB (snapshot {:.0f} ms, write {:.0f} "
-                      "ms)"_format(
+                    ? "saved {} ago, {} accounts on {} nodes, {} session tokens (snapshot "
+                      "{:.0f} ms, write {:.0f} ms)"_format(
                               duration(num(s, "state", "saved_ago")),
                               num(s, "state", "accounts"),
-                              num(s, "state", "bytes") / 1e6,
+                              num(s, "state", "nodes"),
+                              num(s, "state", "sessions"),
                               num(s, "state", "snapshot_ms"),
                               num(s, "state", "write_ms"))
                     : "not saved yet"s,
@@ -3218,142 +3216,112 @@ void HiveMind::log_coverage_progress() {
 
 namespace {
 
-    // The saved state (see HiveMind::save_state), all integers little-endian:
-    //
-    //     "SPNS", version (u8), when saved (i64 unix seconds)
-    //     token count (u32), each: node pubkey (32), token (32)
-    //     swarm count (u32), each:
-    //         swarm id (u64), slot count (u8), each: slot (u8), node pubkey (32)
-    //         account count (u32), each: account id (33), acked mask (u16), acked at (u32)
-    //
-    // Only accounts acknowledged on some node are written.
-    constexpr std::string_view STATE_MAGIC = "SPNS";
-    constexpr uint8_t STATE_VERSION = 1;
-
-    template <std::integral T>
-    void put(std::string& out, T v) {
-        v = oxenc::host_to_little(v);
-        out.append(reinterpret_cast<const char*>(&v), sizeof v);
-    }
-
-    // Reads saved state, throwing on anything truncated.
-    struct StateReader {
-        std::string_view in;
-
-        std::string_view bytes(size_t n) {
-            if (in.size() < n)
-                throw std::runtime_error{"truncated"};
-            auto r = in.substr(0, n);
-            in.remove_prefix(n);
-            return r;
-        }
-        template <std::integral T>
-        T get() {
-            return oxenc::load_little_to_host<T>(bytes(sizeof(T)).data());
-        }
+    // What save_state() writes, as taken on the subscription thread for the writer thread.
+    struct SavedPlacement {
+        AccountID account;
+        uint16_t acked;
+        uint32_t acked_at;
+    };
+    struct SavedSlot {
+        uint64_t swarm;
+        int16_t slot;
+        Ed25519PK node;
+    };
+    struct SavedState {
+        int64_t saved_at;
+        std::vector<std::pair<Ed25519PK, MonitorToken>> tokens;
+        std::vector<SavedSlot> slots;
+        std::vector<SavedPlacement> placements;
     };
 
-    // Writes `data` to `path` whole: to a temporary file, synced, then renamed over it.
-    void write_whole(const std::string& path, std::string_view data) {
-        auto tmp = path + ".tmp";
-        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0)
-            throw std::runtime_error{"cannot open {}: {}"_format(tmp, std::strerror(errno))};
-        for (size_t done = 0; done < data.size();) {
-            auto n = ::write(fd, data.data() + done, data.size() - done);
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0) {
-                auto err = errno;
-                ::close(fd);
-                throw std::runtime_error{"cannot write {}: {}"_format(tmp, std::strerror(err))};
-            }
-            done += n;
-        }
-        if (::fsync(fd) != 0 || ::close(fd) != 0)
-            throw std::runtime_error{"cannot sync {}: {}"_format(tmp, std::strerror(errno))};
-        if (::rename(tmp.c_str(), path.c_str()) != 0)
-            throw std::runtime_error{"cannot rename {}: {}"_format(tmp, std::strerror(errno))};
+    // An integer for pqxx::stream_to, as text.  Given as an integer, libpqxx 8.0 (to 8.0.2 at
+    // least) asserts that its text is shorter than the longest its type can have, which aborts
+    // on a SMALLINT from -10000 down, as a mask with slot 15 is, and a BIGINT from -10^18 down, as
+    // most swarm ids are.
+    std::string copy_int(std::integral auto value) {
+        return std::to_string(value);
     }
 
 }  // namespace
 
 void HiveMind::save_state(bool wait) {
-    if (config.state_file.empty())
+    if (state_writing_ && !wait) {
+        log::warning(cat, "Not saving placement state: the last save is still being written");
         return;
-    if (state_writing_) {
-        if (!wait) {
-            log::warning(cat, "Not saving placement state: the last save is still being written");
-            return;
-        }
     }
     if (state_writer_.joinable())
         state_writer_.join();
 
     auto started = steady_clock::now();
-    std::string out;
-    out.reserve(32 + 64 * monitor_tokens_.size() + 39 * subscribers_.size());
-    out += STATE_MAGIC;
-    put<uint8_t>(out, STATE_VERSION);
-    put<int64_t>(out, unix_timestamp(system_clock::now()));
-    put<uint32_t>(out, monitor_tokens_.size());
-    for (const auto& [pk, token] : monitor_tokens_) {
-        out += pk.sv();
-        out += token.sv();
-    }
-    size_t accounts = 0, swarms = 0;
-    auto swarm_count_at = out.size();
-    put<uint32_t>(out, 0);
+    SavedState state;
+    state.saved_at = unix_timestamp(system_clock::now());
+    state.tokens.assign(monitor_tokens_.begin(), monitor_tokens_.end());
     for (const auto& [id, swarm] : swarms_) {
         if (swarm.nodes == 0)
             continue;
-        swarms++;
-        put<uint64_t>(out, id);
-        put<uint8_t>(out, swarm.nodes);
         for (int s = 0; s < SWARM_SLOTS; s++)
-            if (const auto* node = swarm.slots[s]) {
-                put<uint8_t>(out, s);
-                out += node->pubkey.sv();
-            }
-        auto count_at = out.size();
-        put<uint32_t>(out, 0);
-        uint32_t count = 0;
-        for (const auto* account : swarm.members) {
-            if (!account->acked)
-                continue;
-            out += account->id.sv();
-            put<uint16_t>(out, account->acked);
-            put<uint32_t>(out, account->acked_at);
-            count++;
-        }
-        auto le = oxenc::host_to_little(count);
-        std::memcpy(out.data() + count_at, &le, sizeof le);
-        accounts += count;
+            if (const auto* node = swarm.slots[s])
+                state.slots.push_back({id, static_cast<int16_t>(s), node->pubkey});
+        for (const auto* account : swarm.members)
+            if (account->acked)
+                state.placements.push_back({account->id, account->acked, account->acked_at});
     }
-    auto le = oxenc::host_to_little(static_cast<uint32_t>(swarms));
-    std::memcpy(out.data() + swarm_count_at, &le, sizeof le);
 
     state_saved_.when = steady_clock::now();
-    state_saved_.bytes = out.size();
-    state_saved_.accounts = accounts;
+    state_saved_.accounts = state.placements.size();
+    state_saved_.nodes = state.slots.size();
+    state_saved_.sessions = state.tokens.size();
     state_saved_.snapshot_ms =
             std::chrono::duration<double, std::milli>(*state_saved_.when - started).count();
 
     state_writing_ = true;
-    auto write = [this, out = std::move(out), accounts] {
+    auto write = [this, state = std::move(state)] {
         auto started = steady_clock::now();
         try {
-            write_whole(config.state_file, out);
+            auto conn = pool_.get();
+            pqxx::work tx{conn};
+            // Replaced whole in one transaction, so that a restore finds the last complete save.
+            // The placements' key is built once after they are copied in rather than kept up row by
+            // row, which takes over twice as long at a million accounts.
+            tx.exec("TRUNCATE placement_state, monitor_sessions, swarm_slots, placements")
+                    .no_rows();
+            tx.exec("ALTER TABLE placements DROP CONSTRAINT placements_pkey").no_rows();
+            {
+                auto out = pqxx::stream_to::table(tx, {"monitor_sessions"}, {"snode", "token"});
+                for (const auto& [node, token] : state.tokens)
+                    out.write_values(node, token);
+                out.complete();
+            }
+            {
+                auto out =
+                        pqxx::stream_to::table(tx, {"swarm_slots"}, {"swarm", "slot", "snode"});
+                // Swarm ids use the full 64 bits; BIGINT holds them by their bit pattern.
+                for (const auto& [swarm, slot, node] : state.slots)
+                    out.write_values(copy_int(static_cast<int64_t>(swarm)), copy_int(slot), node);
+                out.complete();
+            }
+            {
+                auto out = pqxx::stream_to::table(
+                        tx, {"placements"}, {"account", "acked", "acked_at"});
+                for (const auto& [account, acked, acked_at] : state.placements)
+                    out.write_values(
+                            account, copy_int(static_cast<int16_t>(acked)), copy_int(acked_at));
+                out.complete();
+            }
+            tx.exec("ALTER TABLE placements ADD PRIMARY KEY (account)").no_rows();
+            tx.exec("INSERT INTO placement_state (saved_at) VALUES ($1)", {state.saved_at})
+                    .no_rows();
+            tx.commit();
             state_saved_.write_ms =
                     std::chrono::duration<double, std::milli>(steady_clock::now() - started)
                             .count();
-            log::info(
+            log::debug(
                     cat,
-                    "Saved placement state of {} accounts ({} B) to {}: snapshot {:.1f}ms, write "
-                    "{:.1f}ms",
-                    accounts,
-                    out.size(),
-                    config.state_file,
+                    "Saved placement state of {} accounts on {} nodes, {} monitor session tokens: "
+                    "snapshot {:.1f}ms, write {:.1f}ms",
+                    state.placements.size(),
+                    state.slots.size(),
+                    state.tokens.size(),
                     state_saved_.snapshot_ms,
                     state_saved_.write_ms.load());
         } catch (const std::exception& e) {
@@ -3368,144 +3336,118 @@ void HiveMind::save_state(bool wait) {
 }
 
 void HiveMind::restore_state() {
-    if (config.state_file.empty())
-        return;
-    std::string data;
-    {
-        std::ifstream f{config.state_file, std::ios::binary};
-        if (!f) {
+    auto now = system_clock::now();
+    // Read whole before any of it is applied, so that a failure part way applies none of it.
+    SavedState state;
+    try {
+        auto conn = pool_.get();
+        pqxx::transaction<pqxx::isolation_level::repeatable_read, pqxx::write_policy::read_only> tx{
+                conn};
+        auto saved_at = tx.query01<int64_t>("SELECT saved_at FROM placement_state");
+        if (!saved_at) {
             log::info(
                     cat,
-                    "No saved placement state ({} not found): every node starts a new monitor "
-                    "session and is subscribed afresh",
-                    config.state_file);
+                    "No saved placement state: every node starts a new monitor session and is "
+                    "subscribed afresh");
             return;
         }
-        data.assign(std::istreambuf_iterator<char>{f}, {});
-    }
-
-    auto now = system_clock::now();
-    int64_t saved_at;
-    // A pass over the file to check it whole, before a second that applies it.
-    auto walk = [&](bool apply) {
-        StateReader r{data};
-        if (r.bytes(STATE_MAGIC.size()) != STATE_MAGIC)
-            throw std::runtime_error{"not a saved state file"};
-        if (auto v = r.get<uint8_t>(); v != STATE_VERSION)
-            throw std::runtime_error{"unknown version {}"_format(v)};
-        saved_at = r.get<int64_t>();
-        if (!apply) {
-            auto age = now - system_time{std::chrono::seconds{saved_at}};
-            if (age > RESUME_MAX_AGE || age < -1min)
-                return false;
-        }
-
-        std::unordered_map<Ed25519PK, MonitorToken> tokens;
-        for (auto n = r.get<uint32_t>(); n > 0; n--) {
-            Ed25519PK pk;
-            MonitorToken token;
-            std::memcpy(pk.data(), r.bytes(pk.size()).data(), pk.size());
-            std::memcpy(token.data(), r.bytes(token.size()).data(), token.size());
-            tokens.emplace(pk, token);
-        }
-        for (auto swarms = r.get<uint32_t>(); swarms > 0; swarms--) {
-            auto id = r.get<uint64_t>();
-            auto sw = swarms_.find(id);
-            // This save's slot -> the slot of the same node, if it is still in this swarm.
-            std::array<int, SWARM_SLOTS> slot_now;
-            slot_now.fill(-1);
-            int kept = 0;
-            for (auto n = r.get<uint8_t>(); n > 0; n--) {
-                auto s = r.get<uint8_t>();
-                Ed25519PK pk;
-                std::memcpy(pk.data(), r.bytes(pk.size()).data(), pk.size());
-                if (s >= SWARM_SLOTS)
-                    throw std::runtime_error{"invalid slot {}"_format(s)};
-                if (!apply)
-                    continue;
-                auto it = sns_.find(pk);
-                if (sw == swarms_.end() || it == sns_.end() || it->second->swarm != id ||
-                    it->second->slot < 0) {
-                    restored_.slots_dropped++;
-                    continue;
-                }
-                auto& node = *it->second;
-                slot_now[s] = node.slot;
-                node.resuming = true;
-                if (auto t = tokens.find(pk); t != tokens.end())
-                    monitor_tokens_[pk] = t->second;
-                kept++;
-            }
-            if (apply && kept) {
-                restored_.swarms++;
-                restored_.slots += kept;
-            }
-            for (auto n = r.get<uint32_t>(); n > 0; n--) {
-                AccountID acct_id;
-                std::memcpy(acct_id.data(), r.bytes(acct_id.size()).data(), acct_id.size());
-                auto acked = r.get<uint16_t>();
-                auto acked_at = r.get<uint32_t>();
-                if (!apply || !kept)
-                    continue;
-                auto it = subscribers_.find(
-                        SwarmPubkey{acct_id, std::nullopt, /*_skip_validation=*/true});
-                if (it == subscribers_.end())
-                    continue;
-                const auto& account = it->first;
-                if (account.swarm != id || account.next_due == SwarmPubkey::UNSCHEDULED)
-                    continue;
-                bool any = false;
-                for (uint16_t bits = acked; bits; bits &= bits - 1)
-                    if (auto s = slot_now[std::countr_zero(bits)]; s >= 0) {
-                        auto bit = static_cast<uint16_t>(1u << s);
-                        if ((account.sent | account.acked) & bit)
-                            continue;
-                        auto claims = std::popcount<uint16_t>(account.sent | account.acked);
-                        sw->second.by_claims[claims]--;
-                        sw->second.by_claims[claims + 1]++;
-                        account.acked |= bit;
-                        account.restored |= bit;
-                        sw->second.slots[s]->claimed++;
-                        any = true;
-                    }
-                if (!any)
-                    continue;
-                restored_.accounts++;
-                account.acked_at = acked_at;
-                // Renewed as it would have been, which may be now; and at the latest well
-                // before its monitors run out.  Set, not scheduled: its first placement here
-                // scheduled it already, and rebuild_schedule() replaces that entry.
-                auto last = system_time{std::chrono::seconds{acked_at}};
-                account.next_due = std::min(
-                        last + resubscribe_delay(), last + hive::MONITOR_LIFETIME - RESUME_MARGIN);
-            }
-        }
-        if (!r.in.empty())
-            throw std::runtime_error{"{} bytes left over"_format(r.in.size())};
-        return true;
-    };
-
-    try {
-        if (!walk(false)) {
+        state.saved_at = std::get<0>(*saved_at);
+        if (auto age = now - system_time{std::chrono::seconds{state.saved_at}};
+            age > RESUME_MAX_AGE || age < -1min) {
             log::info(
                     cat,
                     "Saved placement state is {} old, more than {}: every node starts a new "
                     "monitor session and is subscribed afresh",
-                    std::chrono::floor<std::chrono::seconds>(
-                            now - system_time{std::chrono::seconds{saved_at}}),
+                    std::chrono::floor<std::chrono::seconds>(age),
                     RESUME_MAX_AGE);
             return;
         }
+        for (auto [node, token] :
+             tx.query<Ed25519PK, MonitorToken>("SELECT snode, token FROM monitor_sessions"))
+            state.tokens.emplace_back(node, token);
+        for (auto [swarm, slot, node] :
+             tx.query<int64_t, int16_t, Ed25519PK>("SELECT swarm, slot, snode FROM swarm_slots")) {
+            if (slot < 0 || slot >= SWARM_SLOTS)
+                throw std::runtime_error{"invalid slot {}"_format(slot)};
+            state.slots.push_back({static_cast<uint64_t>(swarm), slot, node});
+        }
+        for (auto [account, acked, acked_at] : tx.stream<AccountID, int16_t, int64_t>(
+                     "SELECT account, acked, acked_at FROM placements"))
+            state.placements.push_back(
+                    {account, static_cast<uint16_t>(acked), static_cast<uint32_t>(acked_at)});
     } catch (const std::exception& e) {
-        log::info(
+        log::warning(
                 cat,
-                "Saved placement state in {} is unusable ({}): every node starts a new monitor "
-                "session and is subscribed afresh",
-                config.state_file,
+                "Saved placement state is unusable ({}): every node starts a new monitor session "
+                "and is subscribed afresh",
                 e.what());
         return;
     }
-    walk(true);
+
+    std::unordered_map<Ed25519PK, MonitorToken> tokens{state.tokens.begin(), state.tokens.end()};
+    // Each saved swarm's slots -> the slot of the same node now, if it is still in that swarm.
+    std::unordered_map<uint64_t, std::array<int, SWARM_SLOTS>> slot_now;
+    std::vector<uint64_t> saved_swarms;
+    for (const auto& [id, s, pk] : state.slots) {
+        auto [it, fresh] = slot_now.try_emplace(id);
+        if (fresh) {
+            it->second.fill(-1);
+            saved_swarms.push_back(id);
+        }
+        auto node = sns_.find(pk);
+        if (node == sns_.end() || node->second->swarm != id || node->second->slot < 0) {
+            restored_.slots_dropped++;
+            continue;
+        }
+        it->second[s] = node->second->slot;
+        node->second->resuming = true;
+        if (auto t = tokens.find(pk); t != tokens.end())
+            monitor_tokens_[pk] = t->second;
+        restored_.slots++;
+    }
+    for (const auto& [id, slots] : slot_now)
+        restored_.swarms += std::ranges::any_of(slots, [](int s) { return s >= 0; });
+    std::ranges::sort(saved_swarms);
+
+    for (const auto& [acct_id, acked, acked_at] : state.placements) {
+        auto it = subscribers_.find(SwarmPubkey{acct_id, std::nullopt, /*_skip_validation=*/true});
+        if (it == subscribers_.end())
+            continue;
+        const auto& account = it->first;
+        // The saved slots are those of the swarm the account was in then, which the swarm list
+        // saved with them gives; an account in another swarm now is placed there afresh.
+        if (account.next_due == SwarmPubkey::UNSCHEDULED ||
+            closest_swarm(account.swarm_space, saved_swarms) != account.swarm)
+            continue;
+        auto slots = slot_now.find(account.swarm);
+        if (slots == slot_now.end())
+            continue;
+        auto& swarm = swarms_.at(account.swarm);
+        bool any = false;
+        for (uint16_t bits = acked; bits; bits &= bits - 1)
+            if (auto s = slots->second[std::countr_zero(bits)]; s >= 0) {
+                auto bit = static_cast<uint16_t>(1u << s);
+                if ((account.sent | account.acked) & bit)
+                    continue;
+                auto claims = std::popcount<uint16_t>(account.sent | account.acked);
+                swarm.by_claims[claims]--;
+                swarm.by_claims[claims + 1]++;
+                account.acked |= bit;
+                account.restored |= bit;
+                swarm.slots[s]->claimed++;
+                any = true;
+            }
+        if (!any)
+            continue;
+        restored_.accounts++;
+        account.acked_at = acked_at;
+        // Renewed as it would have been, which may be now; and at the latest well before its
+        // monitors run out.  Set, not scheduled: its first placement here scheduled it already,
+        // and rebuild_schedule() replaces that entry.
+        auto last = system_time{std::chrono::seconds{acked_at}};
+        account.next_due = std::min(
+                last + resubscribe_delay(), last + hive::MONITOR_LIFETIME - RESUME_MARGIN);
+    }
     rebuild_schedule();
     // Only the restored nodes' sessions can be resumed: without the listing, nothing else could
     // be reconciled.
@@ -3516,14 +3458,13 @@ void HiveMind::restore_state() {
     for (const auto& [pk, node] : sns_)
         if (node->resuming && node->claimed == 0)
             node->resuming = false;
-    restored_.age = std::chrono::duration<double>(now - system_time{std::chrono::seconds{saved_at}})
-                            .count();
+    auto age = now - system_time{std::chrono::seconds{state.saved_at}};
+    restored_.age = std::chrono::duration<double>(age).count();
     log::info(
             cat,
             "Restored placement state saved {} ago: {} accounts on {} nodes in {} swarms; {} "
             "nodes dropped, having moved swarm or left the network",
-            std::chrono::floor<std::chrono::seconds>(
-                    now - system_time{std::chrono::seconds{saved_at}}),
+            std::chrono::floor<std::chrono::seconds>(age),
             restored_.accounts,
             restored_.slots,
             restored_.swarms,

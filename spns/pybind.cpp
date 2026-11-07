@@ -156,11 +156,6 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     &Config::resume_replay,
                     "most notifications per account a node replays when our monitor session with "
                     "it is resumed: the newest, the rest lost")
-            .def_readwrite(
-                    "state_file",
-                    &Config::state_file,
-                    "file the hivemind saves its placements and monitor session tokens in, to "
-                    "resume its sessions after a restart; empty for none")
             .def_property(
                     "renewal_interval",
                     [](Config& self) -> std::optional<int64_t> {

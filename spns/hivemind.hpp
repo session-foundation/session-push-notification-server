@@ -101,7 +101,7 @@ inline constexpr int NOTIFIER_PROTOCOL_VERSION = 1;
 // last renewed when it was last acknowledged, would expire.
 inline constexpr auto RESUME_MARGIN = 5min;
 
-// How often the hivemind saves its placements and monitor session tokens (see Config::state_file).
+// How often the hivemind saves its placements and monitor session tokens (see save_state()).
 inline constexpr auto DUMP_INTERVAL = 5min;
 
 // How old saved state may be for a restart to resume from it.  A monitor lasts 65 minutes from its
@@ -336,20 +336,23 @@ class HiveMind {
     // placements (see save_state()), as resuming a session without its listing relies on both.
     std::unordered_map<Ed25519PK, MonitorToken> monitor_tokens_;
 
-    // Writes the swarms' slot tables, every acknowledged placement with when its account was last
-    // acknowledged, and the monitor session tokens to Config::state_file, replacing it whole.  The
-    // snapshot is taken here; the file is written on a thread of its own, unless `wait`.
+    // Saves the swarms' slot tables, every acknowledged placement with when its account was last
+    // acknowledged, and the monitor session tokens to the database (the placement_state,
+    // swarm_slots, placements and monitor_sessions tables), replacing the last save in one
+    // transaction.  The snapshot is taken here; it is written on a thread of its own, unless
+    // `wait`.
     void save_state(bool wait);
     std::thread state_writer_;
     std::atomic<bool> state_writing_ = false;
-    // What the last save held, and how long it took: its snapshot here, and its write.
+    // What the last save held (acknowledged accounts, nodes in the slot tables, and monitor
+    // session tokens), and how long it took: its snapshot here, and its write.
     struct {
         std::optional<steady_time> when;
-        size_t bytes = 0, accounts = 0;
+        size_t accounts = 0, nodes = 0, sessions = 0;
         double snapshot_ms = 0;
         std::atomic<double> write_ms = 0;
     } state_saved_;
-    // Restores what Config::state_file holds, if it was saved within RESUME_MAX_AGE: the
+    // Restores what save_state() saved, if it was saved within RESUME_MAX_AGE: the
     // placements on nodes still in the same swarm, the accounts' renewals, and those nodes'
     // tokens, for their sessions to be resumed without a listing.  Run once, with the first
     // service node list.

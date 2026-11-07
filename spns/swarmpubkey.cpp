@@ -44,32 +44,32 @@ SwarmPubkey::SwarmPubkey(AccountID account_id, std::optional<Ed25519PK> ed, bool
     swarm = INVALID_SWARM_ID;
 }
 
+uint64_t closest_swarm(uint64_t swarm_space, const std::vector<uint64_t>& swarm_ids) {
+    if (swarm_ids.empty())
+        return INVALID_SWARM_ID;
+    if (swarm_ids.size() == 1)
+        return swarm_ids.front();
+
+    // Adapted from oxen-storage-server:
+
+    // Find the right boundary, i.e. first swarm with swarm_id >= res
+    auto right_it = std::lower_bound(swarm_ids.begin(), swarm_ids.end(), swarm_space);
+    if (right_it == swarm_ids.end())
+        // res is > the top swarm_id, meaning it is big and in the wrapping space between
+        // last and first elements.
+        right_it = swarm_ids.begin();
+
+    // Our "left" is the one just before that (with wraparound, if right is the first swarm)
+    auto left_it = std::prev(right_it == swarm_ids.begin() ? swarm_ids.end() : right_it);
+
+    uint64_t dright = *right_it - swarm_space;
+    uint64_t dleft = swarm_space - *left_it;
+
+    return dright < dleft ? *right_it : *left_it;
+}
+
 bool SwarmPubkey::update_swarm(const std::vector<uint64_t>& swarm_ids) const {
-
-    uint64_t closest;
-    if (swarm_ids.size() == 0)
-        closest = INVALID_SWARM_ID;
-    else if (swarm_ids.size() == 1)
-        closest = swarm_ids.front();
-    else {
-        // Adapted from oxen-storage-server:
-
-        // Find the right boundary, i.e. first swarm with swarm_id >= res
-        auto right_it = std::lower_bound(swarm_ids.begin(), swarm_ids.end(), swarm_space);
-        if (right_it == swarm_ids.end())
-            // res is > the top swarm_id, meaning it is big and in the wrapping space between
-            // last and first elements.
-            right_it = swarm_ids.begin();
-
-        // Our "left" is the one just before that (with wraparound, if right is the first swarm)
-        auto left_it = std::prev(right_it == swarm_ids.begin() ? swarm_ids.end() : right_it);
-
-        uint64_t dright = *right_it - swarm_space;
-        uint64_t dleft = swarm_space - *left_it;
-
-        closest = dright < dleft ? *right_it : *left_it;
-    }
-
+    auto closest = closest_swarm(swarm_space, swarm_ids);
     if (closest != swarm) {
         swarm = closest;
         return true;

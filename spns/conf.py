@@ -109,7 +109,6 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
                 lambda x: re.fullmatch(r"\s*(-1|\d+)\s*", x) and int(x) != 0,
                 int,
             ),
-            "state_file": ("state_file",),
             "resume_replay": (
                 "resume_replay",
                 lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) > 0,
@@ -164,10 +163,6 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
     }
 
     config = spns_hivemind.Config()
-    # Next to the config file unless configured otherwise; configuring it empty saves nothing.
-    config.state_file = os.path.join(
-        os.path.dirname(os.path.abspath(conf_ini)), "hivemind-state.bin"
-    )
 
     def parse_option(fields, s, opt):
         if opt not in fields:

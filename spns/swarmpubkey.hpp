@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "bytes.hpp"
 
@@ -13,6 +14,10 @@ inline constexpr uint64_t INVALID_SWARM_ID = std::numeric_limits<uint64_t>::max(
 // The most nodes a swarm can hold placements for: one bit each in an account's masks.  Storage
 // server swarms are far smaller.
 inline constexpr int SWARM_SLOTS = 16;
+
+// The swarm of `swarm_ids` (sorted) that stores an account at `swarm_space`, or INVALID_SWARM_ID
+// if there are none.
+uint64_t closest_swarm(uint64_t swarm_space, const std::vector<uint64_t>& swarm_ids);
 
 struct SwarmPubkey {
     AccountID id;

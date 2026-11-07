@@ -39,4 +39,37 @@ CREATE TABLE service_stats (
     CHECK((val_str IS NULL AND val_int IS NOT NULL) OR (val_str IS NOT NULL AND val_int IS NULL))
 );
 
+-- The hivemind's placements of accounts on storage nodes, saved every 5 minutes and when it stops,
+-- each save replacing the last whole: a hivemind started within 10 minutes of the save resumes its
+-- monitor sessions with the nodes without having them list every monitor.  When the save was made
+-- (unix seconds), in a single row:
+CREATE TABLE placement_state (
+    saved_at BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX placement_state_single_row ON placement_state ((true));
+
+-- The token each storage node (by Ed25519 pubkey) last issued for resuming our monitor session:
+CREATE TABLE monitor_sessions (
+    snode BYTEA PRIMARY KEY,
+    token BYTEA NOT NULL
+);
+
+-- Each swarm's nodes, in the slots whose bits they own in the placements' acked masks.  The swarm
+-- id is unsigned 64-bit, stored by its bit pattern.
+CREATE TABLE swarm_slots (
+    swarm BIGINT NOT NULL,
+    slot SMALLINT NOT NULL,
+    snode BYTEA NOT NULL,
+
+    PRIMARY KEY(swarm, slot)
+);
+
+-- Every account acknowledged on some node of its swarm: on which slots (a 16-bit mask, stored by
+-- its bit pattern), and when it was last acknowledged (unix seconds).
+CREATE TABLE placements (
+    account BYTEA PRIMARY KEY,
+    acked SMALLINT NOT NULL,
+    acked_at BIGINT NOT NULL
+);
+
 -- vim:ft=sql

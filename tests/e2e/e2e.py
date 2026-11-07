@@ -108,15 +108,12 @@ def wait_db(timeout=60):
 
 def fresh_db():
     """Empties DB, which must exist already, and applies the schema."""
-    execute("DROP TABLE IF EXISTS sub_namespaces, subscriptions, service_stats")
+    execute(
+        "DROP TABLE IF EXISTS sub_namespaces, subscriptions, service_stats, placement_state, "
+        "monitor_sessions, swarm_slots, placements"
+    )
     with open(f"{SRC}/spns/schema.pgsql") as f:
         execute(f.read())
-    # The hivemind's saved placements (and monitor session tokens) belong to the database emptied.
-    for name in ("hivemind-state.bin", "hivemind-state.bin.tmp"):
-        try:
-            os.remove(f"{WORK}/{name}")
-        except FileNotFoundError:
-            pass
 
 
 # Account #i is 03 || SHA256(big-endian i), as in fake_network.
@@ -1217,12 +1214,7 @@ def scenario_restart(build_dir):
             # Saved state too old to trust: new sessions everywhere, and everything subscribed.
             steps = s.restart_hivemind("hivemind4")
             next(steps)
-            path = f"{WORK}/hivemind-state.bin"
-            with open(path, "r+b") as f:
-                f.seek(5)
-                (saved,) = struct.unpack("<q", f.read(8))
-                f.seek(5)
-                f.write(struct.pack("<q", saved - 11 * 60))
+            execute(f"UPDATE placement_state SET saved_at = saved_at - {11 * 60}")
             next(steps, None)
             all_placed()
             n = s.net_counts()
