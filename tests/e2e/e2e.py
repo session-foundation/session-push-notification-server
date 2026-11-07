@@ -1167,6 +1167,47 @@ def scenario_reshuffle(build_dir):
     check_log(s.hivemind)
 
 
+def restore_settled(hm, placements=None, timeout=15):
+    """The counts of the hivemind's line saying how its restored placements settled, once it has
+    said it: kept, and dropped, in all and for each reason, which must add up to the dropped and
+    then, with those kept, to the placements restored (`placements`, if given)."""
+    reasons = (
+        r"(\d+) dropped: (\d+) on nodes without monitor sessions, (\d+) on nodes whose sessions "
+        r"did not resume, (\d+) for monitors since ended, (\d+) on nodes that left their swarm"
+    )
+    pattern = (
+        rf"(?:Restored placements settled: (\d+) of (\d+) kept, on nodes whose monitor sessions "
+        rf"resumed; |None of the (\d+) restored placements was kept, ){reasons}"
+    )
+    deadline = time.time() + timeout * TIME_SCALE
+    while not (m := re.search(pattern, hm.log())):
+        check(time.time() < deadline, "no line saying how the restored placements settled")
+        time.sleep(0.25)
+    print(f"    {m.group(0)}")
+    kept, of, none_of, dropped, no_session, failed, ended, left = (
+        int(x) if x else None for x in m.groups()
+    )
+    counts = dict(
+        kept=kept or 0,
+        placements=of if of is not None else none_of,
+        dropped=dropped,
+        no_session=no_session,
+        resume_failed=failed,
+        ended=ended,
+        left=left,
+    )
+    check(
+        no_session + failed + ended + left == dropped,
+        f"the reasons do not add up to those dropped: {counts}",
+    )
+    check(
+        counts["placements"] == (placements or counts["placements"])
+        and counts["kept"] + dropped == counts["placements"],
+        f"kept and dropped do not add up to the placements restored: {counts}",
+    )
+    return counts
+
+
 def scenario_restart(build_dir):
     """A hivemind restart.  With monitor sessions, the restarted hivemind restores its saved
     placements, the nodes resume their sessions without listing their monitors and replay what
@@ -1227,24 +1268,17 @@ def scenario_restart(build_dir):
             f"notifier; {n['entries']} subscriptions sent after the restart, {n['resumed']} "
             f"monitor sessions resumed ({n['resumed_unlisted']} without their listing)"
         )
-        # Said once the last restored node has settled: each node held every account.
-        settled = s.wait_for(
-            lambda: re.search(
-                r"(?:None of the|Restored placements settled:) [^\n]*", s.hivemind.log()
-            ),
-            15,
-            bool,
-        ).group(0)
-        print(f"    {settled}")
+        # Said once the last restored node has settled: each node held every account, and with
+        # monitor sessions kept them all, without dropped them all for want of sessions.
         placements = s.nodes * accounts
+        settled = restore_settled(s.hivemind, placements)
         if MODE == "monitor":
-            want = f"Restored placements settled: {placements} of {placements} kept"
+            check(settled["kept"] == placements, f"restored placements not all kept: {settled}")
         else:
-            want = (
-                f"None of the {placements} restored placements was kept: {placements} on nodes "
-                "without monitor sessions"
+            check(
+                settled["no_session"] == placements,
+                f"restored placements not all dropped for want of sessions: {settled}",
             )
-        check(settled.startswith(want), f"expected '{want}...'")
         if MODE == "monitor":
             check(
                 c["pushes"] == gap and c["duplicates"] == 0,
@@ -1411,6 +1445,18 @@ def scenario_restart(build_dir):
             s.network.cmd("swarms 2")
             next(steps, None)
             all_placed()
+            # The moved node left the swarm it was saved in, so its placements were not restored
+            # (its slot dropped), nor were those of the accounts that moved swarm with it: the
+            # nodes that stayed resume, keeping every placement restored.
+            check(
+                re.search(r"Restored placement state .* 1 nodes dropped", s.hivemind.log()),
+                "the moved node's slot was not dropped at the restore",
+            )
+            settled = restore_settled(s.hivemind)
+            check(
+                settled["kept"] == settled["placements"] > 0,
+                f"the nodes that stayed did not keep every restored placement: {settled}",
+            )
             n = s.net_counts()
             per_node = json.loads(s.network.cmd("subs"))
             print(

@@ -3861,32 +3861,33 @@ void HiveMind::settle_restored(hive::SNode& node, Settled how) {
 
     if (--restored_.pending_nodes > 0)
         return;
-    auto dropped = restored_.no_session + restored_.resume_failed + restored_.left;
+    // Each dropped placement is counted under the one reason it was dropped for.
+    auto dropped =
+            restored_.no_session + restored_.resume_failed + restored_.ended + restored_.left;
+    auto reasons =
+            "{} dropped: {} on nodes without monitor sessions, {} on nodes whose sessions "
+            "did not resume, {} for monitors since ended, {} on nodes that left their "
+            "swarm"_format(
+                    dropped,
+                    restored_.no_session,
+                    restored_.resume_failed,
+                    restored_.ended,
+                    restored_.left);
     if (restored_.kept == 0)
         log::info(
                 cat,
-                "None of the {} restored placements was kept: {} on nodes without monitor "
-                "sessions, {} on nodes whose sessions did not resume, {} on nodes that left their "
-                "swarm, {} for monitors since ended; every restored account is placed afresh",
+                "None of the {} restored placements was kept, {}; every restored account is "
+                "placed afresh",
                 restored_.placements,
-                restored_.no_session,
-                restored_.resume_failed,
-                restored_.left,
-                restored_.ended);
+                reasons);
     else
         log::info(
                 cat,
                 "Restored placements settled: {} of {} kept, on nodes whose monitor sessions "
-                "resumed; {} dropped for monitors since ended, {} on nodes without monitor "
-                "sessions, {} on nodes whose sessions did not resume, {} on nodes that left their "
-                "swarm",
+                "resumed; {}",
                 restored_.kept,
                 restored_.placements,
-                restored_.ended + dropped,
-                restored_.ended,
-                restored_.no_session,
-                restored_.resume_failed,
-                restored_.left);
+                reasons);
 }
 
 void HiveMind::drop_restored(const SwarmPubkey& account, int slot) {
