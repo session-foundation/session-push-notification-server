@@ -413,8 +413,9 @@ class HiveMind {
     // Accounts on none are classed by why, the first that applies: no subscription with a signature
     // within its window, or none at all (unsendable, and not counted as on none); every entry
     // refused for good; waiting out a node's backoff after a failure; no connected node with a slot
-    // in its swarm; sent to a node and not yet acknowledged; and anything else.  With `detail`,
-    // up to 20 of them are described, one line each, the rarer classes first.
+    // in its swarm; sent to nodes, none of which has acknowledged it (a first placement, or one
+    // after a failure, as a renewal keeps the acknowledgements it renews); and anything else.  With
+    // `detail`, up to 20 of them are described, one line each, the rarer classes first.
     //
     // What is reported as covered is acknowledged on at least the swarm's target number of nodes or
     // 4, whichever is fewer (covered_threshold()): beyond 4 nodes an account's coverage makes no
@@ -424,7 +425,7 @@ class HiveMind {
     // is lagging.
     struct Coverage {
         size_t accounts = 0, covered = 0, under = 0, under_down_only = 0, at_zero = 0;
-        size_t unsendable = 0, rejected = 0, retrying = 0, no_node = 0, claimed = 0, other = 0;
+        size_t unsendable = 0, rejected = 0, retrying = 0, no_node = 0, sent_only = 0, other = 0;
         // Accounts in the index with nothing scheduled (lapsed), which are not counted at all.
         size_t lapsed = 0;
         std::vector<std::string> described;
@@ -462,14 +463,21 @@ class HiveMind {
     // Releases every claim on the account by a node of swarm `swarm` (its own, or the one it is
     // leaving).
     void release_all(const SwarmPubkey& account, uint64_t swarm);
-    // Places `account` on its swarm's connected nodes, their monitor sessions settled, until it is
-    // claimed on its target number: the lightest of those not claiming it, ties going first to a
-    // node in `prev_acked` (its acked mask before a renewal cleared it, so that a balanced swarm
-    // keeps its placements), then at random.  Each is queued with the dispatcher to send it.
-    // `by_scan` counts the placements as a node's scan's.
-    void place(const SwarmPubkey& account, uint16_t prev_acked = 0, bool by_scan = false);
-    // Clears the account's placements and places it afresh.
-    void replace(const SwarmPubkey& account);
+    // The bits of up to `count` of `swarm`'s connected nodes, their monitor sessions settled and
+    // not in `exclude`, for `account`: the lightest first, not counting the account's own claim on
+    // a node, ties going first to the nodes claiming it (so that a balanced swarm keeps its
+    // placements), then at random.
+    uint16_t choose(
+            const SwarmPubkey& account, const Swarm& swarm, uint16_t exclude, int count) const;
+    // Queues `account`, just claimed for `node`, for the node to send, and clears its Unplaced.
+    void send_placed(const SwarmPubkey& account, hive::SNode& node);
+    // Places `account` on more of its swarm's nodes (see choose()) until it is claimed on its
+    // target number.  `by_scan` counts the placements as a node's scan's.
+    void place(const SwarmPubkey& account, bool by_scan = false);
+    // Sends `account` to its target number of its swarm's nodes afresh (see choose()), for its
+    // renewal or a change to its subscriptions.  A node chosen that holds it keeps its claim,
+    // acknowledged or not, sent again; one not chosen gives it up.
+    void renew(const SwarmPubkey& account);
     // Sets the node's scan going again, and queues it with the dispatcher.
     void wake(hive::SNode& node);
     // Wakes every node of the swarm but `except`: an account in it has fallen below its target, a

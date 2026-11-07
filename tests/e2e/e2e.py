@@ -477,6 +477,11 @@ class Setup:
 
         return json.loads(self.client_proc().cmd("stats"))
 
+    def check_covered(self, when):
+        """Checks that the hivemind counts every account covered."""
+        cov = self.stats()["coverage"]
+        check(cov["covered"] == cov["accounts"], f"coverage dipped {when}: {cov}")
+
     def wait_for(self, what, timeout, done, interval=0.5):
         """Polls `what()` until `done` holds for it, failing after `timeout` (scaled)."""
         deadline = time.time() + timeout * TIME_SCALE
@@ -1009,7 +1014,7 @@ def scenario_restart(build_dir):
     # first, all acknowledged by `filled`, at most 1.1 intervals on, and are made by the next of
     # its checks every `tick`; while it places nothing afresh before it starts, `down` after
     # `filled`, and renews that no sooner than 0.9 intervals on.
-    renewal, down, tick = 60, 35, 10
+    renewal, down, tick = 60, 45, 10
 
     try:
         s.wait_subscribed(0, accounts, 60)
@@ -1075,6 +1080,12 @@ def scenario_restart(build_dir):
 
         restored_due = filled + renewal * 11 / 10 + tick
         fresh_due = filled + down + renewal * 9 / 10
+
+        # A renewal keeps the monitors it renews acknowledged while it is answered.
+        def renewing():
+            s.check_covered("while renewing")
+            return s.net_counts()
+
         if MODE == "monitor":
             # Every placement was restored and kept, each account scheduled once, to be renewed
             # when the first hivemind would have.
@@ -1082,8 +1093,8 @@ def scenario_restart(build_dir):
             check(sched == accounts, f"{sched} renewals scheduled for {accounts} accounts")
             s.network.cmd("mark")
             s.wait_for(
-                s.net_counts,
-                restored_due + 2 - time.time(),
+                renewing,
+                restored_due + 5 - time.time(),
                 lambda n: n["entries"] >= 3 * subscriptions,
             )
             renewed = time.time() - filled
@@ -1097,7 +1108,7 @@ def scenario_restart(build_dir):
             # Every restored placement was dropped, and its account placed afresh: renewed a
             # renewal interval from then, and not when the first hivemind would have.
             s.network.cmd("mark")
-            time.sleep(max(0, restored_due + 2 - time.time()))
+            time.sleep(max(0, restored_due + 5 - time.time()))
             n = s.net_counts()
             print(
                 f"    {n['entries']} subscriptions sent between the fill and "
@@ -1108,7 +1119,7 @@ def scenario_restart(build_dir):
                 f"placed again when the restored placements would have been renewed: {n}",
             )
             s.wait_for(
-                s.net_counts,
+                renewing,
                 fresh_due + renewal / 5 + tick + 10 - time.time(),
                 lambda n: n["entries"] >= 3 * subscriptions,
             )
@@ -1529,6 +1540,20 @@ def scenario_rebalance(build_dir):
             f"{st['placements']['moved'] - moved} monitors moved by renewals"
         )
         check(st["placements"]["moved"] > moved, "no renewal moved a monitor to node 5")
+
+        # A renewal keeps the monitors it renews acknowledged while it is answered, so every
+        # account stays covered through each round of them.
+        samples, start = 0, time.time()
+        placed = st["placements"]["placed"]
+        while time.time() < start + 3 * interval:
+            s.check_covered("during renewals")
+            samples += 1
+            time.sleep(0.2)
+        st = s.stats()
+        print(
+            f"    {st['placements']['placed'] - placed} placements renewed over "
+            f"{3 * interval}s, every account covered in each of {samples} samples"
+        )
     finally:
         rc = s.stop()
     check(rc == 0, f"hivemind exit code {rc}")

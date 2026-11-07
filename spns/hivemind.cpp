@@ -1484,7 +1484,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                  {{"rejected", c.rejected},
                   {"retrying", c.retrying},
                   {"no_node", c.no_node},
-                  {"unacknowledged", c.claimed},
+                  {"sent_never_acked", c.sent_only},
                   {"other", c.other}}},
                 {"unsendable", c.unsendable},
                 {"lapsed", c.lapsed},
@@ -1627,11 +1627,12 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                          : "{}s"_format(t);
     };
     auto restore_settled = [&] {
-        auto dropped = "{} no session, {} resume failed, {} node left swarm, {} monitor ended"_format(
-                num(s, "restored", "no_session"),
-                num(s, "restored", "resume_failed"),
-                num(s, "restored", "left"),
-                num(s, "restored", "ended"));
+        auto dropped =
+                "{} no session, {} resume failed, {} node left swarm, {} monitor ended"_format(
+                        num(s, "restored", "no_session"),
+                        num(s, "restored", "resume_failed"),
+                        num(s, "restored", "left"),
+                        num(s, "restored", "ended"));
         if (num(s, "restored", "kept") == 0 && num(s, "restored", "pending_nodes") == 0)
             return "none of its {} placements kept ({})"_format(
                     num(s, "restored", "placements"), dropped);
@@ -1721,9 +1722,9 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    delta("accounts_moved"));
 
     out += "\n  Coverage: {}/{} covered (on {}+ nodes; redundancy {}), {} under-covered ({} only "
-           "on down nodes), {} on none ({} rejected, {} retrying, {} no node, {} unacknowledged, "
-           "{} other), {} unsendable, {} lapsed; node load min/avg/max {}/{:.0f}/{}; placements: "
-           "{} direct, {} by scans, {} moved"_format(
+           "on down nodes), {} on none ({} rejected, {} retrying, {} no node, {} sent but never "
+           "acknowledged, {} other), {} unsendable, {} lapsed; node load min/avg/max "
+           "{}/{:.0f}/{}; placements: {} direct, {} by scans, {} moved"_format(
                    num(s, "coverage", "covered"),
                    num(s, "coverage", "accounts"),
                    num(s, "coverage", "covered_threshold"),
@@ -1734,7 +1735,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    num(s, "coverage", "on_none", "rejected"),
                    num(s, "coverage", "on_none", "retrying"),
                    num(s, "coverage", "on_none", "no_node"),
-                   num(s, "coverage", "on_none", "unacknowledged"),
+                   num(s, "coverage", "on_none", "sent_never_acked"),
                    num(s, "coverage", "on_none", "other"),
                    num(s, "coverage", "unsendable"),
                    num(s, "coverage", "lapsed"),
@@ -2640,7 +2641,46 @@ void HiveMind::release_all(const SwarmPubkey& account, uint64_t swarm) {
         release(account, it->second, std::countr_zero(bits));
 }
 
-void HiveMind::place(const SwarmPubkey& account, uint16_t prev_acked, bool by_scan) {
+uint16_t HiveMind::choose(
+        const SwarmPubkey& account, const Swarm& swarm, uint16_t exclude, int count) const {
+    uint16_t held = account.sent | account.acked;
+    struct Candidate {
+        int slot;
+        size_t load;
+        bool held;
+        uint64_t draw;
+    };
+    std::array<Candidate, SWARM_SLOTS> candidates;
+    int n = 0;
+    for (int s = 0; s < SWARM_SLOTS; s++)
+        if (auto* node = swarm.slots[s]; node && node->settled() && !(exclude >> s & 1)) {
+            bool h = held >> s & 1;
+            candidates[n++] = {s, node->claimed - h, h, rng()};
+        }
+    int chosen = std::clamp(count, 0, n);
+    std::partial_sort(
+            candidates.begin(),
+            candidates.begin() + chosen,
+            candidates.begin() + n,
+            [](const Candidate& a, const Candidate& b) {
+                return std::tuple{a.load, !a.held, a.draw} < std::tuple{b.load, !b.held, b.draw};
+            });
+    uint16_t bits = 0;
+    for (int i = 0; i < chosen; i++)
+        bits |= static_cast<uint16_t>(1u << candidates[i].slot);
+    return bits;
+}
+
+void HiveMind::send_placed(const SwarmPubkey& account, hive::SNode& node) {
+    node.due.push_back(&account);
+    send_pending(node);
+    if (account.unplaced != SwarmPubkey::Unplaced::none) {
+        account.unplaced = SwarmPubkey::Unplaced::none;
+        unplaced_detail_.erase(&account);
+    }
+}
+
+void HiveMind::place(const SwarmPubkey& account, bool by_scan) {
     auto it = swarms_.find(account.swarm);
     if (it == swarms_.end())
         return;
@@ -2649,51 +2689,41 @@ void HiveMind::place(const SwarmPubkey& account, uint16_t prev_acked, bool by_sc
     int short_by = target(swarm) - std::popcount(claimed_by);
     if (short_by <= 0)
         return;
-
-    struct Candidate {
-        hive::SNode* node;
-        bool held;
-        uint64_t draw;
-    };
-    std::array<Candidate, SWARM_SLOTS> candidates;
-    int n = 0;
-    for (int s = 0; s < SWARM_SLOTS; s++)
-        if (auto* node = swarm.slots[s]; node && node->settled() && !(claimed_by >> s & 1))
-            candidates[n++] = {node, bool(prev_acked >> s & 1), rng()};
-    int chosen = std::min(short_by, n);
-    std::partial_sort(
-            candidates.begin(),
-            candidates.begin() + chosen,
-            candidates.begin() + n,
-            [](const Candidate& a, const Candidate& b) {
-                return std::tuple{a.node->claimed, !a.held, a.draw} <
-                       std::tuple{b.node->claimed, !b.held, b.draw};
-            });
-
-    uint16_t chosen_bits = 0;
-    int fresh = 0;
-    for (int i = 0; i < chosen; i++) {
-        auto& node = *candidates[i].node;
+    auto chosen = choose(account, swarm, claimed_by, short_by);
+    for (uint16_t bits = chosen; bits; bits &= bits - 1) {
+        auto& node = *swarm.slots[std::countr_zero(bits)];
         claim(account, swarm, node);
-        node.due.push_back(&account);
-        chosen_bits |= static_cast<uint16_t>(1u << node.slot);
-        fresh += !candidates[i].held;
-        send_pending(node);
+        send_placed(account, node);
     }
-    (by_scan ? scan_placements_ : placements_) += chosen;
-    if (chosen > 0 && account.unplaced != SwarmPubkey::Unplaced::none) {
-        account.unplaced = SwarmPubkey::Unplaced::none;
-        unplaced_detail_.erase(&account);
-    }
-    // A node that did not hold the account before takes the place of one that did, while any of
-    // those is left out; beyond them it is an addition, not a move.
-    moved_placements_ += std::min(fresh, std::popcount<uint16_t>(prev_acked & ~chosen_bits));
+    (by_scan ? scan_placements_ : placements_) += std::popcount(chosen);
 }
 
-void HiveMind::replace(const SwarmPubkey& account) {
-    auto prev_acked = account.acked;
-    release_all(account, account.swarm);
-    place(account, prev_acked);
+void HiveMind::renew(const SwarmPubkey& account) {
+    auto it = swarms_.find(account.swarm);
+    if (it == swarms_.end())
+        return;
+    auto& swarm = it->second;
+    uint16_t held = account.sent | account.acked, prev_acked = account.acked;
+    auto chosen = choose(account, swarm, 0, target(swarm));
+    // The nodes left out, for the balance or for being down, give the account up.  A chosen node
+    // that holds it keeps its acknowledged monitor, which outlives the renewal by several minutes:
+    // it is short only if the renewal fails, which releases it (see unclaim()).
+    for (uint16_t bits = held & ~chosen; bits; bits &= bits - 1)
+        release(account, swarm, std::countr_zero(bits));
+    for (uint16_t bits = chosen; bits; bits &= bits - 1) {
+        auto& node = *swarm.slots[std::countr_zero(bits)];
+        if (held >> node.slot & 1)
+            account.sent |= static_cast<uint16_t>(1u << node.slot);
+        else
+            claim(account, swarm, node);
+        send_placed(account, node);
+    }
+    placements_ += std::popcount(chosen);
+    // A node that did not hold the account before takes the place of one that did, while any of
+    // those is left out; beyond them it is an addition, not a move.
+    moved_placements_ += std::min(
+            std::popcount<uint16_t>(chosen & ~prev_acked),
+            std::popcount<uint16_t>(prev_acked & ~chosen));
 }
 
 void HiveMind::place_again(const std::vector<const SwarmPubkey*>& accounts) {
@@ -2910,7 +2940,7 @@ const SwarmPubkey* HiveMind::next_claim(hive::SNode& node) {
 
         if (std::popcount<uint16_t>(account->sent | account->acked) == scan.pass &&
             account->next_due != SwarmPubkey::UNSCHEDULED)
-            place(*account, 0, /*by_scan=*/true);
+            place(*account, /*by_scan=*/true);
     }
     scan.done = true;
     return nullptr;
@@ -3000,7 +3030,7 @@ void HiveMind::check_subs() {
             continue;
         }
 
-        replace(*account);
+        renew(*account);
         schedule(*account, now + resubscribe_delay());
         due++;
     }
@@ -3081,7 +3111,7 @@ HiveMind::Coverage HiveMind::coverage(bool detail, bool recount) const {
         return "{:.1f}h"_format(std::chrono::duration<double, std::ratio<3600>>(now - t).count());
     };
     // The accounts on none described, by class, in the order they are listed.
-    enum { other, rejected, retrying, no_node, claimed, unsendable, classes };
+    enum { other, rejected, retrying, no_node, sent_only, unsendable, classes };
     constexpr size_t LISTED = 20;
     std::array<std::vector<std::string>, classes> described;
     auto describe = [&](int cls, const SwarmPubkey& account, std::string why) {
@@ -3156,11 +3186,11 @@ HiveMind::Coverage HiveMind::coverage(bool detail, bool recount) const {
                     *account,
                     "no connected node with a slot in swarm {:x} ({} nodes)"_format(id, si.nodes));
         } else if (account->sent) {
-            c.claimed++;
+            c.sent_only++;
             describe(
-                    claimed,
+                    sent_only,
                     *account,
-                    "sent to {} nodes, not yet acknowledged"_format(std::popcount(account->sent)));
+                    "sent to {} nodes, never acknowledged"_format(std::popcount(account->sent)));
         } else {
             c.other++;
             if (detail && described[other].size() < LISTED) {
@@ -4037,7 +4067,7 @@ RETURNING id, xmax = 0
         // scheduled renewal.
         if ((new_sub || changed || account.next_due == SwarmPubkey::UNSCHEDULED) &&
             account.swarm != INVALID_SWARM_ID) {
-            replace(account);
+            renew(account);
             schedule(account, system_clock::now() + resubscribe_delay());
         }
     });
