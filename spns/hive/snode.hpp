@@ -105,6 +105,9 @@ class SNode : public std::enable_shared_from_this<SNode> {
 
     // Touched only from the QUIC loop (jq_), which owns the connection:
     std::shared_ptr<quic::Connection> conn_;
+    // The connection attempt holding one of the hivemind's connect slots (see
+    // HiveMind::allow_connect), until it is established, fails, or is dropped by disconnect().
+    const quic::Connection* connecting_ = nullptr;
     quic::RemoteAddress addr_;
     std::shared_ptr<quic::BTRequestStream> stream_;
     std::optional<steady_time> cooldown_until_;
@@ -276,6 +279,9 @@ class SNode : public std::enable_shared_from_this<SNode> {
     void on_connected(quic::Connection& c);
 
     void on_disconnected(quic::Connection& c, uint64_t errcode);
+
+    // Gives back the connect slot `c` holds, if it holds one.
+    void finish_connecting(const quic::Connection* c);
 
     void on_notify(quic::message msg);
 

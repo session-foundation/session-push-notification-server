@@ -472,10 +472,12 @@ class Setup:
         return json.loads(self.network.cmd(f"coverage {first} {count}"))
 
     def stats(self):
-        """The hivemind's get_stats."""
+        """The hivemind's get_stats, checking the counters that can never be negative."""
         import json
 
-        return json.loads(self.client_proc().cmd("stats"))
+        st = json.loads(self.client_proc().cmd("stats"))
+        check(st["pending_connections"] >= 0, f"{st['pending_connections']} connections pending")
+        return st
 
     def check_covered(self, when):
         """Checks that the hivemind counts every account covered."""
@@ -545,6 +547,8 @@ def check_log(hm):
         "disagrees with a recount",
     ):
         check(bad not in log, f"hivemind log has '{bad}'")
+    negative = re.search(r"-\d+ connecting", log)
+    check(not negative, f"hivemind log has '{negative and negative.group(0)}'")
 
 
 # --- scenarios --------------------------------------------------------------------------------

@@ -63,6 +63,7 @@ void SNode::connect() {
             [this](quic::Connection& c) { on_connected(c); },
             [this](quic::Connection& c, uint64_t ec) { on_disconnected(c, ec); },
             quic::opt::keep_alive{10s});
+    connecting_ = conn_.get();
     stream_ = conn_->open_stream<quic::BTRequestStream>();
     stream_->register_handler("notify", [this](quic::message msg) { on_notify(std::move(msg)); });
     stream_->register_handler("monitor_ended", [this](quic::message msg) {
@@ -106,6 +107,8 @@ void SNode::disconnect() {
     connected_ = false;
     if (conn_) {
         log::debug(cat, "disconnecting from {}", addr_);
+        // Its callbacks, which come later, are for a connection no longer ours, and ignored.
+        finish_connecting(conn_.get());
         stream_.reset();
         // Cleared first, so that a close callback fired from inside close_connection() does not
         // count the loss a second time.
@@ -115,32 +118,35 @@ void SNode::disconnect() {
     }
 }
 
+void SNode::finish_connecting(const quic::Connection* c) {
+    if (c && c == connecting_) {
+        connecting_ = nullptr;
+        hivemind_.finished_connect();
+    }
+}
+
 void SNode::on_connected(quic::Connection& c) {
     assert(jq_.inside());
-    bool no_conn = false;
+    // One we have dropped since (see disconnect()).
+    if (&c != conn_.get())
+        return;
     log::debug(cat, "Connection established to {}", addr_);
     cooldown_fails_ = 0;
     cooldown_until_.reset();
-
-    if (!conn_)
-        // Our conn got replaced from under us, which probably means we are disconnecting, so do
-        // nothing.
-        no_conn = true;
-    else
-        connected_ = true;
-
-    hivemind_.finished_connect();
-
-    if (!no_conn) {
-        hivemind_.count_connection();
-        sub_jq_.call_soon([this, self = shared_from_this(), gen = conn_gen_] {
-            hivemind_.on_node_connected(*this, gen);
-        });
-    }
+    connected_ = true;
+    finish_connecting(&c);
+    hivemind_.count_connection();
+    sub_jq_.call_soon([this, self = shared_from_this(), gen = conn_gen_] {
+        hivemind_.on_node_connected(*this, gen);
+    });
 }
 
 void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
     assert(jq_.inside());
+    // One we dropped (see disconnect()), and whose closing arrives after: a deliberate close, not a
+    // failure, which must not touch a connection made since in its place.
+    if (&c != conn_.get())
+        return;
     bool is_failed_connect = !connected_.exchange(false);
 
     if (hivemind_.has_quic_out()) {
@@ -173,13 +179,11 @@ void SNode::on_disconnected(quic::Connection& c, uint64_t ec) {
     }
 
     stream_.reset();
-    if (conn_) {
-        conn_.reset();
-        lost_connection();
-    }
+    conn_.reset();
+    lost_connection();
 
-    if (hivemind_.has_quic_out() && is_failed_connect)
-        hivemind_.finished_connect();
+    if (hivemind_.has_quic_out())
+        finish_connecting(&c);
 }
 
 uint64_t SNode::take_sent_bytes() {
