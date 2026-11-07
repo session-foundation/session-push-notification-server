@@ -1770,9 +1770,10 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         if (dropped > 0)
             out += ", {} dropped"_format(value(dropped, Mark::wrong));
         // A push service refuses some pushes in the ordinary way (a device's rate limit, say), so
-        // only their share of those sent says anything.
+        // only their share of those sent says anything; with none sent, failures are of earlier
+        // pushes (retries, say), and there is no share to judge.
         if (failures > 0) {
-            double share = sent > 0 ? failures / sent : 1;
+            double share = sent > 0 ? failures / sent : 0;
             out += ", {} failures"_format(
                     value(failures,
                           mark(share > NOTIFIER_FAILURES_LOOK, share > NOTIFIER_FAILURES_WRONG)));
