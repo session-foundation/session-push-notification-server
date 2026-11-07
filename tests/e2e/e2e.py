@@ -1253,7 +1253,8 @@ def scenario_restart(build_dir):
         check(c["pushes"] == 1, f"no push before the restart: {c}")
 
         steps = s.restart_hivemind(
-            "hivemind2", config=f"{config}\nrenewal_interval = {renewal}"
+            "hivemind2",
+            config=f"{config}\nrenewal_interval = {renewal}\nstatus_report_interval = 15",
         )
         next(steps)
         for i in range(gap):
@@ -1346,6 +1347,29 @@ def scenario_restart(build_dir):
                 lambda n: n["entries"] >= 3 * subscriptions,
             )
             print(f"    renewed {time.time() - filled:.0f}s after the first fill")
+
+        # Only the first report after the restart says what was restored and how it settled.
+        while s.hivemind.log().count("Status report, over the last") < 2:
+            s.wait_report()
+        logged = s.hivemind.log()
+        reports = logged.split("Status report, over the last")[1:]
+        check(len(reports) >= 2, f"only {len(reports)} reports from the restarted hivemind")
+        restored = re.search(r"^  Restored: .*", reports[0], re.M)
+        kept = placements if MODE == "monitor" else 0
+        want = (
+            f"Restored: {accounts} accounts from \\S+ ago, 0 nodes dropped; {kept} of {placements} "
+            f"placements kept, {placements - kept} dropped"
+            + ("" if kept else f" \\({placements} no session\\)")
+            + "$"
+        )
+        check(
+            restored and re.fullmatch(want, restored.group(0).strip()),
+            f"the first report's Restored line: {restored and restored.group(0)}",
+        )
+        check(
+            all("Restored:" not in r for r in reports[1:]), "a later report says what was restored"
+        )
+        print(f"    {restored.group(0).strip()}")
 
         if MODE == "monitor":
             # More notifications for each of a few accounts than the replay budget: each node
@@ -1723,7 +1747,7 @@ def scenario_status_report(build_dir):
             )),
         )
         supporting = 3 if MODE == "monitor" else 0
-        sessions = re.search(r"sessions: (\d+)/(\d+) nodes support them; (\d+) created", log)
+        sessions = re.search(r"^  Sessions: (\d+)/(\d+) network support; (\d+) created", log, re.M)
         check(
             sessions and sessions.groups() == (str(supporting), "3", str(supporting)),
             f"the first report's sessions, expected {supporting}/3 supporting and created: "

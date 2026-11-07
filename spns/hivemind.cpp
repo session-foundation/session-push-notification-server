@@ -1857,23 +1857,6 @@ static Report status_report(const nlohmann::json& s, const nlohmann::json& prev,
     auto rate = [&](const auto&... path) { return dt > 0 ? delta(path...) / dt : 0.0; };
     // A figure in bold, and coloured as `mark` says.
     auto value = [](auto v, Mark mark = Mark::plain) { return Figure<decltype(v)>{v, mark}; };
-    auto restore_settled = [&] {
-        auto dropped =
-                "{} no session, {} resume failed, {} node left swarm, {} monitor ended"_format(
-                        value(num(s, "restored", "no_session")),
-                        value(num(s, "restored", "resume_failed")),
-                        value(num(s, "restored", "left")),
-                        value(num(s, "restored", "ended")));
-        if (num(s, "restored", "kept") == 0 && num(s, "restored", "pending_nodes") == 0)
-            return "none of its {} placements kept ({})"_format(
-                    value(num(s, "restored", "placements")), dropped);
-        return "of its {} placements, {} kept, dropped {}; {} nodes yet to settle"_format(
-                value(num(s, "restored", "placements")),
-                value(num(s, "restored", "kept")),
-                dropped,
-                value(num(s, "restored", "pending_nodes")));
-    };
-
     // The notifiers' own counters (service_stats) are kept across restarts, so they are compared
     // only with an earlier report's; the hivemind's start from zero at startup, and the first
     // report's figures for those are over the time since.
@@ -2061,46 +2044,63 @@ static Report status_report(const nlohmann::json& s, const nlohmann::json& prev,
     std::string saved = "not saved yet";
     if (get(s, "state", "saved_ago").is_number()) {
         auto ago = num(s, "state", "saved_ago");
-        bool failed = get(s, "state", "failed") == true;
-        saved = "saved {} ago, {} accounts on {} nodes, {} session tokens (snapshot {:.0f} ms, "
-                "write {:.0f} ms){}"_format(
-                        value(friendly_duration(ago),
-                              mark(ago > std::chrono::duration<double>(SAVE_AGE_LOOK).count(),
-                                   false)),
-                        value(num(s, "state", "accounts")),
-                        value(num(s, "state", "nodes")),
-                        value(num(s, "state", "sessions")),
-                        value(num(s, "state", "snapshot_ms")),
-                        value(num(s, "state", "write_ms")),
-                        failed ? ", {}"_format(value("last save failed"s, Mark::look)) : ""s);
+        saved = "saved {} ago ({} placements, {} tokens; snapshot {:.0f} ms, write {:.1f} s)"_format(
+                value(friendly_duration(ago),
+                      mark(ago > std::chrono::duration<double>(SAVE_AGE_LOOK).count(), false)),
+                value(num(s, "state", "accounts")),
+                value(num(s, "state", "sessions")),
+                value(num(s, "state", "snapshot_ms")),
+                value(num(s, "state", "write_ms") / 1000));
+        if (get(s, "state", "failed") == true)
+            saved += ", {}"_format(value("last save failed"s, Mark::look));
     }
+    r.line(0, "State: {}"_format(saved));
+
     auto unsupported = delta("monitor_sessions", "unsupported"),
          session_failed = delta("monitor_sessions", "failed"),
          discarded = delta("monitor_sessions", "replay_discarded");
-    auto sessions = "{}/{} nodes support them; {} created, {} resumed"_format(
-            value(num(s, "monitor_sessions", "nodes_supporting")),
-            value(num(s, "snodes")),
-            value(delta("monitor_sessions", "created")),
-            value(delta("monitor_sessions", "resumed")));
-    if (unsupported > 0)
-        sessions += ", {} unsupported"_format(value(unsupported, Mark::look));
-    if (session_failed > 0)
-        sessions += ", {} failed"_format(value(session_failed, Mark::look));
-    if (discarded > 0)
-        sessions += ", {} replays discarded for {} accounts"_format(
-                value(discarded), value(delta("monitor_sessions", "replay_discarded_accounts")));
     r.line(0,
-           "State: {}; {}; sessions: {}"_format(
-                   saved,
-                   get(s, "restored", "age").is_number()
-                           ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
-                                     value(num(s, "restored", "accounts")),
-                                     value(num(s, "restored", "nodes")),
-                                     value(friendly_duration(num(s, "restored", "age"))),
-                                     value(num(s, "restored", "nodes_dropped")),
-                                     restore_settled())
-                           : "restored nothing"s,
-                   sessions));
+           "Sessions: {}/{} network support; {} created, {} resumed"_format(
+                   value(num(s, "monitor_sessions", "nodes_supporting")),
+                   value(num(s, "snodes")),
+                   value(delta("monitor_sessions", "created")),
+                   value(delta("monitor_sessions", "resumed"))));
+    if (unsupported > 0)
+        r.extend(", {} unsupported"_format(value(unsupported, Mark::look)));
+    if (session_failed > 0)
+        r.extend(", {} failed"_format(value(session_failed, Mark::look)));
+    if (discarded > 0)
+        r.extend(
+                ", {} replays discarded for {} accounts"_format(
+                        value(discarded),
+                        value(delta("monitor_sessions", "replay_discarded_accounts"))));
+
+    // What was restored at startup, and how it settled: in the first report only.
+    if (!have_prev && get(s, "restored", "age").is_number()) {
+        r.line(0,
+               "Restored: {} accounts from {} ago, {} nodes dropped; {} of {} placements kept, {} "
+               "dropped"_format(
+                       value(num(s, "restored", "accounts")),
+                       value(friendly_duration(num(s, "restored", "age"))),
+                       value(num(s, "restored", "nodes_dropped")),
+                       value(num(s, "restored", "kept")),
+                       value(num(s, "restored", "placements")),
+                       value(num(s, "restored", "no_session") +
+                             num(s, "restored", "resume_failed") + num(s, "restored", "ended") +
+                             num(s, "restored", "left"))));
+        std::vector<std::string> reasons;
+        for (auto [key, reason] :
+             {std::pair{"no_session", "no session"},
+              std::pair{"resume_failed", "resume failed"},
+              std::pair{"ended", "monitor ended"},
+              std::pair{"left", "node left swarm"}})
+            if (auto n = num(s, "restored", key); n > 0)
+                reasons.push_back("{} {}"_format(value(n), reason));
+        if (!reasons.empty())
+            r.extend(" ({})"_format(fmt::join(reasons, ", ")));
+        if (auto pending = num(s, "restored", "pending_nodes"); pending > 0)
+            r.extend("; {} nodes yet to settle"_format(value(pending)));
+    }
 
     auto snodes = num(s, "snodes"), connected = num(s, "connections");
     auto connected_share = snodes > 0 ? connected / snodes : 1;
