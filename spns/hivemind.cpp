@@ -2304,9 +2304,12 @@ void HiveMind::db_cleanup() {
     auto conn = pool_.get();
     pqxx::work tx{conn};
     std::unordered_map<std::string, int64_t> expired;
+    // Once a subscription can no longer be sent: then the in-memory one lapses too.
     for (auto [service] : tx.query<std::string>(
-                 "DELETE FROM subscriptions WHERE signature_ts <= $1 RETURNING service",
-                 {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)}))
+                 "DELETE FROM subscriptions WHERE signature_ts < $1 RETURNING service",
+                 {unix_timestamp(
+                         system_clock::now() - hive::Subscription::SIGNATURE_EXPIRY +
+                         hive::Subscription::SIGNATURE_MARGIN)}))
         expired[service]++;
     tx.commit();
     for (const auto& [service, count] : expired)
@@ -2799,6 +2802,19 @@ void HiveMind::refused(hive::SNode& node, const SwarmPubkey& account, std::strin
     unplaced_detail_[&account] = std::move(error);
 }
 
+void HiveMind::nothing_to_send(hive::SNode& node, const SwarmPubkey& account, bool not_yet_valid) {
+    unclaim(node, account);
+    if (not_yet_valid)
+        return;
+    // Lapsed, as its renewal would find it: placed again only if it is subscribed again.
+    if (account.unplaced != SwarmPubkey::Unplaced::none) {
+        account.unplaced = SwarmPubkey::Unplaced::none;
+        unplaced_detail_.erase(&account);
+    }
+    release_all(account, account.swarm);
+    account.next_due = SwarmPubkey::UNSCHEDULED;
+}
+
 void HiveMind::retrying(
         hive::SNode& node,
         const std::vector<const SwarmPubkey*>& accounts,
@@ -2929,7 +2945,8 @@ void HiveMind::check_subs() {
     assert(sub_loop_.inside());
 
     auto now = system_clock::now();
-    auto sig_min = now - hive::Subscription::SIGNATURE_EXPIRY + 10s;
+    auto sig_min =
+            now - hive::Subscription::SIGNATURE_EXPIRY + hive::Subscription::SIGNATURE_MARGIN;
     auto sig_max = now + hive::Subscription::SIGNATURE_EARLY;
 
     size_t due = 0, lapsed = 0;
@@ -3026,7 +3043,8 @@ HiveMind::Coverage HiveMind::coverage(bool detail, bool recount) const {
     Coverage c;
     // The window send_next sends subscriptions in.
     auto now = system_clock::now();
-    auto sig_min = now - hive::Subscription::SIGNATURE_EXPIRY + 10s;
+    auto sig_min =
+            now - hive::Subscription::SIGNATURE_EXPIRY + hive::Subscription::SIGNATURE_MARGIN;
     auto sig_max = now + hive::Subscription::SIGNATURE_EARLY;
     auto ago = [&](system_time t) {
         return "{:.1f}h"_format(std::chrono::duration<double, std::ratio<3600>>(now - t).count());
@@ -3788,7 +3806,8 @@ WHERE id % {0} = {1})"_format(n, i))) {
     auto update_clocks = [&] {
         now = steady_clock::now();
         sys_now = std::chrono::floor<std::chrono::seconds>(system_clock::now());
-        sigts_cutoff.first = sys_now - hive::Subscription::SIGNATURE_EXPIRY + 5s;
+        sigts_cutoff.first = sys_now - hive::Subscription::SIGNATURE_EXPIRY +
+                             hive::Subscription::SIGNATURE_MARGIN;
         sigts_cutoff.second = sys_now + hive::Subscription::SIGNATURE_EARLY;
     };
     update_clocks();
@@ -3799,8 +3818,8 @@ WHERE id % {0} = {1})"_format(n, i))) {
         for (auto& [swpk, subaccount, sig, sigts, wd, ns_arr] : rows) {
             raw_count++;
 
-            if (sigts <= sigts_cutoff.first || sigts >= sigts_cutoff.second)
-                // Don't try loading entries that are about to expire
+            if (sigts < sigts_cutoff.first || sigts > sigts_cutoff.second)
+                // Not sendable, as send_next would find (and those too old are deleted).
                 continue;
 
             // DEBUG

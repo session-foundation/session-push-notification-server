@@ -54,12 +54,6 @@ namespace quic = oxen::quic;
 
 using namespace quic::literals;
 
-
-// How long until we expire subscriptions (relative to the signature timestamp).  This can be no
-// more than 14 days (because that's the subscription cutoff for storage server), but can also be
-// less.
-inline constexpr auto SIGNATURE_EXPIRY = 14 * 24h;
-
 // How much we allow an unsubscribe signature timestamp to be off before we reject it
 inline constexpr auto UNSUBSCRIBE_GRACE = 24h;
 
@@ -684,6 +678,10 @@ class HiveMind {
     // last refusal's text; and for accounts it is to place again after `backoff`, following a
     // failure.
     void refused(hive::SNode& node, const SwarmPubkey& account, std::string error);
+    // Called by an SNode for an account with no subscription it could send: lapsed, as at its
+    // renewal, when every signature has expired, and otherwise (some signature not yet valid) only
+    // given up on this node.
+    void nothing_to_send(hive::SNode& node, const SwarmPubkey& account, bool not_yet_valid);
     void retrying(
             hive::SNode& node,
             const std::vector<const SwarmPubkey*>& accounts,

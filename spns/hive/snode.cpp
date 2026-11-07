@@ -362,7 +362,8 @@ bool SNode::send_next(
         return false;
 
     auto now = system_clock::now();
-    auto sig_min = now - hive::Subscription::SIGNATURE_EXPIRY + 10s;
+    auto sig_min =
+            now - hive::Subscription::SIGNATURE_EXPIRY + hive::Subscription::SIGNATURE_MARGIN;
     auto sig_max = now + hive::Subscription::SIGNATURE_EARLY;
 
     oxenc::bt_list_producer req;
@@ -380,9 +381,12 @@ bool SNode::send_next(
         }
 
         auto before = entries.size();
+        bool not_yet_valid = false;
         for (const auto& sub : subs->second) {
-            if (sub.sig_ts < sig_min || sub.sig_ts > sig_max)
+            if (sub.sig_ts < sig_min || sub.sig_ts > sig_max) {
+                not_yet_valid |= sub.sig_ts > sig_max;
                 continue;
+            }
 
             auto dict = req.append_dict();
 
@@ -406,9 +410,7 @@ bool SNode::send_next(
         if (entries.size() != before)
             accounts++;
         else
-            // Nothing current to send: renewal finds it lapsed, and it is placed again only if
-            // it is subscribed again.
-            hivemind_.unclaim(*this, *acct);
+            hivemind_.nothing_to_send(*this, *acct, not_yet_valid);
     }
 
     if (entries.empty())
