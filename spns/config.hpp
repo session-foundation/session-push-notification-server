@@ -110,6 +110,10 @@ struct Config {
     // 2 seconds, so it must be at least that.
     std::chrono::seconds status_report_interval = 5min;
 
+    // A file to write each status report to as well, as Markdown, replacing the last; empty for
+    // none.
+    std::string status_report_file;
+
     // Maximum connections we will attempt to establish simultaneously (we can have more, we just
     // won't try to open more than this at once until some succeed or fail).  You can set this to 0
     // for a "dry run" mode where no connections at all will be made.

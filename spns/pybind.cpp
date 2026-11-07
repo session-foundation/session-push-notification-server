@@ -194,6 +194,10 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     },
                     "seconds between status reports in the log; at least 2")
             .def_readwrite(
+                    "status_report_file",
+                    &Config::status_report_file,
+                    "file each status report is written to as well, as Markdown; empty for none")
+            .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,
                     "maximum number of permitted simultaneous connection attempts.  (This is not "

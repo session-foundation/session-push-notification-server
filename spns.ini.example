@@ -90,6 +90,10 @@ startup_wait = 8.0
 # Seconds between the multi-line status reports in the log; at least 2.
 #status_report_interval = 300
 
+# A file to write each status report to as well, as Markdown, replacing the one before; by default
+# none.
+#status_report_file = /var/lib/spns/status-report.md
+
 
 [keys]
 

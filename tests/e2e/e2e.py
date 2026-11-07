@@ -1605,7 +1605,12 @@ def scenario_status_report(build_dir):
         "INSERT INTO service_stats (service, name, val_int) VALUES ('retired', 'notifies', 5), "
         "('dummy', 'failures', 1000000)"
     )
-    s = Setup(build_dir, nodes=3, config="status_report_interval = 15")
+    report_file = f"{WORK}/status-report.md"
+    s = Setup(
+        build_dir,
+        nodes=3,
+        config=f"status_report_interval = 15\nstatus_report_file = {report_file}",
+    )
     quiet = None
     try:
         quiet = Proc("quiet", [f"{FAKES}/fake_notifier", "--stats", HIVEMIND_SOCK, "200", "quiet"])
@@ -1696,6 +1701,26 @@ def scenario_status_report(build_dir):
                 re.M,
             ),
             "no Client requests line of the expected form in the reports",
+        )
+        # The report file holds the last report, as Markdown: the same lines, a bullet each, with
+        # their figures in bold.
+        check(os.path.exists(report_file), f"no status report file {report_file}")
+        with open(report_file) as f:
+            markdown = f.read()
+        check(markdown.startswith("# Status report, "), f"no heading in the report file: {markdown}")
+        check("**" in markdown, f"no figure in bold in the report file: {markdown}")
+        logged = log[log.rindex("Status report, over the last") :].splitlines()
+        logged = [line.strip() for line in logged[1:] if line.startswith("  ")]
+        bullets = [
+            re.sub(r"\\(.)", r"\1", re.sub(r"\*\*|🟡|🔴", "", line.strip()[2:]))
+            for line in markdown.splitlines()[2:]
+        ]
+        check(
+            bullets == logged,
+            "the report file differs from the logged report: "
+            + "".join(difflib.unified_diff(
+                [l + "\n" for l in logged], [b + "\n" for b in bullets], "logged", "file"
+            )),
         )
         supporting = 3 if MODE == "monitor" else 0
         sessions = re.search(r"sessions: (\d+)/(\d+) nodes support them; (\d+) created", log)

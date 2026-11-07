@@ -277,6 +277,10 @@ class HiveMind {
     // this header has nlohmann::json just declared.)
     std::unique_ptr<nlohmann::json> last_report_;
     steady_time last_report_time_{};
+    // Writes a status report to Config::status_report_file, replacing the last whole.  A failure
+    // is logged once, and not again until a write has succeeded.
+    void write_report_file(const std::string& markdown);
+    bool report_file_failed_ = false;
 
     // Every node, for make_conns(); QUIC loop (jq_) only.
     std::vector<std::shared_ptr<hive::SNode>> conns_;

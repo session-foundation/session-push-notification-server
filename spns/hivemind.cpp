@@ -18,6 +18,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -42,30 +43,24 @@ namespace spns {
 // How a figure in the status report reads: as it is, worth a look, or wrong now.
 enum class Mark { plain, look, wrong };
 
-// A figure in the status report, formatted by its own format spec, in bold, and in yellow or red as
-// its mark says.  The escape codes go out whatever the sink: the hivemind logs only to its coloured
-// stderr sink (see main.cpp), whose pattern carries its own codes unconditionally, and oxen-logging
-// exposes no colour setting to follow.
+// A figure in the status report, formatted by its own format spec, and set off in the text it is
+// formatted into, with its mark, for Report to find (see Report::extend()).
 template <typename T>
 struct Figure {
     T value;
     Mark mark;
 };
+inline constexpr char FIGURE_START = '\x01', FIGURE_END = '\x02';
 
 }  // namespace spns
 
 template <typename T>
 struct fmt::formatter<spns::Figure<T>> : fmt::formatter<T> {
     auto format(const spns::Figure<T>& f, fmt::format_context& ctx) const {
-        using enum spns::Mark;
         ctx.advance_to(
                 fmt::format_to(
-                        ctx.out(),
-                        "{}",
-                        f.mark == wrong  ? "\x1b[1;31m"
-                        : f.mark == look ? "\x1b[1;33m"
-                                         : "\x1b[1m"));
-        return fmt::format_to(fmt::formatter<T>::format(f.value, ctx), "\x1b[0m");
+                        ctx.out(), "{}{}", spns::FIGURE_START, static_cast<char>('0' + int(f.mark))));
+        return fmt::format_to(fmt::formatter<T>::format(f.value, ctx), "{}", spns::FIGURE_END);
     }
 };
 
@@ -1730,7 +1725,113 @@ static Mark mark(bool look, bool wrong) {
     return wrong ? Mark::wrong : look ? Mark::look : Mark::plain;
 }
 
-static std::string status_report(const nlohmann::json& s, const nlohmann::json& prev, double dt) {
+namespace {
+
+    // A status report as data, for rendering for the log (render_ansi()) and as Markdown
+    // (render_markdown()): the interval it covers, and its lines, each with its depth (0, or 1
+    // beneath the line before) and its text in runs, each plain or a figure with its mark.
+    struct Report {
+        struct Run {
+            std::string text;
+            std::optional<Mark> figure;
+        };
+        struct Line {
+            int depth;
+            std::vector<Run> runs;
+        };
+        double interval = 0;
+        std::vector<Line> lines;
+
+        // Starts a line, of `text` (see extend()).
+        void line(int depth, std::string_view text) {
+            lines.push_back({depth, {}});
+            extend(text);
+        }
+        // Adds `text`, as formatted with Figures in it, to the last line.
+        void extend(std::string_view text) {
+            auto& runs = lines.back().runs;
+            auto plain = [&](std::string_view t) {
+                if (t.empty())
+                    return;
+                if (!runs.empty() && !runs.back().figure)
+                    runs.back().text += t;
+                else
+                    runs.push_back({std::string{t}, std::nullopt});
+            };
+            while (!text.empty()) {
+                auto start = text.find(FIGURE_START);
+                plain(text.substr(0, start));
+                if (start == std::string_view::npos)
+                    break;
+                auto end = text.find(FIGURE_END, start);
+                runs.push_back(
+                        {std::string{text.substr(start + 2, end - start - 2)},
+                         static_cast<Mark>(text[start + 1] - '0')});
+                text.remove_prefix(end + 1);
+            }
+        }
+    };
+
+    // For the log: every figure in bold, and in yellow or red as marked.  The escape codes go out
+    // whatever the sink: the hivemind logs only to its coloured stderr sink (see main.cpp), whose
+    // pattern carries its own codes unconditionally, and oxen-logging exposes no colour setting to
+    // follow.
+    std::string render_ansi(const Report& r) {
+        auto figure = [](const std::string& text, Mark mark) {
+            return "{}{}\x1b[0m"_format(
+                    mark == Mark::wrong  ? "\x1b[1;31m"
+                    : mark == Mark::look ? "\x1b[1;33m"
+                                         : "\x1b[1m",
+                    text);
+        };
+        auto out = "Status report, over the last {}:"_format(
+                figure(friendly_duration(r.interval), Mark::plain));
+        for (const auto& line : r.lines) {
+            out += "\n";
+            out.append(2 * (line.depth + 1), ' ');
+            for (const auto& run : line.runs)
+                out += run.figure ? figure(run.text, *run.figure) : run.text;
+        }
+        return out;
+    }
+
+    // As Markdown, for status_report_file: a heading with the report's time and interval, then a
+    // bullet per line, every figure in bold, and those marked preceded by a yellow or red circle,
+    // as Markdown has no colour.
+    std::string render_markdown(const Report& r, std::chrono::sys_seconds when) {
+        auto escape = [](std::string_view text) {
+            std::string out;
+            for (char c : text) {
+                if (c == '\\' || c == '*' || c == '_' || c == '`')
+                    out += '\\';
+                out += c;
+            }
+            return out;
+        };
+        auto out = "# Status report, {:%Y-%m-%d %H:%M:%S} UTC, over the last {}\n\n"_format(
+                when, friendly_duration(r.interval));
+        for (const auto& line : r.lines) {
+            out.append(2 * line.depth, ' ');
+            out += "- ";
+            for (const auto& run : line.runs) {
+                if (!run.figure) {
+                    out += escape(run.text);
+                    continue;
+                }
+                if (*run.figure == Mark::look)
+                    out += "🟡";
+                else if (*run.figure == Mark::wrong)
+                    out += "🔴";
+                out += "**{}**"_format(escape(run.text));
+            }
+            out += "\n";
+        }
+        return out;
+    }
+
+}  // namespace
+
+static Report status_report(const nlohmann::json& s, const nlohmann::json& prev, double dt) {
     // The value at `path`, or null where any of it is absent.  Every lookup goes through this: a
     // const json's operator[] asserts that its key exists, and the parts of the stats need not
     // agree on which services there are (one whose stats are left in the database from an earlier
@@ -1778,16 +1879,17 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     // report's figures for those are over the time since.
     bool have_prev = prev.is_object() && !prev.empty();
 
-    std::string out = "Status report, over the last {}:"_format(value(friendly_duration(dt)));
+    Report r;
+    r.interval = dt;
 
-    out += "\n  Notifiers:";
+    r.line(0, "Notifiers:");
     std::vector<std::string> shown, idle;
     for (const auto* key : {"notifiers_registered", "notifiers_gone"})
         if (const auto& names = get(s, key); names.is_array())
             for (const auto& name : names)
                 shown.push_back(name.get<std::string>());
     if (shown.empty())
-        out += " none";
+        r.extend(" none");
     std::sort(shown.begin(), shown.end());
     for (const auto& service : shown) {
         bool gone = false;
@@ -1810,38 +1912,44 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             idle.push_back(service);
             continue;
         }
-        out += "\n    {}: {:.1f} pushes/s"_format(service, value(dt > 0 ? sent / dt : 0.0));
+        r.line(1, "{}: {:.1f} pushes/s"_format(service, value(dt > 0 ? sent / dt : 0.0)));
         if (acks > 0)
-            out += ", ack latency {} avg / {} max"_format(
-                    value(friendly_duration(
-                            delta("notifier_queue", service, "ack_seconds") / acks)),
-                    value(friendly_duration(ack_max),
-                          mark(ack_max > NOTIFIER_ACK_LOOK, ack_max > NOTIFIER_ACK_WRONG)));
+            r.extend(
+                    ", ack latency {} avg / {} max"_format(
+                            value(friendly_duration(
+                                    delta("notifier_queue", service, "ack_seconds") / acks)),
+                            value(friendly_duration(ack_max),
+                                  mark(ack_max > NOTIFIER_ACK_LOOK,
+                                       ack_max > NOTIFIER_ACK_WRONG))));
         // Only a full window is worth showing: below it, the count just cycles through the acks.
         if (unacked >= PUSH_WINDOW)
-            out += ", {} unacked"_format(value(unacked));
+            r.extend(", {} unacked"_format(value(unacked)));
         if (backlog > 0)
-            out += ", {} backlogged"_format(
-                    value(backlog, mark(true, backlog > NOTIFIER_BACKLOG_WRONG)));
+            r.extend(
+                    ", {} backlogged"_format(
+                            value(backlog, mark(true, backlog > NOTIFIER_BACKLOG_WRONG))));
         if (dropped > 0)
-            out += ", {} dropped"_format(value(dropped, Mark::wrong));
+            r.extend(", {} dropped"_format(value(dropped, Mark::wrong)));
         // A push service refuses some pushes in the ordinary way (a device's rate limit, say), so
         // only their share of those sent says anything; with none sent, failures are of earlier
         // pushes (retries, say), and there is no share to judge.
         if (failures > 0) {
             double share = sent > 0 ? failures / sent : 0;
-            out += ", {:.1f} failures/s"_format(
-                    value(dt > 0 ? failures / dt : 0.0,
-                          mark(share > NOTIFIER_FAILURES_LOOK, share > NOTIFIER_FAILURES_WRONG)));
+            r.extend(
+                    ", {:.1f} failures/s"_format(
+                            value(dt > 0 ? failures / dt : 0.0,
+                                  mark(share > NOTIFIER_FAILURES_LOOK,
+                                       share > NOTIFIER_FAILURES_WRONG))));
         }
         if (blocked.is_number())
-            out += "; window blocked {}"_format(
-                    value(friendly_duration(blocked.get<double>()), Mark::wrong));
+            r.extend(
+                    "; window blocked {}"_format(
+                            value(friendly_duration(blocked.get<double>()), Mark::wrong)));
         if (gone)
-            out += "; {}"_format(value("connection lost"s, Mark::wrong));
+            r.extend("; {}"_format(value("connection lost"s, Mark::wrong)));
     }
     if (!idle.empty())
-        out += "\n    idle: {}"_format(fmt::join(idle, ", "));
+        r.line(1, "idle: {}"_format(fmt::join(idle, ", ")));
 
     // A rate, split by the kind of account: Session accounts and groups, and others if any.
     auto by_type = [&](const char* key) {
@@ -1851,21 +1959,23 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             split += ", {:.1f}/s other"_format(value(rate("incoming", key, "other")));
         return split;
     };
-    out += "\n  Incoming: {:.1f}/s from nodes, {:.1f}/s unique ({}), {:.1f} pushes/s ({})"_format(
-            value(rate("incoming", "received")),
-            value(rate("incoming", "unique")),
-            by_type("unique_by_type"),
-            value(rate("incoming", "pushes")),
-            by_type("pushes_by_type"));
+    r.line(0,
+           "Incoming: {:.1f}/s from nodes, {:.1f}/s unique ({}), {:.1f} pushes/s ({})"_format(
+                   value(rate("incoming", "received")),
+                   value(rate("incoming", "unique")),
+                   by_type("unique_by_type"),
+                   value(rate("incoming", "pushes")),
+                   by_type("pushes_by_type")));
 
     auto peak_bytes = num(s, "incoming", "queue_peak_bytes");
     auto incoming_dropped = delta("incoming", "dropped"),
          lookup_failures = delta("incoming", "lookup_failures");
-    out += "\n  Processing: peak {} queued ({} bytes), {} dropped, {} lookup failures"_format(
-            value(num(s, "incoming", "queue_peak")),
-            value(peak_bytes, mark(peak_bytes > INCOMING_QUEUE_LOOK, false)),
-            value(incoming_dropped, mark(false, incoming_dropped > 0)),
-            value(lookup_failures, mark(lookup_failures > 0, false)));
+    r.line(0,
+           "Processing: peak {} queued ({} bytes), {} dropped, {} lookup failures"_format(
+                   value(num(s, "incoming", "queue_peak")),
+                   value(peak_bytes, mark(peak_bytes > INCOMING_QUEUE_LOOK, false)),
+                   value(incoming_dropped, mark(false, incoming_dropped > 0)),
+                   value(lookup_failures, mark(lookup_failures > 0, false))));
 
     auto requests = delta("monitor_requests", "sent"),
          request_failed = delta("monitor_requests", "failed"),
@@ -1880,16 +1990,18 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             split += ", {} other"_format(value(num(s, key, "other")));
         return split;
     };
-    out += "\n  Subscriptions: {} accounts ({}), {} subscriptions ({}) in {} swarms; {} schedule "
+    r.line(0,
+           "Subscriptions: {} accounts ({}), {} subscriptions ({}) in {} swarms; {} schedule "
            "entries"_format(
                    value(num(s, "accounts_monitored")),
                    split_counts("accounts_by_type"),
                    value(num(s, "subscriptions_distinct")),
                    split_counts("subscriptions_by_type"),
                    value(num(s, "swarm_index", "swarms")),
-                   value(num(s, "schedule")));
+                   value(num(s, "schedule"))));
 
-    out += "\n  Monitor requests: {} accounts to send, {}/{} in flight, {} nodes waiting; {} "
+    r.line(0,
+           "Monitor requests: {} accounts to send, {}/{} in flight, {} nodes waiting; {} "
            "sent, {} answered, {} failed, {} timed out; {} wrong swarm; {} accounts moved "
            "swarm"_format(
                    value(num(s, "pending", "accounts")),
@@ -1907,21 +2019,23 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    value(wrong_swarm,
                          mark(wrong_swarm > WRONG_SWARM_LOOK * entries,
                               wrong_swarm > WRONG_SWARM_WRONG * entries)),
-                   value(delta("accounts_moved")));
+                   value(delta("accounts_moved"))));
     if (auto moved = delta("placements", "moved"); moved > 0)
-        out += "; {} monitors moved between nodes"_format(value(moved));
+        r.extend("; {} monitors moved between nodes"_format(value(moved)));
 
-    out += "\n  Client requests: {} new subscriptions, {} renewals, {} unsubscribes"_format(
-            value(delta("client_requests", "new_subscriptions")),
-            value(delta("client_requests", "renewals")),
-            value(delta("client_requests", "unsubscribes")));
+    r.line(0,
+           "Client requests: {} new subscriptions, {} renewals, {} unsubscribes"_format(
+                   value(delta("client_requests", "new_subscriptions")),
+                   value(delta("client_requests", "renewals")),
+                   value(delta("client_requests", "unsubscribes"))));
     if (auto rejected = delta("client_requests", "rejected"); rejected > 0)
-        out += ", {} rejected"_format(value(rejected));
+        r.extend(", {} rejected"_format(value(rejected)));
 
     auto accounts = num(s, "coverage", "accounts"), covered = num(s, "coverage", "covered"),
          uncovered = num(s, "coverage", "at_zero");
     auto covered_share = accounts > 0 ? covered / accounts : 1;
-    out += "\n  Coverage: {} {}; {} under-covered ({} only on down nodes); {} uncovered; {} "
+    r.line(0,
+           "Coverage: {} {}; {} under-covered ({} only on down nodes); {} uncovered; {} "
            "unsendable; {} lapsed"_format(
                    value("{}/{} ({:.1f}%)"_format(covered, accounts, 100 * covered_share),
                          mark(covered_share < COVERED_LOOK, covered_share < COVERED_WRONG)),
@@ -1933,15 +2047,16 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    value(num(s, "coverage", "under_covered_down_only")),
                    value(uncovered, mark(uncovered > 0, uncovered >= UNCOVERED_WRONG * accounts)),
                    value(num(s, "coverage", "unsendable")),
-                   value(num(s, "coverage", "lapsed")));
+                   value(num(s, "coverage", "lapsed"))));
     if (uncovered > 0)
-        out += "\n    uncovered: {} rejected, {} retrying, {} no node, {} sent but never "
+        r.line(1,
+               "uncovered: {} rejected, {} retrying, {} no node, {} sent but never "
                "acknowledged, {} other"_format(
                        value(num(s, "coverage", "uncovered", "rejected")),
                        value(num(s, "coverage", "uncovered", "retrying")),
                        value(num(s, "coverage", "uncovered", "no_node")),
                        value(num(s, "coverage", "uncovered", "sent_never_acked")),
-                       value(num(s, "coverage", "uncovered", "other")));
+                       value(num(s, "coverage", "uncovered", "other"))));
 
     std::string saved = "not saved yet";
     if (get(s, "state", "saved_ago").is_number()) {
@@ -1974,21 +2089,23 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     if (discarded > 0)
         sessions += ", {} replays discarded for {} accounts"_format(
                 value(discarded), value(delta("monitor_sessions", "replay_discarded_accounts")));
-    out += "\n  State: {}; {}; sessions: {}"_format(
-            saved,
-            get(s, "restored", "age").is_number()
-                    ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
-                              value(num(s, "restored", "accounts")),
-                              value(num(s, "restored", "nodes")),
-                              value(friendly_duration(num(s, "restored", "age"))),
-                              value(num(s, "restored", "nodes_dropped")),
-                              restore_settled())
-                    : "restored nothing"s,
-            sessions);
+    r.line(0,
+           "State: {}; {}; sessions: {}"_format(
+                   saved,
+                   get(s, "restored", "age").is_number()
+                           ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
+                                     value(num(s, "restored", "accounts")),
+                                     value(num(s, "restored", "nodes")),
+                                     value(friendly_duration(num(s, "restored", "age"))),
+                                     value(num(s, "restored", "nodes_dropped")),
+                                     restore_settled())
+                           : "restored nothing"s,
+                   sessions));
 
     auto snodes = num(s, "snodes"), connected = num(s, "connections");
     auto connected_share = snodes > 0 ? connected / snodes : 1;
-    out += "\n  Nodes: {}/{} connected, {} connecting, {} cooling down, {} connections made; "
+    r.line(0,
+           "Nodes: {}/{} connected, {} connecting, {} cooling down, {} connections made; "
            "{:.1f}/{:.1f} kB/s out/in; load min/avg/max {}/{:.0f}/{} accounts"_format(
                    value(connected,
                          mark(connected_share < NODES_CONNECTED_LOOK,
@@ -2001,27 +2118,28 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    value(rate("bytes_received") / 1000),
                    value(num(s, "node_load", "min")),
                    value(num(s, "node_load", "avg")),
-                   value(num(s, "node_load", "max")));
+                   value(num(s, "node_load", "max"))));
 
     auto db_idle = num(s, "db_connections", "idle"), db_in_use = num(s, "db_connections", "in_use");
-    out += "\n  Process: RSS {:.0f} MB; block {}{}; up {}; db connections {} idle, {} busy"_format(
-            value(num(s, "rss") / 1e6),
-            value(num(s, "block_height")),
-            get(s, "block_age").is_number()
-                    ? ", {} old"_format(value(friendly_duration(num(s, "block_age"))))
-                    : ""s,
-            value(friendly_duration(num(s, "uptime"))),
-            value(db_idle),
-            value(db_in_use, mark(db_idle == 0 && db_in_use > 0, false)));
+    r.line(0,
+           "Process: RSS {:.0f} MB; block {}{}; up {}; db connections {} idle, {} busy"_format(
+                   value(num(s, "rss") / 1e6),
+                   value(num(s, "block_height")),
+                   get(s, "block_age").is_number()
+                           ? ", {} old"_format(value(friendly_duration(num(s, "block_age"))))
+                           : ""s,
+                   value(friendly_duration(num(s, "uptime"))),
+                   value(db_idle),
+                   value(db_in_use, mark(db_idle == 0 && db_in_use > 0, false))));
 
     // During a fill, every account not yet reached is uncovered, as expected.
     if (const auto& accounts = get(s, "coverage", "uncovered_accounts");
         get(s, "coverage", "filling") != true && accounts.is_array() && !accounts.empty()) {
-        out += "\n  Uncovered or unsendable accounts:";
+        r.line(0, "Uncovered or unsendable accounts:");
         for (const auto& line : accounts)
-            out += "\n    {}"_format(line.get<std::string>());
+            r.line(1, "{}"_format(line.get<std::string>()));
     }
-    return out;
+    return r;
 }
 
 void HiveMind::on_get_stats(oxenmq::Message& m) {
@@ -2070,10 +2188,11 @@ void HiveMind::log_stats(std::string pre_cmd) {
                               ? std::chrono::duration<double>(system_clock::now() - startup_time)
                                         .count()
                               : std::chrono::duration<double>(now - last_report_time_).count();
-            log::info(
-                    stats,
-                    "{}",
-                    status_report(s, last_report_ ? *last_report_ : nlohmann::json{}, dt));
+            auto r = status_report(s, last_report_ ? *last_report_ : nlohmann::json{}, dt);
+            log::info(stats, "{}", render_ansi(r));
+            if (!config.status_report_file.empty())
+                write_report_file(render_markdown(
+                        r, std::chrono::floor<std::chrono::seconds>(system_clock::now())));
             last_report_ = std::make_unique<nlohmann::json>(std::move(s));
             last_report_time_ = now;
             last_stats_logged = now;
@@ -2082,6 +2201,28 @@ void HiveMind::log_stats(std::string pre_cmd) {
         }
     };
     get_stats_json(std::move(on_stats), report ? StatsDepth::audited : StatsDepth::tick);
+}
+
+void HiveMind::write_report_file(const std::string& markdown) {
+    const auto& path = config.status_report_file;
+    auto tmp = path + ".tmp";
+    try {
+        {
+            std::ofstream f{tmp, std::ios::binary | std::ios::trunc};
+            f.exceptions(std::ios::failbit | std::ios::badbit);
+            f << markdown;
+        }
+        std::filesystem::rename(tmp, path);
+        report_file_failed_ = false;
+    } catch (const std::exception& e) {
+        if (!std::exchange(report_file_failed_, true))
+            log::warning(
+                    cat,
+                    "Failed to write the status report to {}: {}; not saying so again until a "
+                    "write succeeds",
+                    path,
+                    e.what());
+    }
 }
 
 void HiveMind::on_drop_registrations(oxenmq::Message& m) {

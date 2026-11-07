@@ -134,6 +134,7 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
                 lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) >= 2,
                 int,
             ),
+            "status_report_file": ("status_report_file",),
             "filter_lifetime": ("filter_lifetime", None, int),
             "startup_wait": ("notifier_wait", None, lambda x: round(1000 * float(x))),
             "notifiers_expected": (
