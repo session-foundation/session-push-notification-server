@@ -1668,6 +1668,7 @@ constexpr double REQUESTS_FAILED_LOOK = 0.005, REQUESTS_FAILED_WRONG = 0.05;
 constexpr double WRONG_SWARM_LOOK = 0.005, WRONG_SWARM_WRONG = 0.05;
 constexpr double NODES_CONNECTED_LOOK = 0.98, NODES_CONNECTED_WRONG = 0.90;
 constexpr double COVERED_LOOK = 0.99, COVERED_WRONG = 0.90;
+constexpr double ON_NONE_WRONG = 0.05;  // any account on no node is worth a look
 constexpr auto SAVE_AGE_LOOK = 2 * DUMP_INTERVAL;
 
 static Mark mark(bool look, bool wrong) {
@@ -1846,7 +1847,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    value(num(s, "coverage", "redundancy")),
                    value(num(s, "coverage", "under_covered")),
                    value(num(s, "coverage", "under_covered_down_only")),
-                   value(on_none, mark(on_none > 0, false)),
+                   value(on_none, mark(on_none > 0, on_none >= ON_NONE_WRONG * accounts)),
                    value(num(s, "coverage", "on_none", "rejected")),
                    value(num(s, "coverage", "on_none", "retrying")),
                    value(num(s, "coverage", "on_none", "no_node")),
