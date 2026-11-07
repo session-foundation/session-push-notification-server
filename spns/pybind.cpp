@@ -197,7 +197,7 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     [](Config& self, int64_t seconds) {
                         self.status_report_interval = std::chrono::seconds{seconds};
                     },
-                    "seconds between status reports in the log; at least 15")
+                    "seconds between status reports in the log; at least 2")
             .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,

@@ -407,7 +407,7 @@ HiveMind::HiveMind(Config conf_in) :
     jq_.add_timer(10s, [this] { make_conns(); });
 
     // For updating systemd Status line
-    omq_.add_timer([this] { log_stats(); }, 15s);
+    omq_.add_timer([this] { log_stats(); }, 2s);
 
     log::info(cat, "Startup complete");
 }
@@ -1344,7 +1344,8 @@ static nlohmann::json seconds_since(const std::optional<steady_time>& t, steady_
     return std::chrono::duration<double>(now - *t).count();
 }
 
-void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, bool audit) {
+void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, StatsDepth depth) {
+    bool audit = depth == StatsDepth::audited;
     auto result = nlohmann::json{};
 
     {
@@ -1371,15 +1372,17 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, bo
             }
         }
 
-        int64_t total = 0;
-        for (const auto& [service, count] : tx.query<std::string, int64_t>(
-                     R"(SELECT service, COUNT(*) FROM subscriptions GROUP BY service)")) {
-            result["subscriptions"][service] = count;
-            total += count;
-        }
-        result["subscriptions"]["total"] = total;
-
         tx.commit();
+    }
+    {
+        std::lock_guard lock{subscription_rows_mutex_};
+        int64_t total = 0;
+        for (const auto& [service, count] : subscription_rows_)
+            if (count > 0) {
+                result["subscriptions"][service] = count;
+                total += count;
+            }
+        result["subscriptions"]["total"] = total;
     }
 
     {
@@ -1427,6 +1430,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, bo
     sub_jq_.call_soon([when_ready = std::move(when_ready),
                        result = std::move(result),
                        audit,
+                       depth,
                        this]() mutable {
         size_t n_conns = 0;
         for (auto& sn : sns_)
@@ -1452,7 +1456,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, bo
         std::unordered_map<uint64_t, Recount> recount;
         if (audit)
             recount = audit_counters();
-        auto c = coverage(true, audit);
+        auto c = depth == StatsDepth::tick ? Coverage{} : coverage(true, audit);
         if (audit) {
             auto index = coverage();
             for (auto [counter, kept, counted] :
@@ -1772,13 +1776,14 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
 }
 
 void HiveMind::on_get_stats(oxenmq::Message& m) {
-    get_stats_json([m = m.send_later()](nlohmann::json stats) { m(stats.dump()); });
+    get_stats_json(
+            [m = m.send_later()](nlohmann::json stats) { m(stats.dump()); }, StatsDepth::full);
 }
 
 void HiveMind::log_stats(std::string pre_cmd) {
     // Decided before the stats are gathered, as only a report has them audited.
     bool report = std::chrono::steady_clock::now() - last_stats_logged >=
-                  config.status_report_interval - 5s;
+                  config.status_report_interval - 1s;
     auto on_stats = [this, pre_cmd = std::move(pre_cmd), report](nlohmann::json s) {
         std::list<std::string> notifiers;
         for (auto& [k, v] : s.items())
@@ -1810,7 +1815,7 @@ void HiveMind::log_stats(std::string pre_cmd) {
                                       : "{}\nSTATUS={}"_format(pre_cmd, stat_line);
         sd_notify(0, sd_out.c_str());
 
-        // Due a little early, so that the 15-second tick it goes out with does not slip past it.
+        // Due a little early, so that the 2-second tick it goes out with does not slip past it.
         if (auto now = std::chrono::steady_clock::now(); report) {
             double dt = !last_report_
                               ? std::chrono::duration<double>(system_clock::now() - startup_time)
@@ -1827,7 +1832,7 @@ void HiveMind::log_stats(std::string pre_cmd) {
             log::debug(stats, "Status: {}", stat_line);
         }
     };
-    get_stats_json(std::move(on_stats), report);
+    get_stats_json(std::move(on_stats), report ? StatsDepth::audited : StatsDepth::tick);
 }
 
 void HiveMind::on_drop_registrations(oxenmq::Message& m) {
@@ -1868,6 +1873,7 @@ void HiveMind::on_drop_registrations(oxenmq::Message& m) {
                 "invalid admin.on_drop_registration request: expected list of service id strings");
         return;
     }
+    count_subscription_rows(std::string{service}, -deleted);
 
     {
         std::lock_guard lock{services_mutex_};
@@ -2297,10 +2303,19 @@ void HiveMind::on_unsubscribe(oxenmq::Message& m) {
 void HiveMind::db_cleanup() {
     auto conn = pool_.get();
     pqxx::work tx{conn};
-    tx.exec("DELETE FROM subscriptions WHERE signature_ts <= $1",
-            {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)})
-            .no_rows();
+    std::unordered_map<std::string, int64_t> expired;
+    for (auto [service] : tx.query<std::string>(
+                 "DELETE FROM subscriptions WHERE signature_ts <= $1 RETURNING service",
+                 {unix_timestamp(system_clock::now() - SIGNATURE_EXPIRY)}))
+        expired[service]++;
     tx.commit();
+    for (const auto& [service, count] : expired)
+        count_subscription_rows(service, -count);
+}
+
+void HiveMind::count_subscription_rows(const std::string& service, int64_t change) {
+    std::lock_guard lock{subscription_rows_mutex_};
+    subscription_rows_[service] += change;
 }
 
 void HiveMind::subscribe_blocks() {
@@ -3689,6 +3704,14 @@ void HiveMind::load_saved_subscriptions() {
     pqxx::work txn{conn};
 
     auto [total] = txn.query1<int>("SELECT COUNT(*) FROM subscriptions");
+    {
+        std::unordered_map<std::string, int64_t> rows;
+        constexpr auto query = "SELECT service, COUNT(*) FROM subscriptions GROUP BY service";
+        for (auto [service, count] : txn.query<std::string, int64_t>(query))
+            rows[service] = count;
+        std::lock_guard lock{subscription_rows_mutex_};
+        subscription_rows_ = std::move(rows);
+    }
 
     int n = std::max<int>(1, std::thread::hardware_concurrency() / 4);
 
@@ -3902,6 +3925,8 @@ RETURNING id, xmax = 0
         increment_stat(tx, s, new_sub ? "subscription" : "sub_renew", 1);
 
     tx.commit();
+    if (new_sub)
+        count_subscription_rows(service, 1);
 
     sub_jq_.call_soon([this, new_sub, pubkey = std::move(pubkey), sub = std::move(sub)]() mutable {
         auto [it, inserted] = subscribers_.try_emplace(std::move(pubkey));
@@ -3992,6 +4017,8 @@ bool HiveMind::remove_subscription(
                     .no_rows();
 
     tx.commit();
+    if (result.affected_rows() > 0)
+        count_subscription_rows(service, -static_cast<int64_t>(result.affected_rows()));
 
     // We don't remove the subscription from internal data structures: other devices
     // (with the exact subcription) may be still using it, and so we may still want

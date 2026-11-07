@@ -91,7 +91,7 @@ startup_wait = 8.0
 #monitor_requests = 64
 #monitor_timeout = 600
 
-# Seconds between the multi-line status reports in the log; at least 15.
+# Seconds between the multi-line status reports in the log; at least 2.
 #status_report_interval = 300
 
 

@@ -132,7 +132,7 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
             ),
             "status_report_interval": (
                 "status_report_interval",
-                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) >= 15,
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) >= 2,
                 int,
             ),
             "filter_lifetime": ("filter_lifetime", None, int),

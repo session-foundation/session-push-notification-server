@@ -474,6 +474,13 @@ class HiveMind {
     // How many distinct subscriptions subscribers_ holds.
     size_t subscription_count_ = 0;
 
+    // The database's subscription rows (devices' registrations) per service: counted once at
+    // startup and kept in step with every insert and delete since, so that the status tick need
+    // not count them.
+    std::mutex subscription_rows_mutex_;
+    std::unordered_map<std::string, int64_t> subscription_rows_;
+    void count_subscription_rows(const std::string& service, int64_t change);
+
     // Monitor requests sent since startup, those answered and those that failed or timed out, and
     // the subscriptions in the answers refused for the wrong swarm or rejected; and the accounts
     // nodes reported moved to the swarm we place them in.
@@ -552,9 +559,12 @@ class HiveMind {
     /// integer and string values are permitted (+keys only allow integers).
     void on_service_stats(oxenmq::Message& m);
 
-    // With `audit`, as for the periodic status report, the counters are checked against a recount
-    // (audit_counters()) and the coverage and node load figures come from the recount.
-    void get_stats_json(std::function<void(nlohmann::json)> when_ready, bool audit = false);
+    // How much get_stats_json() gathers: for the status tick, what its status line needs, which
+    // leaves out coverage, a pass over every account; everything, for get_stats; and for the
+    // periodic status report, everything with the counters checked against a recount
+    // (audit_counters()), and the coverage and node load figures from the recount.
+    enum class StatsDepth { tick, full, audited };
+    void get_stats_json(std::function<void(nlohmann::json)> when_ready, StatsDepth depth);
 
     void on_get_stats(oxenmq::Message& m);
 

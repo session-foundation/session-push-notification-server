@@ -107,7 +107,7 @@ struct Config {
     std::chrono::milliseconds monitor_timeout = 10min;
 
     // How often the multi-line status report is logged.  It goes out with the status tick, every
-    // 15 seconds, so it must be at least that.
+    // 2 seconds, so it must be at least that.
     std::chrono::seconds status_report_interval = 5min;
 
     // Maximum connections we will attempt to establish simultaneously (we can have more, we just

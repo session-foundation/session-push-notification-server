@@ -847,6 +847,10 @@ def scenario_churn(build_dir):
         check(c["duplicates"] == 0, f"{c['duplicates']} duplicate pushes")
         n = query1("SELECT count(*) FROM subscriptions WHERE svcid LIKE 'client-%'")
         check(n == 100, f"database holds {n} client subscriptions, expected 100")
+        # The hivemind keeps its own count of the rows, through every subscribe and unsubscribe.
+        rows = query1("SELECT count(*) FROM subscriptions")
+        counted = s.stats()["subscriptions"]["total"]
+        check(counted == rows, f"the hivemind counts {counted} subscriptions; the database {rows}")
         s.wait_report()
     finally:
         rc = s.stop()
