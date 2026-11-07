@@ -1009,9 +1009,10 @@ def scenario_restart(build_dir):
         s.wait_for(lambda: s.check(0, accounts), 60, lambda c: c["missing"] == 0)
 
     # The restored renewals fall due within the first restarted hivemind's run: those saved by the
-    # first, all acknowledged by `filled`, at most 1.1 intervals on; while it places nothing afresh
-    # before it starts, `down` after `filled`, and renews that no sooner than 0.9 intervals on.
-    renewal, down = 60, 25
+    # first, all acknowledged by `filled`, at most 1.1 intervals on, and are made by the next of
+    # its checks every `tick`; while it places nothing afresh before it starts, `down` after
+    # `filled`, and renews that no sooner than 0.9 intervals on.
+    renewal, down, tick = 60, 35, 10
 
     try:
         s.wait_subscribed(0, accounts, 60)
@@ -1057,7 +1058,7 @@ def scenario_restart(build_dir):
         c = s.wait_pushes(before + 1, 30)
         check(c["pushes"] == before + 1, "no push for a notification sent after the restart")
 
-        restored_due = filled + renewal * 11 / 10
+        restored_due = filled + renewal * 11 / 10 + tick
         fresh_due = filled + down + renewal * 9 / 10
         if MODE == "monitor":
             # Every placement was restored and kept, each account scheduled once, to be renewed
@@ -1067,7 +1068,7 @@ def scenario_restart(build_dir):
             s.network.cmd("mark")
             s.wait_for(
                 s.net_counts,
-                restored_due + 5 - time.time(),
+                restored_due + 2 - time.time(),
                 lambda n: n["entries"] >= 3 * subscriptions,
             )
             renewed = time.time() - filled
@@ -1093,7 +1094,7 @@ def scenario_restart(build_dir):
             )
             s.wait_for(
                 s.net_counts,
-                fresh_due + renewal / 5 + 10 - time.time(),
+                fresh_due + renewal / 5 + tick + 10 - time.time(),
                 lambda n: n["entries"] >= 3 * subscriptions,
             )
             print(f"    renewed {time.time() - filled:.0f}s after the first fill")
