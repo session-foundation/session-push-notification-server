@@ -68,7 +68,7 @@ HiveMind::HiveMind(Config conf_in) :
     // notification services).
     omq_.listen_plain(
             config.hivemind_sock, [](std::string_view addr, std::string_view /*pk*/, bool /*sn*/) {
-                log::info(cat, "Incoming local sock connection from {}", addr);
+                log::debug(cat, "Incoming local sock connection from {}", addr);
                 return oxenmq::AuthLevel::admin;
             });
     log::info(cat, "Listening for local connections on {}", config.hivemind_sock);
@@ -82,7 +82,7 @@ HiveMind::HiveMind(Config conf_in) :
                     break;
                 }
             }
-            log::info(cat, "Incoming {} connection from {}", is_admin ? "admin" : "public", addr);
+            log::debug(cat, "Incoming {} connection from {}", is_admin ? "admin" : "public", addr);
             return is_admin ? oxenmq::AuthLevel::admin : oxenmq::AuthLevel::none;
         };
         omq_.listen_curve(*config.hivemind_curve, std::move(allow_curve_conn));
