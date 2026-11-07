@@ -104,6 +104,12 @@ inline constexpr auto RESUME_MARGIN = 5min;
 // How often the hivemind saves its placements and monitor session tokens (see save_state()).
 inline constexpr auto DUMP_INTERVAL = 5min;
 
+// How often coverage is logged while a fill is in progress (see log_coverage_progress()), and the
+// share of the accounts whose coverage must change between two lines for that alone to count as
+// one.
+inline constexpr auto COVERAGE_LOG_INTERVAL = 15s;
+inline constexpr double COVERAGE_CHANGE_SHARE = 0.001;
+
 // How old saved state may be for a restart to resume from it.  A monitor lasts 65 minutes from its
 // last renewal and renewals come every 45-55 minutes, so anything acknowledged in the 55 minutes
 // before a save made this long ago is live for at least 10 minutes yet.
@@ -452,9 +458,15 @@ class HiveMind {
     // What a node said when it last gave up an account (Unplaced): the last refusal's text, or the
     // node and its backoff; until the account is placed again.
     std::unordered_map<const SwarmPubkey*, std::string> unplaced_detail_;
-    // What log_coverage_progress() last reported, to report only changes.
+    // What log_coverage_progress() last logged, and since when the fill it is following has been
+    // in progress, if one is.
     Coverage coverage_logged_;
-    // While accounts are below their target, logs how many are at it; runs every few seconds.
+    std::optional<steady_time> fill_started_;
+    // Logs coverage while a fill is in progress: while a node waits for a request slot, the
+    // requests in flight are at their cap, or coverage has changed by more than
+    // COVERAGE_CHANGE_SHARE of the accounts since the last line.  When none of those holds, logs
+    // the settled figures, and how long the fill took, once, and nothing more until the next fill.
+    // Runs every COVERAGE_LOG_INTERVAL.
     void log_coverage_progress();
 
     // Placements of an account on a node since startup: made by place(), and by nodes' scans; and

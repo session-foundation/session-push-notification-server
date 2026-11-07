@@ -443,7 +443,7 @@ HiveMind::HiveMind(Config conf_in) :
     // This ticker handles re-subscriptions, clearing expiries, etc.; it's on a relatively slow
     // timer because nothing in here is time critical:
     sub_jq_.add_timer(10s, [this] { check_subs(); });
-    sub_jq_.add_timer(5s, [this] { log_coverage_progress(); });
+    sub_jq_.add_timer(COVERAGE_LOG_INTERVAL, [this] { log_coverage_progress(); });
     sub_jq_.add_timer(OXEND_BLOCK_SUB_INTERVAL, [this] { subscribe_blocks(); });
     sub_jq_.add_timer(DUMP_INTERVAL, [this] { save_state(false); });
     // And this one reconnects to nodes whose connection failed or was lost, once their cooldown
@@ -3418,24 +3418,43 @@ HiveMind::Coverage HiveMind::coverage(bool detail, bool recount) const {
 void HiveMind::log_coverage_progress() {
     auto c = coverage();
     const auto& was = coverage_logged_;
-    bool below = c.under + c.at_zero > 0, was_below = was.under + was.at_zero > 0;
-    if ((below || was_below) &&
-        (c.accounts != was.accounts || c.covered != was.covered || c.under != was.under ||
-         c.under_down_only != was.under_down_only || c.at_zero != was.at_zero))
+    auto differ = [](size_t a, size_t b) { return a > b ? a - b : b - a; };
+    auto changed = differ(c.accounts, was.accounts) + differ(c.covered, was.covered) +
+                   differ(c.under, was.under) + differ(c.at_zero, was.at_zero);
+    bool filling = !send_queue_.empty() || requests_in_flight_ >= config.monitor_requests ||
+                   changed > COVERAGE_CHANGE_SHARE * c.accounts;
+    if (!filling && !fill_started_)
+        return;
+
+    auto now = steady_clock::now();
+    auto figures =
+            "{}/{} accounts ({:.1f}%) covered, {} under-covered ({} only on down nodes), {} "
+            "on none, {} unsendable"_format(
+                    c.covered,
+                    c.accounts,
+                    c.accounts ? 100.0 * c.covered / c.accounts : 100.0,
+                    c.under,
+                    c.under_down_only,
+                    c.at_zero,
+                    c.unsendable);
+    if (filling) {
+        if (!fill_started_)
+            fill_started_ = now;
         log::info(
                 cat,
-                "Coverage: {}/{} accounts ({:.1f}%) covered, {} under-covered ({} only on down "
-                "nodes), {} on none, {} unsendable; {}/{} requests in flight, {} nodes waiting",
-                c.covered,
-                c.accounts,
-                c.accounts ? 100.0 * c.covered / c.accounts : 100.0,
-                c.under,
-                c.under_down_only,
-                c.at_zero,
-                c.unsendable,
+                "Coverage: {}; {}/{} requests in flight, {} nodes waiting",
+                figures,
                 requests_in_flight_,
                 config.monitor_requests,
                 send_queue_.size());
+    } else {
+        log::info(
+                cat,
+                "Coverage settled after {}: {}",
+                friendly_duration(std::chrono::duration<double>(now - *fill_started_).count()),
+                figures);
+        fill_started_.reset();
+    }
     coverage_logged_ = c;
 }
 
