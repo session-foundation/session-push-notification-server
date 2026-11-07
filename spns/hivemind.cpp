@@ -1880,7 +1880,23 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                         value(num(s, "state", "write_ms")),
                         failed ? ", {}"_format(value("last save failed"s, Mark::look)) : ""s);
     }
-    out += "\n  State: {}; {}; sessions: {} resumed, {} replays discarded for {} accounts"_format(
+    auto unsupported = delta("monitor_sessions", "unsupported"),
+         session_failed = delta("monitor_sessions", "failed"),
+         discarded = delta("monitor_sessions", "replay_discarded");
+    auto sessions = "{}/{} nodes support them, {} created, {} resumed"_format(
+            value(num(s, "monitor_sessions", "nodes_supporting")),
+            value(num(s, "snodes")),
+            value(delta("monitor_sessions", "created")),
+            value(delta("monitor_sessions", "resumed")));
+    if (unsupported > 0)
+        sessions += ", {} unsupported"_format(value(unsupported, Mark::look));
+    if (session_failed > 0)
+        sessions += ", {} failed"_format(value(session_failed, Mark::look));
+    sessions += " over the interval";
+    if (discarded > 0)
+        sessions += ", {} replays discarded for {} accounts"_format(
+                value(discarded), value(delta("monitor_sessions", "replay_discarded_accounts")));
+    out += "\n  State: {}; {}; sessions: {}"_format(
             saved,
             get(s, "restored", "age").is_number()
                     ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
@@ -1890,9 +1906,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                               value(num(s, "restored", "nodes_dropped")),
                               restore_settled())
                     : "restored nothing"s,
-            value(delta("monitor_sessions", "resumed")),
-            value(delta("monitor_sessions", "replay_discarded")),
-            value(delta("monitor_sessions", "replay_discarded_accounts")));
+            sessions);
 
     auto snodes = num(s, "snodes"), connected = num(s, "connections");
     auto connected_share = snodes > 0 ? connected / snodes : 1;

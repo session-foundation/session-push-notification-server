@@ -1580,6 +1580,13 @@ def scenario_status_report(build_dir):
             f"no ack round trip on the busy notifier's line: {busy.group(0)}",
         )
         check("unacked" not in log, "a report shows unacked pushes below a full window")
+        supporting = 3 if MODE == "monitor" else 0
+        sessions = re.search(r"sessions: (\d+)/(\d+) nodes support them, (\d+) created", log)
+        check(
+            sessions and sessions.groups() == (str(supporting), "3", str(supporting)),
+            f"the first report's sessions, expected {supporting}/3 supporting and created: "
+            f"{sessions and sessions.group(0)}",
+        )
         check(
             re.search(r"^    idle: .*\bquiet\b", log, re.M),
             "the quiet notifier is not listed as idle",
