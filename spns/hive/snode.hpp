@@ -211,6 +211,9 @@ class SNode : public std::enable_shared_from_this<SNode> {
     /// saved state after a restart or kept across a lost connection: they stand until the
     /// session's resumption confirms or refutes them.
     bool resuming = false;
+    /// Set while the claims it holds were restored from saved state and its monitor session has
+    /// yet to confirm or refute them (see HiveMind::settle_restored).
+    bool restored = false;
     std::deque<const SwarmPubkey*> due;
     struct {
         // The swarm_space the scan has reached, so that changes to the swarm's members leave its

@@ -1034,6 +1034,24 @@ def scenario_restart(build_dir):
             f"notifier; {n['entries']} subscriptions sent after the restart, {n['resumed']} "
             f"monitor sessions resumed ({n['resumed_unlisted']} without their listing)"
         )
+        # Said once the last restored node has settled: each node held every account.
+        settled = s.wait_for(
+            lambda: re.search(
+                r"(?:None of the|Restored placements settled:) [^\n]*", s.hivemind.log()
+            ),
+            15,
+            bool,
+        ).group(0)
+        print(f"    {settled}")
+        placements = s.nodes * accounts
+        if MODE == "monitor":
+            want = f"Restored placements settled: {placements} of {placements} kept"
+        else:
+            want = (
+                f"None of the {placements} restored placements was kept: {placements} on nodes "
+                "without monitor sessions"
+            )
+        check(settled.startswith(want), f"expected '{want}...'")
         if MODE == "monitor":
             check(
                 c["pushes"] == gap and c["duplicates"] == 0,

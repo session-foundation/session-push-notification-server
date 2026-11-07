@@ -1521,7 +1521,14 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                 {"accounts", restored_.accounts},
                 {"swarms", restored_.swarms},
                 {"nodes", restored_.slots},
-                {"nodes_dropped", restored_.slots_dropped}};
+                {"nodes_dropped", restored_.slots_dropped},
+                {"placements", restored_.placements},
+                {"kept", restored_.kept},
+                {"ended", restored_.ended},
+                {"no_session", restored_.no_session},
+                {"resume_failed", restored_.resume_failed},
+                {"left", restored_.left},
+                {"pending_nodes", restored_.pending_nodes}};
         result["placements"] = {
                 {"placed", placements_},
                 {"by_scans", scan_placements_},
@@ -1618,6 +1625,21 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         return t >= 3600 ? "{}h{:02}m"_format(t / 3600, t / 60 % 60)
              : t >= 60   ? "{}m{:02}s"_format(t / 60, t % 60)
                          : "{}s"_format(t);
+    };
+    auto restore_settled = [&] {
+        auto dropped = "{} no session, {} resume failed, {} node left swarm, {} monitor ended"_format(
+                num(s, "restored", "no_session"),
+                num(s, "restored", "resume_failed"),
+                num(s, "restored", "left"),
+                num(s, "restored", "ended"));
+        if (num(s, "restored", "kept") == 0 && num(s, "restored", "pending_nodes") == 0)
+            return "none of its {} placements kept ({})"_format(
+                    num(s, "restored", "placements"), dropped);
+        return "of its {} placements, {} kept, dropped {}; {} nodes yet to settle"_format(
+                num(s, "restored", "placements"),
+                num(s, "restored", "kept"),
+                dropped,
+                num(s, "restored", "pending_nodes"));
     };
 
     // The notifiers' own counters (service_stats) are kept across restarts, so they are compared
@@ -1735,11 +1757,12 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                               num(s, "state", "write_ms"))
                     : "not saved yet"s,
             get(s, "restored", "age").is_number()
-                    ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped"_format(
+                    ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
                               num(s, "restored", "accounts"),
                               num(s, "restored", "nodes"),
                               duration(num(s, "restored", "age")),
-                              num(s, "restored", "nodes_dropped"))
+                              num(s, "restored", "nodes_dropped"),
+                              restore_settled())
                     : "restored nothing"s,
             delta("monitor_sessions", "resumed"),
             delta("monitor_sessions", "replay_discarded"),
@@ -2741,7 +2764,7 @@ void HiveMind::leave_swarm(hive::SNode& node) {
         return;
     auto it = swarms_.find(node.swarm);
     auto& swarm = it->second;
-    settle_restored(node, false);
+    settle_restored(node, Settled::left);
     clear_slot(swarm, node);
     swarm.slots[node.slot] = nullptr;
     swarm.nodes--;
@@ -3455,9 +3478,15 @@ void HiveMind::restore_state() {
         auto it = sns_.find(t.first);
         return it == sns_.end() || !it->second->resuming;
     });
-    for (const auto& [pk, node] : sns_)
+    for (const auto& [pk, node] : sns_) {
         if (node->resuming && node->claimed == 0)
             node->resuming = false;
+        if (node->resuming) {
+            node->restored = true;
+            restored_.pending_nodes++;
+            restored_.placements += node->claimed;
+        }
+    }
     auto age = now - system_time{std::chrono::seconds{state.saved_at}};
     restored_.age = std::chrono::duration<double>(age).count();
     log::info(
@@ -3471,17 +3500,57 @@ void HiveMind::restore_state() {
             restored_.slots_dropped);
 }
 
-void HiveMind::settle_restored(const hive::SNode& node, bool confirmed) {
-    if (node.slot < 0 || node.claimed == 0)
+void HiveMind::settle_restored(hive::SNode& node, Settled how) {
+    if (!node.restored)
         return;
-    auto bit = static_cast<uint16_t>(1u << node.slot);
-    for (const auto* account : swarms_.at(node.swarm).members)
-        if (account->restored & bit) {
-            if (confirmed)
-                account->restored = 0;
-            else
-                drop_restored(*account, node.slot);
-        }
+    node.restored = false;
+    // Nothing is placed on a node until its session has settled, so all it claims was restored.
+    size_t held = node.slot >= 0 ? node.claimed : 0;
+    switch (how) {
+        case Settled::kept: restored_.kept += held; break;
+        case Settled::no_session: restored_.no_session += held; break;
+        case Settled::resume_failed: restored_.resume_failed += held; break;
+        case Settled::left: restored_.left += held; break;
+    }
+    if (held > 0) {
+        auto bit = static_cast<uint16_t>(1u << node.slot);
+        for (const auto* account : swarms_.at(node.swarm).members)
+            if (account->restored & bit) {
+                if (how == Settled::kept)
+                    account->restored = 0;
+                else
+                    drop_restored(*account, node.slot);
+            }
+    }
+
+    if (--restored_.pending_nodes > 0)
+        return;
+    auto dropped = restored_.no_session + restored_.resume_failed + restored_.left;
+    if (restored_.kept == 0)
+        log::info(
+                cat,
+                "None of the {} restored placements was kept: {} on nodes without monitor "
+                "sessions, {} on nodes whose sessions did not resume, {} on nodes that left their "
+                "swarm, {} for monitors since ended; every restored account is placed afresh",
+                restored_.placements,
+                restored_.no_session,
+                restored_.resume_failed,
+                restored_.left,
+                restored_.ended);
+    else
+        log::info(
+                cat,
+                "Restored placements settled: {} of {} kept, on nodes whose monitor sessions "
+                "resumed; {} dropped for monitors since ended, {} on nodes without monitor "
+                "sessions, {} on nodes whose sessions did not resume, {} on nodes that left their "
+                "swarm",
+                restored_.kept,
+                restored_.placements,
+                restored_.ended + dropped,
+                restored_.ended,
+                restored_.no_session,
+                restored_.resume_failed,
+                restored_.left);
 }
 
 void HiveMind::drop_restored(const SwarmPubkey& account, int slot) {
@@ -3495,13 +3564,13 @@ void HiveMind::drop_restored(const SwarmPubkey& account, int slot) {
         schedule(account, system_clock::now() + resubscribe_delay());
 }
 
-void HiveMind::abandon_resume(hive::SNode& node) {
+void HiveMind::abandon_resume(hive::SNode& node, Settled why) {
     if (!node.resuming)
         return;
     node.resuming = false;
+    settle_restored(node, why);
     if (node.slot < 0 || node.claimed == 0)
         return;
-    settle_restored(node, false);
     auto& swarm = swarms_.at(node.swarm);
     clear_slot(swarm, node);
     wake(swarm, &node);
@@ -3533,7 +3602,7 @@ void HiveMind::monitor_session_started(
                     "out of date); subscribing everything in a new one",
                     node.pubkey);
         monitor_session_stats_.created++;
-        abandon_resume(node);
+        abandon_resume(node, Settled::resume_failed);
         wake(node);
         return;
     }
@@ -3544,6 +3613,8 @@ void HiveMind::monitor_session_started(
     monitor_session_stats_.resumed++;
     node.resuming = false;
     size_t ended = 0;
+    auto held = node.claimed;
+    bool listed = true;
     try {
         oxenc::bt_list_consumer list{monitors};
         while (!list.is_finished()) {
@@ -3573,10 +3644,16 @@ void HiveMind::monitor_session_started(
                 "everything",
                 node.pubkey,
                 e.what());
-        node.resuming = true;
-        abandon_resume(node);
+        listed = false;
     }
-    settle_restored(node, true);
+    if (node.restored)
+        restored_.ended += held - node.claimed;
+    if (listed)
+        settle_restored(node, Settled::kept);
+    else {
+        node.resuming = true;
+        abandon_resume(node, Settled::resume_failed);
+    }
     monitor_session_stats_.kept += node.claimed;
     monitor_session_stats_.ended += ended;
     log::debug(
@@ -3590,7 +3667,7 @@ void HiveMind::monitor_session_started(
 
 void HiveMind::monitor_session_unsupported(hive::SNode& node) {
     monitor_session_stats_.unsupported++;
-    abandon_resume(node);
+    abandon_resume(node, Settled::no_session);
     wake(node);
 }
 
@@ -3605,7 +3682,7 @@ void HiveMind::monitor_session_failed(hive::SNode& node) {
                 "Forgot our monitor session token for {}: its next one starts afresh",
                 node.pubkey);
     monitor_session_stats_.failed++;
-    abandon_resume(node);
+    abandon_resume(node, Settled::resume_failed);
     wake(node);
 }
 
@@ -3625,7 +3702,7 @@ void HiveMind::on_node_connected(hive::SNode& snode, int gen) {
         return;
     if (!snode.offers_monitor_sessions()) {
         monitor_session_stats_.old_version++;
-        abandon_resume(snode);
+        abandon_resume(snode, Settled::no_session);
         wake(snode);
         return;
     }

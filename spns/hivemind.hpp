@@ -358,16 +358,25 @@ class HiveMind {
     // service node list.
     void restore_state();
     bool restore_tried_ = false;
+    // How a restored node's claims settled: kept, its session resumed; or dropped, the node having
+    // no monitor sessions, its session not resumed, or the node having left its swarm.
+    enum class Settled { kept, no_session, resume_failed, left };
     struct {
         double age = -1;
         size_t accounts = 0, swarms = 0, slots = 0, slots_dropped = 0;
+        // The placements restored, and how those settled went (see Settled), with the monitors
+        // a resumed session reported ended dropped from its kept; and the restored nodes yet to
+        // settle.
+        size_t placements = 0, kept = 0, ended = 0, no_session = 0, resume_failed = 0, left = 0;
+        size_t pending_nodes = 0;
     } restored_;
     // Gives up the claims a node holds for its monitor session to be resumed, when it was not
-    // resumed after all.
-    void abandon_resume(hive::SNode& node);
-    // Settles the restored claims (see SwarmPubkey::restored) a node holds: confirmed, its session
-    // resumed, or about to be released, which drops each with drop_restored().
-    void settle_restored(const hive::SNode& node, bool confirmed);
+    // resumed after all, for the reason given.
+    void abandon_resume(hive::SNode& node, Settled why);
+    // Settles the restored claims (see SwarmPubkey::restored) a restored node holds: kept, its
+    // session resumed, or about to be released, which drops each with drop_restored().  Logs how
+    // the restored placements went once the last restored node has settled.
+    void settle_restored(hive::SNode& node, Settled how);
     // Drops `account`'s restored claim on `slot`, if it has one, ahead of the claim's release:
     // once it has none left, it is renewed as for a placement made now.
     void drop_restored(const SwarmPubkey& account, int slot);
