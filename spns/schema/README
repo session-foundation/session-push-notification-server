@@ -1,0 +1,52 @@
+The hivemind's database schema.  The hivemind brings the database up to date itself when it starts,
+before anything else uses it (see spns/migrations.hpp); nothing here is applied by hand.  The files
+are built into the hivemind (cmake/SpnsSchema.cmake), so it reads none of them at run time, and
+adding, removing or editing one re-runs CMake.
+
+full_schema.sql is the schema as it stands after every migration here, in one piece: it is what to
+read to see the current schema.  A database with none of the migrations recorded, and none of the
+hivemind's tables, is created from it in one step, and every migration is recorded as applied
+without being run.  It must be kept in step with the migrations: built from it alone and from the
+migrations alone, a database must come out the same, which the e2e "schema" scenario checks.  Column
+order counts in that comparison, so a column that a migration adds goes last in its table here too.
+
+Every other file here beginning with a number and ending with .sql is a one-time migration, run in
+order against the `migrations_applied` table: if its name is not there, it is run, and its name
+inserted, in one transaction, which is rolled back if it fails (and the hivemind does not start).
+A migration does not begin a transaction of its own.  Each run happens under an advisory lock, so
+two hiveminds starting at once cannot both apply one.
+
+The order is by migration *name* -- the filename without its .sql, which is what is recorded in
+`migrations_applied` -- not by filename.  This matters when one name is a prefix of another: sorting
+filenames would order `001_foo+002.sql` before `001_foo.sql`, because '+' sorts below '.'.  Sorting
+names makes it a prefix comparison, so the shorter name always runs first.
+
+Name migrations `NNN_description_of_migration.sql`, such as `003_device_tables.sql`.  A migration
+that depends on earlier ones must use a larger `NNN` than they do.
+
+000 to 002 are written to run against a database made before migrations were recorded, which has the
+tables but no `migrations_applied`: each statement is a no-op where its change is there already.
+Such a database has them run and recorded (not full_schema.sql, as it has tables already).  Later
+migrations need not be idempotent, as they only ever run once, against a recorded database.
+
+
+Iterating on a branch
+---------------------
+
+While developing a schema change you generally want to keep updating a database you have already
+been using, rather than recreating it after every edit.  To do that, name the first migration what
+the finished one will be called, and add addenda alongside it as you go:
+
+    003_new_feature.sql
+    003_new_feature+001.sql
+    003_new_feature+002.sql
+
+Before merging, fold the addenda back into `003_new_feature.sql` and delete them.  Because your
+database recorded `003_new_feature` when you first created that file, the squashed migration is
+already applied and is not re-run: your development database survives the squash.  The orphaned
+`003_new_feature+NNN` rows left in `migrations_applied` are ignored, since only names present in the
+registry are ever consulted.
+
+If instead you name the first file something you later rename, the squash leaves your development
+database out of step and you have to recreate it -- a nuisance rather than a problem, but easily
+avoided.

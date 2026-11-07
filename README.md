@@ -42,7 +42,9 @@ SPNS is a mix of Python and C++ with a postgresql database for persistent storag
 manages connections to the swarm, processes messages, and interacts with the database is C++, with
 some bits of Python for initialization and dealing with configuration files.  The web front-end
 (which proxies subscriptions from clients to the core) and the code that communicates with the
-notification services are written in Python.
+notification services are written in Python.  The hivemind creates the database's tables itself
+when it starts, and applies any schema migrations a new version brings (see `spns/schema/README`):
+the database must exist, and its user be able to create tables in it.
 
 These components run independently, but communicate together using OxenMQ: there is one main
 high-performance process, called "hivemind", which provides an interface for notifier services and

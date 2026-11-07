@@ -16,15 +16,16 @@ make e2e-slow                             # the three slow ones
 E2E_SUSTAINED_MINUTES=2 make e2e-sustained
 ```
 
-These targets of the project's build build the hivemind and the three fakes (which nothing else
-builds) and run `e2e.py` against them; further `e2e.py` options go through `E2E_ARGS`, e.g.
+These targets of the project's build build the hivemind, the three fakes and `migrate_schema` (which
+nothing else builds) and run `e2e.py` against them; further `e2e.py` options go through `E2E_ARGS`, e.g.
 `make e2e-fast E2E_ARGS="--db other"`. For a sanitizer run, configure a build with
 `-fsanitize=thread` (or `address`) in `CMAKE_CXX_FLAGS` and the linker flags and run its e2e
 targets: the harness stretches its timeouts, skips the timing limits and fails a scenario on any
 report. It needs `python3-psycopg`, plus the Python modules the hivemind loads (`python3-nacl`,
 `python3-coloredlogs`), and a Postgres database it may empty, reached through the usual libpq
 environment (`PGHOST`, `PGUSER`, ...): `spns_e2e` unless `--db` says otherwise, created once
-beforehand (`createdb spns_e2e`), and emptied before every scenario. It is Linux only, reading the
+beforehand (`createdb spns_e2e`), and emptied before every scenario, which then has `migrate_schema`
+create the hivemind's tables in it as the hivemind does at startup. It is Linux only, reading the
 hivemind's memory and CPU use from `/proc`. Sockets, config and logs go in a temporary directory
 (`--work-dir`), and the fakes listen on ports 22029 and 23000 upwards (`--oxend-port`,
 `--quic-port`). The exit code is non-zero if any scenario fails, and a failing scenario prints the
@@ -48,6 +49,7 @@ Fast:
 
 | scenario | checks |
 |---|---|
+| `schema` | `spns/schema/full_schema.sql` builds what the migrations build in order, column by column, constraints and indexes; the hivemind's migration step creates a new database from `full_schema.sql` and records every migration, brings a database in production's state from before migrations level with it and records them (keeping its rows), and applies nothing the next time |
 | `correctness` | one push per device per message across duplicate copies; namespaces, data, svcdata, two devices, expiry, unknown accounts; subscribe, drop and unsubscribe at runtime |
 | `burst` | 50,000 subscriptions, 5 nodes each sending the same 20,000 notifications at once: all 20,000 arrive, once each |
 | `resend` | the notifier stops reading (SIGSTOP) mid-burst: its window fills, and once it resumes nothing is lost |
@@ -94,6 +96,9 @@ Docker's seccomp filter, which refuses the `setarch -R` it needs.
 - `fake_notifier`: registers as the `dummy` notifier, accepts any `service_info.token` as the
   service id, answers `notifier.ack`, and records every push, with its `L` if it has one.
 - `fake_client`: signs subscribe and unsubscribe requests for deterministic `05` accounts.
+- `migrate_schema`: not a fake, but the hivemind's own migration step (`spns/migrations.hpp`), run
+  against a database (and schema) on its own, for `e2e.py` to create the tables before it seeds
+  them, and the `schema` scenario to check it.
 
 Each reads commands on stdin and answers on stdout; the comment at the top of each file lists them.
 `e2e.py` seeds the database directly, with account `#i` being `03 || SHA256(big-endian i)`, the same

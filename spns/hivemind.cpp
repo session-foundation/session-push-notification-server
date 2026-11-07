@@ -35,6 +35,7 @@
 #include "blake2b.hpp"
 #include "hive/signature.hpp"
 #include "hive/subscription.hpp"
+#include "migrations.hpp"
 
 namespace spns {
 
@@ -59,6 +60,9 @@ HiveMind::HiveMind(Config conf_in) :
                 std::string{config.omq_privkey.sv()},
                 false,
                 nullptr} {
+
+    sd_notify(0, "STATUS=Migrating database");
+    schema::apply_migrations(*pool_.get());
 
     // fiddle_rlimit_nofile();
 
