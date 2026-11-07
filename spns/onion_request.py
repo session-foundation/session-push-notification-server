@@ -1,15 +1,11 @@
 from flask import request, abort
+from http import HTTPStatus
 import json
 from typing import Tuple
 
-from . import config
+from . import config, onion_decrypt
 from .web import app
 from .subrequest import make_subrequest
-
-from session_util.onionreq import OnionReqParser
-
-onion_privkey_bytes = config.PRIVKEYS["onionreq"].encode()
-onion_pubkey_bytes = config.PUBKEYS["onionreq"].encode()
 
 def bencode_consume_string(body: memoryview) -> Tuple[memoryview, memoryview]:
     """
@@ -68,7 +64,7 @@ def handle_v4_onionreq_plaintext(body):
 
     except Exception as e:
         app.logger.warning("Invalid v4 onion request: {}".format(e))
-        meta = {'code': http.BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
+        meta = {'code': HTTPStatus.BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
         data = b'Invalid v4 onion request'
 
     meta = json.dumps(meta).encode()
@@ -79,13 +75,12 @@ def handle_v4_onionreq_plaintext(body):
 
 def decrypt_onionreq():
     try:
-        return OnionReqParser(
-            onion_pubkey_bytes,
-            onion_privkey_bytes,
-            request.data)
-    except Exception as e:
-        app.logger.warning("Failed to decrypt onion request: {}".format(e))
-    abort(http.BAD_REQUEST)
+        parser, key = onion_decrypt.decrypt(request.data, config.ONIONREQ_KEYS)
+    except ValueError as e:
+        app.logger.warning(f"Failed to decrypt onion request: {e}")
+        abort(HTTPStatus.BAD_REQUEST)
+    app.logger.debug(f"Decrypted onion request with the {key} key")
+    return parser
 
 
 @app.post("/oxen/v4/lsrpc")

@@ -8,7 +8,7 @@ import traceback
 import time
 import signal
 import systemd.daemon
-from .util import derive_notifier_key, warn_on_except
+from .util import derive_notifier_key, register_notifier, warn_on_except
 from .. import config
 from ..config import logger
 from spns_hivemind import SUBSCRIBE
@@ -59,8 +59,14 @@ def validate(msg: Message):
 @warn_on_except
 def push_notification(msg: Message):
     data = oxenc.bt_deserialize(msg.data()[0])
+    if b"}" in data:
+        body = f"{len(data[b'~'])}B of {data[b'}']}B" if b"~" in data else f"too large: {data[b'}']}B"
+    elif b"~" in data:
+        body = f"{len(data[b'~'])}B"
+    else:
+        body = "no data"
     logger.critical(
-        f"Dummy notifier received push for {data[b'&']}, enc_key {data[b'^']}, message hash {data[b'#']} ({len(data[b'~'])}B) for account {data[b'@'].hex()}/{data[b'n']}"
+        f"Dummy notifier received push for {data[b'&']}, enc_key {data[b'^']}, message hash {data[b'#']} ({body}) for account {data[b'@'].hex()}/{data[b'n']}"
     )
     global stats_lock, notifies
     with stats_lock:
@@ -77,7 +83,7 @@ def ping():
         notifies, failures = 0, 0
 
     logger.debug(f"dummy re-registering and reporting stats {report}")
-    omq.send(hivemind, "admin.register_service", "dummy")
+    register_notifier(omq, hivemind, "dummy")
     omq.send(hivemind, "admin.service_stats", "dummy", oxenc.bt_serialize(report))
     systemd.daemon.notify(
         f"WATCHDOG=1\nSTATUS=Running; {total_notifies} notifications, {total_failures} failures"
@@ -97,6 +103,7 @@ def connect_to_hivemind():
     cat = omq.add_category("notifier", AuthLevel.basic)
     cat.add_request_command("validate", validate)
     cat.add_command("push", push_notification)
+    cat.add_request_command("ack", lambda msg: msg.reply())
 
     omq.add_timer(ping, timedelta(seconds=5))
 
@@ -106,7 +113,7 @@ def connect_to_hivemind():
         Address(config.config.hivemind_sock), auth_level=AuthLevel.basic, ephemeral_routing_id=False
     )
 
-    omq.send(hivemind, "admin.register_service", "dummy")
+    register_notifier(omq, hivemind, "dummy")
 
 
 def disconnect():

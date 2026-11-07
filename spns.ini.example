@@ -39,8 +39,12 @@ max_connects = 1000
 
 # We use a time-based filter on notifications to avoid sending duplicate notifications; this timer
 # controls the minimum time for which we will filter duplicates.  (In practice, the filter will
-# often last somewhat longer than this, but this is the minimum).
-filter_lifetime = 300
+# often last somewhat longer than this, but this is the minimum).  It must outlast the oldest a
+# notification can be when it reaches us: one replayed after a monitor session is resumed can be
+# about 13 minutes old (the 10 minutes a detached session lasts, plus the reconnection and the
+# storage server's cleanup timer), and a duplicate of one already pushed must still be recognised
+# then.  The filter keeps two generations of hashes, so a longer lifetime costs a little memory.
+filter_lifetime = 900
 
 # How long the main hivemind process will wait at startup before establishing connections to
 # the network's service nodes.  This delay is designed to allow subordinate notification processes
@@ -53,6 +57,42 @@ startup_wait = 8.0
 # we have received notifier registrations for all the notifiers listed here.  (Note that even when
 # this is set other notifiers can still register, they just aren't required for startup to proceed).
 #notifiers_expected = apns,firebase
+
+# The most bytes of a message body that reach a device, for subscriptions that want data.  A bigger
+# message reaches a subscription that opted in to truncated bodies cut to this many bytes, with its
+# full size, and any other as its size alone, flagged as too large.  Must be positive; 2500 is the
+# most the push services accept once the body is encrypted and encoded, and a larger value makes
+# them reject the notifications of bigger messages, so is only for testing.
+#body_limit = 2500
+
+# How many of its swarm's nodes each account is subscribed on, at most the swarm's size: -1, the
+# default, for all of them, or a positive number.  Fewer means fewer subscriptions to make and
+# renew, and fewer duplicate notifications from the swarm, at the cost of an account's
+# notifications depending on fewer nodes' connections.  The accounts go to the nodes holding the
+# fewest.
+#redundancy = -1
+
+# The most notifications per account a storage server keeps while our monitor session with it is
+# detached, and replays when it is resumed, after a reconnection or a quick restart: the newest of
+# them, the rest being lost, as push notifications are best effort.
+#resume_replay = 10
+
+# For testing only: seconds between an account's renewals, within a tenth either side, instead of
+# 45-55 minutes; it must stay well below the 65 minutes a storage server keeps a monitor.
+#renewal_interval = 60
+
+# The most monitor (subscription) requests in flight at once across all storage servers, and how
+# many seconds one may go unanswered before it is retried; both must be positive.  The defaults,
+# shown here, suit production.
+#monitor_requests = 64
+#monitor_timeout = 600
+
+# Seconds between the multi-line status reports in the log; at least 2.
+#status_report_interval = 300
+
+# A file to write each status report to as well, as Markdown, replacing the one before; by default
+# none.
+#status_report_file = /var/lib/spns/status-report.md
 
 
 [keys]
@@ -68,9 +108,15 @@ startup_wait = 8.0
 hivemind = key_x25519
 onionreq = onionreq_x25519
 
-# This key is the Ed25519 used for the QUIC listener, if QUIC listening is enabled via the
-# [hivemind] quic_listen option.  You can create it using `session-router-config --key FILENAME`
-# (from the session-router-bin package).
+# This key is required: the Ed25519 key used for our connections to storage servers, and for the
+# QUIC listener, if QUIC listening is enabled via the [hivemind] quic_listen option.  Its pubkey is
+# what storage servers recognise as the privileged push server's: its monitor sessions get the large
+# limits and their own pool of missed notifications, where an unrecognised key gets a small
+# anonymous session.  Its pubkey also serves as an Ed25519 onion request key, alongside `onionreq`:
+# clients encrypt to its X25519 conversion, so that they can use the one Ed25519 pubkey for
+# session-router, QUIC and onion requests.  Each onion request is tried with `onionreq` first, if
+# set, then with this.  You can create it using `session-router-config --key FILENAME` (from the
+# session-router-bin package).
 quic = key_ed25519
 
 [notify-firebase]

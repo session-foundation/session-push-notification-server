@@ -3,7 +3,13 @@
 from .. import config
 from ..config import logger
 from spns_hivemind import SUBSCRIBE
-from .util import encrypt_notify_payload, derive_notifier_key, warn_on_except, NotifyStats
+from .util import (
+    encrypt_notify_payload,
+    derive_notifier_key,
+    register_notifier,
+    warn_on_except,
+    NotifyStats,
+)
 
 from hms.src import push_admin
 from hms.src.push_admin import messaging as huawei_messaging
@@ -29,11 +35,6 @@ queue_timer = None
 # Whenever we add/change fields we increment this so that a Session client could figure out what it
 # is speaking to:
 SPNS_HUAWEI_VERSION = 1
-
-# If our JSON payload hits 4000 bytes then Huawei will reject it, so we limit ourselves to this size
-# *before* encryption + base64 encoding.  If the source message exceeds this, we send an alternative
-# "too big" response in the metadata instead of including the message.
-MAX_MSG_SIZE = 2500
 
 # Firebase max simultaneous notifications:
 MAX_NOTIFIES = 500
@@ -68,7 +69,7 @@ def validate(msg: Message):
 def push_notification(msg: Message):
     data = oxenc.bt_deserialize(msg.data()[0])
 
-    enc_payload = encrypt_notify_payload(data, max_msg_size=MAX_MSG_SIZE)
+    enc_payload = encrypt_notify_payload(data)
 
     device_token = data[b"&"].decode()  # unique service id, as we returned from validate
 
@@ -107,7 +108,7 @@ def send_pending():
 @warn_on_except
 def ping():
     global omq, hivemind, stats
-    omq.send(hivemind, "admin.register_service", "huawei")
+    register_notifier(omq, hivemind, "huawei")
     omq.send(hivemind, "admin.service_stats", "huawei", oxenc.bt_serialize(stats.collect()))
     systemd.daemon.notify(
         f"WATCHDOG=1\nSTATUS=Running; {stats.total_notifies} notifications, "
@@ -130,6 +131,7 @@ def start():
     cat = omq.add_category("notifier", AuthLevel.basic)
     cat.add_request_command("validate", validate)
     cat.add_command("push", push_notification)
+    cat.add_request_command("ack", lambda msg: msg.reply())
 
     omq.add_timer(ping, datetime.timedelta(seconds=5))
 
@@ -148,7 +150,7 @@ def start():
 
     huawei_push_admin = push_admin.initialize_app(conf["app_id"], conf["app_secret"])
 
-    omq.send(hivemind, "admin.register_service", "huawei")
+    register_notifier(omq, hivemind, "huawei")
 
 
 def disconnect(flush_pending=True):

@@ -115,11 +115,10 @@ PYBIND11_MODULE(spns_hivemind, m) {
             .def_readwrite(
                     "quic_keys",
                     &Config::quic_keys,
-                    "Ed25519 combined secret key + pubkey value (64 bytes), used for QUIC.")
+                    "Ed25519 combined secret key + pubkey value (64 bytes), used for QUIC; must be "
+                    "set (the default value will not work)")
             .def_readwrite(
-                    "quic_listen",
-                    &Config::quic_listen,
-                    "Optional listen addresses for quic (requires that `quic_key` is set)")
+                    "quic_listen", &Config::quic_listen, "Optional listen addresses for quic")
             .def_property(
                     "filter_lifetime",
                     [](Config& self) { return self.filter_lifetime.count(); },
@@ -139,6 +138,65 @@ PYBIND11_MODULE(spns_hivemind, m) {
                     "Set of notification services that we expect; if non-empty then we will stop "
                     "the `notifier_wait` time early once we have registered notifiers for all the "
                     "values set here.")
+            .def_readwrite(
+                    "monitor_body_limit",
+                    &Config::monitor_body_limit,
+                    "most bytes of a message body that reach a device, for subscriptions that want "
+                    "data; a bigger message is pushed cut to this, with its full size, to "
+                    "subscriptions that opted in to truncated bodies, and as its size alone to the "
+                    "rest.  Must be positive; the default of 2500 is the most the push services "
+                    "accept once the body is encrypted and encoded, and larger is only for testing.")
+            .def_readwrite(
+                    "redundancy",
+                    &Config::redundancy,
+                    "how many of its swarm's nodes each account is subscribed on, at most the "
+                    "swarm's size: -1 for all of them, or a positive number")
+            .def_readwrite(
+                    "resume_replay",
+                    &Config::resume_replay,
+                    "most notifications per account a node replays when our monitor session with "
+                    "it is resumed: the newest, the rest lost")
+            .def_property(
+                    "renewal_interval",
+                    [](Config& self) -> std::optional<int64_t> {
+                        if (self.renewal_interval)
+                            return self.renewal_interval->count();
+                        return std::nullopt;
+                    },
+                    [](Config& self, std::optional<int64_t> secs) {
+                        if (secs)
+                            self.renewal_interval = std::chrono::seconds{*secs};
+                        else
+                            self.renewal_interval.reset();
+                    },
+                    "seconds between an account's renewals, if not 45-55 minutes: for testing; "
+                    "None for the default")
+            .def_readwrite(
+                    "monitor_requests",
+                    &Config::monitor_requests,
+                    "most monitor requests in flight at once across all nodes; must be positive")
+            .def_property(
+                    "monitor_timeout",
+                    [](Config& self) {
+                        return std::chrono::duration<double>(self.monitor_timeout).count();
+                    },
+                    [](Config& self, double seconds) {
+                        self.monitor_timeout =
+                                std::chrono::milliseconds{static_cast<int64_t>(seconds * 1000)};
+                    },
+                    "seconds a monitor request may go unanswered before it counts as failed; must "
+                    "be positive")
+            .def_property(
+                    "status_report_interval",
+                    [](Config& self) { return self.status_report_interval.count(); },
+                    [](Config& self, int64_t seconds) {
+                        self.status_report_interval = std::chrono::seconds{seconds};
+                    },
+                    "seconds between status reports in the log; at least 2")
+            .def_readwrite(
+                    "status_report_file",
+                    &Config::status_report_file,
+                    "file each status report is written to as well, as Markdown; empty for none")
             .def_readwrite(
                     "max_pending_connects",
                     &Config::max_pending_connects,

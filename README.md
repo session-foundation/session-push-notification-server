@@ -42,7 +42,9 @@ SPNS is a mix of Python and C++ with a postgresql database for persistent storag
 manages connections to the swarm, processes messages, and interacts with the database is C++, with
 some bits of Python for initialization and dealing with configuration files.  The web front-end
 (which proxies subscriptions from clients to the core) and the code that communicates with the
-notification services are written in Python.
+notification services are written in Python.  The hivemind creates the database's tables itself
+when it starts, and applies any schema migrations a new version brings (see `spns/schema/README`):
+the database must exist, and its user be able to create tables in it.
 
 These components run independently, but communicate together using OxenMQ: there is one main
 high-performance process, called "hivemind", which provides an interface for notifier services and
@@ -132,7 +134,8 @@ start from the `cmake ..` step).
 A `spns.ini.example` file is included in the project root; you should copy this to `spns.ini` and
 edit it to suite your requirements.  The settings inside it are full of comments to guide you
 further in this initial setup, including details on how to create the necessary key for receiving
-onion requests.
+onion requests, and the required QUIC key (`[keys]` `quic`) the hivemind presents to storage
+servers: its pubkey is what storage servers recognise as the privileged push server's.
 
 The notifiers require various magic special files obtained after pleading with the powers that be to
 oh-please-let-us-into-your-blessed-walled-garden!  Here there be dragons because the business model

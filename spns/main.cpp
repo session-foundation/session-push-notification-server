@@ -3,6 +3,7 @@
 #include <pybind11/pytypes.h>
 
 #include <csignal>
+#include <optional>
 #include <oxen/log.hpp>
 
 #include "config.hpp"
@@ -60,7 +61,13 @@ int main(int argc, char** argv) {
     }
 
     log::info(cat, "Initializing hivemind");
-    spns::HiveMind hivemind{std::move(conf)};
+    std::optional<spns::HiveMind> hivemind;
+    try {
+        hivemind.emplace(std::move(conf));
+    } catch (const std::exception& e) {
+        log::critical(cat, "Failed to start the hivemind: {}", e.what());
+        return 1;
+    }
     log::info(cat, "Hivemind started");
 
     // We don't need any signal handler: when a SIGINT/SIGTERM comes in we just catch it here, stop

@@ -8,6 +8,7 @@ from nacl.bindings import (
 )
 from oxenc import bt_serialize, bt_deserialize, to_base64
 import json
+import os
 from threading import Lock
 import time
 from collections import deque
@@ -28,6 +29,50 @@ def derive_notifier_key(name):
     )
 
 
+# The notifier registration protocol we speak (see the hivemind's register_notifier).
+NOTIFIER_PROTOCOL_VERSION = 1
+
+# The largest body we can deliver: the most the push services' payload caps leave room for, once it
+# is encrypted and encoded.
+MAX_BODY = 2500
+
+
+def register_notifier(omq, hivemind, service: str):
+    """
+    Registers `service` with the hivemind.  A refusal, or any failure but a timeout, means this
+    notifier cannot work with this hivemind, so it ends the process; a timeout (which a lost
+    connection also gives) is only a warning, as the hivemind may be down or restarting, and the
+    periodic re-registration tries again.
+    """
+
+    def on_reply(data):
+        if data:
+            config.logger.critical(
+                f"The hivemind refused the {service} notifier: {bytes(data[0]).decode(errors='replace')}"
+            )
+            # This runs on an oxenmq thread, where sys.exit() would end only the thread.
+            os._exit(1)
+
+    def on_reply_failure(data):
+        reason = [bytes(d) for d in data]
+        if reason == [b"TIMEOUT"]:
+            config.logger.warning(
+                f"No reply from the hivemind to the {service} notifier's registration"
+            )
+            return
+        config.logger.critical(f"The {service} notifier's registration failed: {reason}")
+        os._exit(1)
+
+    omq.request(
+        hivemind,
+        "admin.register_notifier",
+        service,
+        bt_serialize({"": NOTIFIER_PROTOCOL_VERSION, "max_body": MAX_BODY}),
+        on_reply=on_reply,
+        on_reply_failure=on_reply_failure,
+    )
+
+
 def encrypt_payload(msg: bytes, enc_key: bytes):
     nonce = nacl.utils.random(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES)
     ciphertext = crypto_aead_xchacha20poly1305_ietf_encrypt(
@@ -36,17 +81,19 @@ def encrypt_payload(msg: bytes, enc_key: bytes):
     return nonce + ciphertext
 
 
-def encrypt_notify_payload(data: dict, max_msg_size: int = 2500, broken_nobody_hack: bool = False):
+def encrypt_notify_payload(data: dict, broken_nobody_hack: bool = False):
     enc_key = data[b"^"]
 
     metadata = {"@": data[b"@"].hex(), "#": data[b"#"].decode(), "n": data[b"n"], "t": data[b"t"], "z": data[b"z"]}
     body = data.get(b"~")
 
-    if body:
-        metadata["l"] = len(body)
-        if max_msg_size >= 0 and len(body) > max_msg_size:
+    if b"}" in data:
+        # The message is over the hivemind's body limit: any body is only its first part.
+        metadata["l"] = data[b"}"]
+        if not body:
             metadata["B"] = True
-            body = None
+    elif body:
+        metadata["l"] = len(body)
 
     metadata_json = json.dumps(metadata)
     payload = bt_serialize([metadata_json, body] if body else [metadata if broken_nobody_hack else metadata_json])

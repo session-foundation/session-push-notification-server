@@ -18,6 +18,13 @@ coloredlogs.install(milliseconds=True, isatty=True, logger=logger)
 PRIVKEYS = {}
 PUBKEYS = {}
 
+# The keys an onion request may be encrypted to, as (key name, X25519 pubkey bytes, X25519 privkey
+# bytes), in the order they are tried: "onionreq", then the X25519 conversion of the "quic" Ed25519
+# key, which lets a client use the hivemind's one Ed25519 pubkey for session-router, QUIC and onion
+# requests.  Today's clients all use the first, so only those that have moved to the second pay
+# for a failed trial.
+ONIONREQ_KEYS = []
+
 # We stash anything in a `[notify-xyz]` into `NOTIFY['xyz']` for notifiers to piggyback on the
 # config.
 NOTIFY = {}
@@ -92,6 +99,42 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
         "hivemind": {
             "subs_interval": ("subs_interval", None, int),
             "max_connects": ("max_pending_connects", None, int),
+            "body_limit": (
+                "monitor_body_limit",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) > 0,
+                int,
+            ),
+            "redundancy": (
+                "redundancy",
+                lambda x: re.fullmatch(r"\s*(-1|\d+)\s*", x) and int(x) != 0,
+                int,
+            ),
+            "resume_replay": (
+                "resume_replay",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) > 0,
+                int,
+            ),
+            "renewal_interval": (
+                "renewal_interval",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and 0 < int(x) < 3600,
+                int,
+            ),
+            "monitor_requests": (
+                "monitor_requests",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) > 0,
+                int,
+            ),
+            "monitor_timeout": (
+                "monitor_timeout",
+                lambda x: re.fullmatch(r"\s*\d+(\.\d*)?\s*", x) and float(x) > 0,
+                float,
+            ),
+            "status_report_interval": (
+                "status_report_interval",
+                lambda x: re.fullmatch(r"\s*\d+\s*", x) and int(x) >= 2,
+                int,
+            ),
+            "status_report_file": ("status_report_file",),
             "filter_lifetime": ("filter_lifetime", None, int),
             "startup_wait": ("notifier_wait", None, lambda x: round(1000 * float(x))),
             "notifiers_expected": (
@@ -143,6 +186,8 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
         logger.debug(f"Set config.{conf[0]} = {value}")
         setattr(config, conf[0], value)
 
+    PRIVKEYS.clear()
+    PUBKEYS.clear()
     for s in cp.sections():
         if s == "keys":
             for opt in cp["keys"]:
@@ -192,6 +237,11 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
                     logger.info(
                         f"Loaded {opt} keypair with pubkey {PUBKEYS[opt].encode().hex()}"
                     )
+                    if opt == "quic":
+                        x_pub = PRIVKEYS[opt].to_curve25519_private_key().public_key
+                        logger.info(
+                            f"... which is onion request X25519 pubkey {x_pub.encode().hex()}"
+                        )
         elif s == "log":
             for opt in cp["log"]:
                 if opt == "level":
@@ -220,7 +270,19 @@ def load_config(conf_ini: str | None = None) -> spns_hivemind.Config:
     config.omq_privkey = PRIVKEYS["hivemind"].encode()
     config.omq_pubkey = PUBKEYS["hivemind"].encode()
 
-    if "quic" in PRIVKEYS:
-        config.quic_keys = PRIVKEYS["quic"].encode() + PUBKEYS["quic"].encode()
+    if "quic" not in PRIVKEYS:
+        raise RuntimeError(
+            f"[keys] quic is required in {conf_ini}: the hivemind's Ed25519 key, whose pubkey "
+            "storage servers recognise as the privileged push server's"
+        )
+    config.quic_keys = PRIVKEYS["quic"].encode() + PUBKEYS["quic"].encode()
+
+    ONIONREQ_KEYS.clear()
+    if "onionreq" in PRIVKEYS:
+        ONIONREQ_KEYS.append(
+            ("onionreq", PUBKEYS["onionreq"].encode(), PRIVKEYS["onionreq"].encode())
+        )
+    x_priv = PRIVKEYS["quic"].to_curve25519_private_key()
+    ONIONREQ_KEYS.append(("quic", x_priv.public_key.encode(), x_priv.encode()))
 
     return config

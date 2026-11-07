@@ -14,20 +14,26 @@
 #include <oxenmq/message.h>
 #include <oxenmq/oxenmq.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
+#include <oxen/quic/btstream.hpp>
 #include <oxen/quic/crypto.hpp>
 #include <oxen/quic/endpoint.hpp>
 #include <oxen/quic/loop.hpp>
-#include <oxenmq/zmq.hpp>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -48,12 +54,6 @@ namespace quic = oxen::quic;
 
 using namespace quic::literals;
 
-
-// How long until we expire subscriptions (relative to the signature timestamp).  This can be no
-// more than 14 days (because that's the subscription cutoff for storage server), but can also be
-// less.
-inline constexpr auto SIGNATURE_EXPIRY = 14 * 24h;
-
 // How much we allow an unsubscribe signature timestamp to be off before we reject it
 inline constexpr auto UNSUBSCRIBE_GRACE = 24h;
 
@@ -65,6 +65,59 @@ inline constexpr size_t SERVICE_ID_MAX_SIZE = 999;
 inline constexpr size_t SERVICE_DATA_MAX_SIZE = 99'999;
 inline constexpr size_t MSG_DATA_MAX_SIZE = 75_ki;  // Storage server limit
 
+// Maximum bytes of incoming message notifications waiting for the processing thread; beyond this
+// they are dropped.  Bounds what waits while processing is held up, e.g. by a stalled notifier.
+inline constexpr size_t NOTIFY_QUEUE_MAX_BYTES = 256_Mi;
+
+// A batch of notifications looks up its accounts' subscriptions in queries of at most this many
+// accounts each.  If the lookup fails, the batch is tried again after this long.
+inline constexpr size_t SUBSCRIPTION_LOOKUP_BATCH = 1000;
+inline constexpr auto NOTIFY_LOOKUP_RETRY = 1s;
+
+// Maximum pushes held per service while its notifier cannot take them (the window below is full,
+// or its connection is gone); beyond this the service's new pushes are dropped.
+inline constexpr size_t PUSH_BACKLOG_MAX = 50_k;
+
+// Push flow control.  Every PUSH_ACK_INTERVAL-th push to a service is followed by a notifier.ack
+// request, which the notifier answers once it has taken everything queued before it, and pushes to
+// the service stop while PUSH_WINDOW are unacknowledged.  The window plus two outstanding acks must
+// fit the notifier's oxenmq queue for its category (200 by default; see register_notifier), and
+// sits far below zmq's 1000-message send queue so that neither a push nor an ack is ever refused.
+inline constexpr size_t PUSH_ACK_INTERVAL = 95;
+inline constexpr size_t PUSH_WINDOW = 2 * PUSH_ACK_INTERVAL;
+
+// How often a service whose window has filled is reported.
+inline constexpr auto PUSH_BLOCKED_REPORT_INTERVAL = 30s;
+
+// A notifier whose connection failed has this long to register again before its backlog is
+// dropped and it is treated as any unregistered service.
+inline constexpr auto NOTIFIER_GONE_LIMIT = 5min;
+
+// The notifier registration protocol a notifier must speak to be registered (see
+// register_notifier).
+inline constexpr int NOTIFIER_PROTOCOL_VERSION = 1;
+
+// An account restored from saved state is renewed at the latest this long before its monitors,
+// last renewed when it was last acknowledged, would expire.
+inline constexpr auto RESUME_MARGIN = 5min;
+
+// How often the hivemind saves its placements and monitor session tokens (see save_state()).
+inline constexpr auto DUMP_INTERVAL = 5min;
+
+// How often coverage is logged while a fill is in progress (see log_coverage_progress()), and the
+// share of the accounts whose coverage must change between two lines for that alone to count as
+// one.
+inline constexpr auto COVERAGE_LOG_INTERVAL = 15s;
+inline constexpr double COVERAGE_CHANGE_SHARE = 0.001;
+
+// How old saved state may be for a restart to resume from it.  A monitor lasts 65 minutes from its
+// last renewal and renewals come every 45-55 minutes, so anything acknowledged in the 55 minutes
+// before a save made this long ago is live for at least 10 minutes yet.
+inline constexpr auto RESUME_MAX_AGE = 10min;
+
+// oxend drops a block subscription that has not been renewed for 30 minutes.
+inline constexpr auto OXEND_BLOCK_SUB_INTERVAL = 5min;
+
 // Parameters for our request to get service node data:
 inline constexpr auto _get_sns_params = R"({
   "active_only": true,
@@ -74,7 +127,8 @@ inline constexpr auto _get_sns_params = R"({
     "storage_lmq_port": true,
     "swarm_id": true,
     "block_hash": true,
-    "height": true
+    "height": true,
+    "storage_server_version": true
   }
 })";
 
@@ -125,12 +179,73 @@ class HiveMind {
     const Config config;
 
   private:
-    // std::mutex mutex_;
-    //  OxenMQ server for internal communications, proxied subscriptions, etc.
-    oxenmq::OxenMQ omq_;
+    // Message notifications waiting for process_notifications().  The QUIC loop only appends
+    // here: a notification is parsed, looked up and sent on the processing thread, so that the
+    // QUIC loop keeps reading from every service node however long that takes.
+    std::mutex notify_mutex_;
+    std::condition_variable notify_cv_;
+    std::vector<quic::message> notify_queue_;
+    size_t notify_queue_bytes_ = 0;
+    // The most notifications, and bytes, the queue has held since the last status report (which
+    // resets them).
+    size_t notify_queue_peak_ = 0, notify_queue_peak_bytes_ = 0;
+    std::atomic<int64_t> notifications_dropped_{0};
+    bool notify_quit_ = false;
+
+    // Per-service push flow control and backlog.  Guarded by notify_mutex_.
+    struct ServicePushes {
+        // The connection the counters refer to; on_register_notifier() resets them when it changes.
+        oxenmq::ConnectionID conn;
+        // Pushes sent on conn not yet covered by a notifier.ack reply.
+        size_t unacked = 0;
+        // Pushes waiting to be sent because the window is full or the notifier's connection is
+        // gone.  Sent, in order, ahead of any new push for the service.
+        std::deque<std::string> backlog;
+        // Dropped for exceeding PUSH_BACKLOG_MAX, since last reported.
+        int64_t dropped = 0;
+        // Pushes sent, and dropped for exceeding PUSH_BACKLOG_MAX, since startup.
+        int64_t sent = 0, dropped_total = 0;
+        // notifier.ack replies on conn since startup, and the seconds they took in all from their
+        // requests; and the longest since the last status report (which resets it).
+        int64_t acks = 0;
+        double ack_seconds = 0, ack_max = 0;
+        // Times the window filled since last reported, and since when it has been full.
+        int64_t blocks = 0;
+        std::optional<steady_time> blocked_since;
+        steady_time next_report{};
+    };
+    std::unordered_map<std::string, ServicePushes> service_pushes_;
+    // Set when a backlog may be sendable again: an ack arrived, or a notifier registered.
+    bool drain_ = false;
+    void send_push(
+            const std::string& service, const oxenmq::ConnectionID& conn, std::string_view push);
+    void request_ack(const std::string& service, const oxenmq::ConnectionID& conn);
+    // Appends to the service's backlog, or drops it if the backlog is at PUSH_BACKLOG_MAX.
+    void backlog_push(const std::string& service, std::string push);
+
+    // OxenMQ server for internal communications, proxied subscriptions, etc.  Held in an optional
+    // so that the destructor can tear it down first: its worker threads run request handlers and
+    // send_push()'s failure callback, which touch members declared after it.
+    std::optional<oxenmq::OxenMQ> omq_impl_;
+    oxenmq::OxenMQ& omq_ = *omq_impl_;
 
     // QUIC endpoint used to connect to service nodes (for receiving pushes)
     quic::Loop loop_;
+    // Everything the hivemind itself schedules on the QUIC loop goes through this queue rather
+    // than loop_ directly, so that the destructor can stop it, dropping whatever is still queued,
+    // before the members those jobs reference are destroyed.  loop_'s own queue only stops in
+    // ~Loop.
+    quic::JobQueue jq_{loop_};
+
+    // The subscription thread: an event loop of its own, which owns everything about what is to
+    // be subscribed where (the members from sns_ to last_block_ below, and each node's queue) and
+    // encodes the monitor requests, so that the QUIC loop only does I/O.  A cold start encodes a
+    // subscription per account per node, tens of millions of them, and on the QUIC loop that held
+    // up every connection for minutes.  The hivemind schedules on it only through sub_jq_, for
+    // the same reason as jq_.
+    quic::Loop sub_loop_;
+    quic::JobQueue sub_jq_{sub_loop_};
+
     std::shared_ptr<quic::TLSCreds> creds_out_, creds_in_;
     std::list<std::shared_ptr<quic::Endpoint>> quic_in_;
     std::shared_ptr<quic::Endpoint> quic_out_;  // Might be set to one of the elements of quic_in_
@@ -138,42 +253,337 @@ class HiveMind {
 
     PGConnPool pool_;
 
-    const int object_id_;  // Thread-safe unique id for this HiveMind object
-    zmq::context_t notification_ctx_{};
-    zmq::socket_t notify_pull_{notification_ctx_, zmq::socket_type::pull};
     std::thread notify_proc_thread_;
-    std::unordered_map<std::thread::id, std::unique_ptr<zmq::socket_t>> notify_push_;
-    std::mutex notify_push_mutex_;
-    zmq::socket_t& notify_push_sock();
     std::atomic<int64_t> pushes_processed_{0};
+
+    // Counts since startup, for get_stats and the periodic status report: notifications from the
+    // nodes, those left after de-duplication, the pushes they made, the batches they were looked
+    // up in and the lookups that failed; connections established to nodes, and the bytes of the
+    // messages they sent us.
+    std::atomic<int64_t> notifications_received_{0}, notifications_unique_{0}, pushes_produced_{0},
+            lookup_batches_{0}, lookup_failures_{0}, connections_established_{0},
+            bytes_received_{0};
+    // The unique notifications and pushes again, by the kind of account they were for (a Session
+    // account, a group, or other; see account_kind()).
+    std::array<std::atomic<int64_t>, 3> unique_by_kind_{}, pushes_by_kind_{};
+    // Clients' requests since startup: subscriptions added and renewed, unsubscribes done, and
+    // subscribe requests refused, as invalid or by the notifier's validation.
+    std::atomic<int64_t> subscriptions_added_{0}, subscriptions_renewed_{0}, unsubscribes_{0},
+            subscribes_rejected_{0};
+    // The bytes the nodes have acknowledged receiving from us, as sampled; QUIC loop (jq_) only.
+    int64_t bytes_sent_ = 0;
+
+    // The previous status report's stats, and when it was made.  (Behind a pointer only because
+    // this header has nlohmann::json just declared.)
+    std::unique_ptr<nlohmann::json> last_report_;
+    steady_time last_report_time_{};
+    // Writes a status report to Config::status_report_file, replacing the last whole.  A failure
+    // is logged once, and not again until a write has succeeded.
+    void write_report_file(const std::string& markdown);
+    bool report_file_failed_ = false;
+
+    // Every node, for make_conns(); QUIC loop (jq_) only.
+    std::vector<std::shared_ptr<hive::SNode>> conns_;
+
+    // Touched only from the subscription thread (sub_jq_), from here to last_block_:
 
     // edpk -> SNode
     std::unordered_map<Ed25519PK, std::shared_ptr<hive::SNode>> sns_;
-    // swarmid -> {SNode...}
-    std::unordered_map<uint64_t, std::unordered_set<std::shared_ptr<hive::SNode>>> swarms_;
+
+    // A swarm: the accounts it stores (every key of subscribers_ placed in it), sorted by
+    // swarm_space for the nodes' coverage scans; and its nodes, each in the slot whose bit it
+    // owns in the accounts' sent and acked masks.
+    struct Swarm {
+        std::vector<const SwarmPubkey*> members;
+        std::array<hive::SNode*, SWARM_SLOTS> slots{};
+        int nodes = 0;
+        // How many members are claimed by each number of nodes, so that a scan can skip a pass
+        // with nothing to find, as every pass short of the last is when the swarm is covered.
+        std::array<size_t, SWARM_SLOTS + 1> by_claims{};
+        // Changed with every edit to the members, so that a scan can keep its place in them by
+        // index between edits, and find it again by swarm_space after one.
+        uint64_t generation = 0;
+
+        // The account's place among the members, if it is one.
+        std::vector<const SwarmPubkey*>::iterator find(const SwarmPubkey& account);
+        void insert(const SwarmPubkey& account);
+        void erase(const SwarmPubkey& account);
+    };
+    // swarmid -> the swarm, for every swarm with an account or a node.
+    std::unordered_map<uint64_t, Swarm> swarms_;
+    // How many nodes an account in `swarm` is to be subscribed on: the configured redundancy, or
+    // every node of the swarm, and never more than the swarm has.
+    int target(const Swarm& swarm) const {
+        return config.redundancy > 0 ? std::min(config.redundancy, swarm.nodes) : swarm.nodes;
+    }
+    // The acknowledged nodes an account in `swarm` is reported covered on (see Coverage).
+    int covered_threshold(const Swarm& swarm) const { return std::clamp(target(swarm), 1, 4); }
+    // The same for a swarm of more nodes than that, as the coverage lines describe it.
+    int covered_threshold() const {
+        return config.redundancy >= 1 && config.redundancy <= 3 ? config.redundancy : 4;
+    }
 
     // Sorted list of all swarm ids
     std::vector<uint64_t> swarm_ids_;
 
-    // {swarmpubkey: [Subscription...]} -- all subscriptions, per account (less dupes)
-    std::unordered_map<SwarmPubkey, std::vector<hive::Subscription>> subscribers_;
+    // {swarmpubkey: [Subscription...]} -- all subscriptions, per account (less dupes).  Keys are
+    // never erased, not even once an account has no subscription left: swarms_, schedule_ and the
+    // nodes' due lists hold pointers to them.
+    hive::Subscribers subscribers_;
 
-    // last block hash & height
+    // When each account is next to be placed afresh on its swarm (see place()), as a min-heap on
+    // the time (see schedule_later).  An entry is live only while its time equals the
+    // account's next_due, so rescheduling an account is pushing a new entry, and an old one is
+    // skipped when it comes off the heap.
+    //
+    // A deque would not do: renewals are due a random 45-55 minutes on, so appending them does not
+    // keep it in order, and popping only from the front would hold each one back until everything
+    // ahead of it was due too.
+    std::vector<std::pair<const SwarmPubkey*, system_time>> schedule_;
+    // The heap's ordering: the soonest entry at the front.
+    static bool schedule_later(
+            const std::pair<const SwarmPubkey*, system_time>& a,
+            const std::pair<const SwarmPubkey*, system_time>& b) {
+        return a.second > b.second;
+    }
+    void schedule(const SwarmPubkey& account, system_time when);
+    // Replaces the schedule with one entry per scheduled account, at its next_due: for when many
+    // accounts' renewals have been set at once, superseding the entries they had.
+    void rebuild_schedule();
+    // How long until an account placed now is next renewed: 45-55 minutes (see RESUBSCRIBE_MIN),
+    // unless configured otherwise.
+    std::chrono::seconds resubscribe_delay() const;
+
+    // Checks a node's word that `account` is now stored by swarm `swarm_hex` (its swarm id in
+    // hex) against swarms_, counting the agreements and disagreements for check_subs() to
+    // report; a disagreement means our swarm list is stale, and gets it refreshed.
+    void check_moved(std::string_view account, std::string_view swarm_hex);
+    int64_t moved_agree_ = 0, moved_disagree_ = 0;
+
+    // The token each node last issued us for resuming our monitor session with it.  Saved with the
+    // placements (see save_state()), as resuming a session without its listing relies on both.
+    std::unordered_map<Ed25519PK, MonitorToken> monitor_tokens_;
+
+    // Saves the swarms' slot tables, every acknowledged placement with when its account was last
+    // acknowledged, and the monitor session tokens to the database (the placement_state,
+    // swarm_slots, placements and monitor_sessions tables), replacing the last save in one
+    // transaction.  The snapshot is taken here; it is written on a thread of its own, unless
+    // `wait`.
+    void save_state(bool wait);
+    std::thread state_writer_;
+    std::atomic<bool> state_writing_ = false;
+    // What the last save held (acknowledged accounts, nodes in the slot tables, and monitor
+    // session tokens), and how long it took: its snapshot here, and its write.
+    struct {
+        std::optional<steady_time> when;
+        size_t accounts = 0, nodes = 0, sessions = 0;
+        double snapshot_ms = 0;
+        std::atomic<double> write_ms = 0;
+        // Whether the last save failed to be written.
+        std::atomic<bool> failed = false;
+    } state_saved_;
+    // Restores what save_state() saved, if it was saved within RESUME_MAX_AGE: the
+    // placements on nodes still in the same swarm, the accounts' renewals, and those nodes'
+    // tokens, for their sessions to be resumed without a listing.  Run once, with the first
+    // service node list.
+    void restore_state();
+    bool restore_tried_ = false;
+    // How a restored node's claims settled: kept, its session resumed; or dropped, the node having
+    // no monitor sessions, its session not resumed, or the node having left its swarm.
+    enum class Settled { kept, no_session, resume_failed, left };
+    struct {
+        double age = -1;
+        size_t accounts = 0, swarms = 0, slots = 0, slots_dropped = 0;
+        // The placements restored, and how those settled went (see Settled), with the monitors
+        // a resumed session reported ended dropped from its kept; and the restored nodes yet to
+        // settle.
+        size_t placements = 0, kept = 0, ended = 0, no_session = 0, resume_failed = 0, left = 0;
+        size_t pending_nodes = 0;
+    } restored_;
+    // Gives up the claims a node holds for its monitor session to be resumed, when it was not
+    // resumed after all, for the reason given.
+    void abandon_resume(hive::SNode& node, Settled why);
+    // Settles the restored claims (see SwarmPubkey::restored) a restored node holds: kept, its
+    // session resumed, or about to be released, which drops each with drop_restored().  Logs how
+    // the restored placements went once the last restored node has settled.
+    void settle_restored(hive::SNode& node, Settled how);
+    // Drops `account`'s restored claim on `slot`, if it has one, ahead of the claim's release:
+    // once it has none left, it is renewed as for a placement made now.
+    void drop_restored(const SwarmPubkey& account, int slot);
+
+    // How the nodes' connections have gone for monitor sessions since startup: not offered one for
+    // their version; and for monitor_session requests, a new session, a resumed one, a node without
+    // sessions (despite its version), or no answer; and for resumed ones, the accounts whose claims
+    // stood, and the monitors the node reported ended.
+    struct {
+        int64_t old_version = 0, created = 0, resumed = 0, unsupported = 0, failed = 0;
+        int64_t kept = 0, ended = 0;
+        // Missed notifications nodes discarded beyond Config::resume_replay, and the accounts they
+        // were for.
+        int64_t replay_discarded = 0, replay_discarded_accounts = 0;
+    } monitor_session_stats_;
+
+    // The dispatcher of monitor requests: the nodes waiting for one of the Config::monitor_requests
+    // slots, in the order they asked, so that slots go round the nodes; and how many are taken.
+    std::deque<std::shared_ptr<hive::SNode>> send_queue_;
+    int requests_in_flight_ = 0;
+    // Sends requests for the queued nodes while slots are free, unless held.  Not reentrant: a
+    // node building its request queues nodes as it places accounts on them, and they are sent
+    // once it is done.
+    void dispatch_requests();
+    bool dispatching_ = false;
+    // Set while a new service node list is applied: until every node is in its new swarm, one
+    // still in its old one would send that swarm's accounts to be refused.
+    bool hold_dispatch_ = false;
+
+    // Accounts' coverage, over the accounts with subscriptions to renew: how many there are, how
+    // many are acknowledged on as many nodes as their swarm's target, and how many on none (shown
+    // as uncovered).
+    //
+    // Accounts on none are classed by why, the first that applies: no subscription with a signature
+    // within its window, or none at all (unsendable, and not counted as on none); every entry
+    // refused for good; waiting out a node's backoff after a failure; no connected node with a slot
+    // in its swarm; sent to nodes, none of which has acknowledged it (a first placement, or one
+    // after a failure, as a renewal keeps the acknowledgements it renews); and anything else.  With
+    // `detail`, up to 20 of them are described, one line each, the rarer classes first.
+    //
+    // What is reported as covered is acknowledged on at least the swarm's target number of nodes or
+    // 4, whichever is fewer (covered_threshold()): beyond 4 nodes an account's coverage makes no
+    // difference worth reporting, though placement still aims at the target.  Of the accounts on
+    // some nodes but fewer, the under-covered, those acknowledged on every connected node of their
+    // swarm are short only because the rest are down or have no slot; any others mean placement
+    // is lagging.
+    struct Coverage {
+        size_t accounts = 0, covered = 0, under = 0, under_down_only = 0, at_zero = 0;
+        size_t unsendable = 0, rejected = 0, retrying = 0, no_node = 0, sent_only = 0, other = 0;
+        // Accounts in the index with nothing scheduled (lapsed), which are not counted at all.
+        size_t lapsed = 0;
+        std::vector<std::string> described;
+    };
+    //
+    // The swarm index (Swarm::members) is walked by default; with `recount`, the accounts
+    // themselves (subscribers_), as a check on the index.
+    Coverage coverage(bool detail = false, bool recount = false) const;
+    // The incremental counters recounted from the accounts themselves: for each swarm, its
+    // accounts, how many are claimed by each number of nodes (Swarm::by_claims), and how many
+    // each slot's node claims (SNode::claimed) and is being left by (SNode::leaving).
+    struct Recount {
+        size_t members = 0;
+        std::array<size_t, SWARM_SLOTS + 1> by_claims{};
+        std::array<size_t, SWARM_SLOTS> claimed{}, leaving{};
+    };
+    // Recounts them, warning of every one that disagrees with its recount.
+    std::unordered_map<uint64_t, Recount> audit_counters() const;
+    // What a node said when it last gave up an account (Unplaced): the last refusal's text, or the
+    // node and its backoff; until the account is placed again.
+    std::unordered_map<const SwarmPubkey*, std::string> unplaced_detail_;
+    // What log_coverage_progress() last logged, and since when the fill it is following has been
+    // in progress, if one is.
+    Coverage coverage_logged_;
+    std::optional<steady_time> fill_started_;
+    // Whether a fill is in progress, coverage now being `c`: a node waits for a request slot, the
+    // requests in flight are at their cap, or coverage has changed by more than
+    // COVERAGE_CHANGE_SHARE of the accounts since log_coverage_progress()'s last line.
+    bool filling(const Coverage& c) const;
+    // Logs coverage while a fill is in progress (see filling()).  When none is, logs the settled
+    // figures, and how long the fill took, once, and nothing more until the next fill.  Runs every
+    // COVERAGE_LOG_INTERVAL.
+    void log_coverage_progress();
+
+    // Placements of an account on a node since startup: made by place(), and by nodes' scans; and
+    // of place()'s, those that moved a monitor from one node to another.
+    int64_t placements_ = 0, scan_placements_ = 0, moved_placements_ = 0;
+
+    // Claims `account`, of `swarm`, for `node`, setting its sent bit.
+    static void claim(const SwarmPubkey& account, Swarm& swarm, hive::SNode& node);
+    // Clears the bits of the node in `slot` for `account`, if either is set, and its claim.
+    static void release(const SwarmPubkey& account, Swarm& swarm, int slot);
+    // Sets the nodes the account is leaving (SwarmPubkey::leaving), and their counts of them.
+    static void set_leaving(const SwarmPubkey& account, Swarm& swarm, uint16_t leaving);
+    // Releases the nodes the account is leaving, once it has been sent to no other node still to
+    // answer.
+    static void release_leaving(const SwarmPubkey& account, Swarm& swarm);
+    // Releases every claim on the account by a node of swarm `swarm` (its own, or the one it is
+    // leaving).
+    void release_all(const SwarmPubkey& account, uint64_t swarm);
+    // The bits of up to `count` of `swarm`'s connected nodes, their monitor sessions settled and
+    // not in `exclude`, for `account`: the lightest first, not counting the account's own claim on
+    // a node, ties going first to the nodes claiming it (so that a balanced swarm keeps its
+    // placements), then at random.
+    uint16_t choose(
+            const SwarmPubkey& account, const Swarm& swarm, uint16_t exclude, int count) const;
+    // Queues `account`, just claimed for `node`, for the node to send, and clears its Unplaced.
+    void send_placed(const SwarmPubkey& account, hive::SNode& node);
+    // Places `account` on more of its swarm's nodes (see choose()) until it is claimed on its
+    // target number.  `by_scan` counts the placements as a node's scan's.
+    void place(const SwarmPubkey& account, bool by_scan = false);
+    // Sends `account` to its target number of its swarm's nodes afresh (see choose()), for its
+    // renewal or a change to its subscriptions.  A node chosen that holds it keeps its claim,
+    // acknowledged or not, sent again.  One not chosen gives it up: once the chosen nodes have
+    // answered, if it is a connected node holding a live monitor (see release_leaving()), and at
+    // once otherwise.
+    void renew(const SwarmPubkey& account);
+    // Sets the node's scan going again, and queues it with the dispatcher.
+    void wake(hive::SNode& node);
+    // Wakes every node of the swarm but `except`: an account in it has fallen below its target, a
+    // node has joined or left it, or its target has changed.
+    void wake(Swarm& swarm, const hive::SNode* except = nullptr);
+    // Gives the node a slot in its swarm, or leaves it without one if the swarm has none free.
+    void join_swarm(hive::SNode& node);
+    // Clears the node's slot across its swarm's accounts and frees it.
+    void leave_swarm(hive::SNode& node);
+    // Clears the node's bits across its swarm's accounts, keeping its slot.
+    void clear_slot(Swarm& swarm, hive::SNode& node);
+
+    // last block hash & height, and when the hash last changed
     std::pair<std::string, int64_t> last_block_{"", -1};
+    steady_time last_block_time_{};
+
+    // How many distinct subscriptions subscribers_ holds.
+    size_t subscription_count_ = 0;
+    // The accounts subscribers_ holds, and their subscriptions, by kind of account (a Session
+    // account, a group, or other; see account_kind()).
+    std::array<size_t, 3> accounts_by_kind_{}, subscriptions_by_kind_{};
+
+    // The database's subscription rows (devices' registrations) per service: counted once at
+    // startup and kept in step with every insert and delete since, so that the status tick need
+    // not count them.
+    std::mutex subscription_rows_mutex_;
+    std::unordered_map<std::string, int64_t> subscription_rows_;
+    void count_subscription_rows(const std::string& service, int64_t change);
+
+    // Monitor requests sent since startup, those answered and those that failed or timed out, and
+    // the subscriptions in the answers refused for the wrong swarm or rejected; and the accounts
+    // nodes reported moved to the swarm we place them in.
+    struct {
+        int64_t sent = 0, answered = 0, failed = 0, timed_out = 0, wrong_swarm = 0, rejected = 0;
+        // The subscriptions the requests carried, counted with their requests' outcome.
+        int64_t entries = 0;
+    } monitor_stats_;
+    int64_t moved_total_ = 0;
 
     std::atomic<int> pending_connects_ = 0;
     std::atomic<int> connect_count_ = 0;
 
     const std::chrono::system_clock::time_point startup_time = std::chrono::system_clock::now();
 
-    // contains Blake2B(service || svcid || msghash) for sent notification de-duping.  Every 10
-    // minutes, we replace filter_rotate_ with filter_, and check both filters for de-duping (so
-    // that hashes expire after 10-20 minutes).  (The 10 mins value is configurable).
+    // contains Blake2B(account || msghash) of the notifications already handled: every member of
+    // the account's swarm sends us the same one, and only the first is looked up and pushed.
+    // Every 10 minutes, we replace filter_rotate_ with filter_, and check both filters for
+    // de-duping (so that hashes expire after 10-20 minutes).  (The 10 mins value is configurable).
+    // Only used on the notification processing thread.
     std::unordered_set<Blake2B_32> filter_, filter_rotate_;
     steady_time filter_rotate_time_ = steady_clock::now() + config.filter_lifetime;
 
     // Registered push services: servicename => omq Connectionid to talk to the service
     std::unordered_map<std::string, oxenmq::ConnectionID> services_;
+    // Services whose connection failed, and since when: their pushes wait in service_pushes_ for
+    // the notifier to register again.
+    std::unordered_map<std::string, steady_time> services_gone_;
+    // service -> the service ids and subscriptions its notifier has dropped since startup.
+    std::unordered_map<std::string, std::pair<int64_t, int64_t>> registrations_dropped_;
+    std::mutex services_mutex_;
+    void service_gone(const std::string& service, oxenmq::ConnectionID conn);
 
     // Our connection to a local oxend for block and SN info
     oxenmq::ConnectionID oxend_;
@@ -201,7 +611,8 @@ class HiveMind {
     ~HiveMind();
 
   private:
-    void on_reg_service(oxenmq::Message& m);
+    void on_register_notifier(oxenmq::Message& m);
+    void on_obsolete_register_service(oxenmq::Message& m);
 
     void process_notifications();
 
@@ -221,11 +632,18 @@ class HiveMind {
     /// integer and string values are permitted (+keys only allow integers).
     void on_service_stats(oxenmq::Message& m);
 
-    void get_stats_json(std::function<void(nlohmann::json)> when_ready);
+    // How much get_stats_json() gathers: for the status tick, what its status line needs, which
+    // leaves out coverage, a pass over every account; everything, for get_stats; and for the
+    // periodic status report, everything with the counters checked against a recount
+    // (audit_counters()), and the coverage and node load figures from the recount.
+    enum class StatsDepth { tick, full, audited };
+    void get_stats_json(std::function<void(nlohmann::json)> when_ready, StatsDepth depth);
 
     void on_get_stats(oxenmq::Message& m);
 
-    std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now() - 1h;
+    // When the last status report was logged: startup, before the first, which comes one
+    // status_report_interval later.
+    std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now();
     void log_stats(std::string pre_cmd = "WATCHDOG=1"s);
 
     using UnsubData = std::tuple<Signature, std::optional<Subaccount>, int64_t>;
@@ -240,6 +658,7 @@ class HiveMind {
             const SwarmPubkey& pubkey,
             std::shared_ptr<hive::Subscription> sub,
             const std::optional<EncKey>& enc_key,
+            bool want_truncated,
             std::vector<std::string> data,
             const std::optional<UnsubData>& unsub = std::nullopt);
 
@@ -270,14 +689,25 @@ class HiveMind {
     void db_cleanup();
 
     void on_new_block(oxenmq::Message&) { refresh_sns(); }
+    // Subscribes, or renews our subscription, to oxend's notify.block, which calls refresh_sns().
+    void subscribe_blocks();
     void refresh_sns();
 
+    // Called only from the subscription thread (sub_jq_), as is everything else below that
+    // touches subscriptions or swarms.
     void on_sns_response(std::vector<std::string> data);
 
-    // Re-checks all SN subscriptions for and new subscriptions or needed resubscriptions; must be
-    // called on the loop_ thread.
+    // Moves every account whose swarm the new swarm_ids_ changes to its new swarm, releasing its
+    // placements on the old one, and returns those moved, to be placed once the nodes' own swarms
+    // are up to date.  An account placed for the first time is scheduled for renewal.
+    std::vector<const SwarmPubkey*> reassign_swarms();
+
+    // Places afresh every account whose renewal is due, reschedules it, and queues the nodes with
+    // something to send.  Runs every 10s, and after changes to the network.
     void check_subs();
 
+    // Starts connections to the nodes not connected (or cooling down after failing); QUIC loop
+    // (jq_) only.
     void make_conns();
 
   public:
@@ -294,17 +724,88 @@ class HiveMind {
 
     bool has_quic_out() { return (bool)quic_out_; }
 
-    // Accesses the quic loop governing SNode connections (and various internals)
-    quic::Loop& loop() { return loop_; }
+    // Schedules work on the QUIC loop governing SNode connections; see jq_.
+    quic::JobQueue& jq() { return jq_; }
 
-    // Returns the creds object for establishing outbound connections.  TODO: This isn't needed once
-    // all nodes are running an updated libquic, but older libquic doesn't allow no-creds
-    // connections.
+    // The subscription thread's queue; see sub_loop_.
+    quic::JobQueue& sub_jq() { return sub_jq_; }
+
+    // Returns the creds object for establishing outbound connections: our configured QUIC key,
+    // which storage servers recognise as the privileged push server's.
     const std::shared_ptr<quic::TLSCreds>& creds_out() { return creds_out_; }
 
-    // Internal helper called by SNode with itself to dispatch a call back into itself with a
-    // reference to the HiveMind's master subscriber container.
-    void check_my_subs(hive::SNode& snode);
+    // Called by an SNode once its connection numbered `gen` is established, to fill and send its
+    // queue.
+    void on_node_connected(hive::SNode& snode, int gen);
+
+    // Called with an SNode that may have something to send: queues it for a request slot.
+    void send_pending(hive::SNode& snode);
+
+    // The next account for the node's request: the next of those placed on it that it still
+    // claims.  With none left, the node's scan walks its swarm for accounts short of their target,
+    // the least covered first, and places each on the lightest nodes (see place()), which may or
+    // may not include this one, until one is.  Null once there is nothing, when the scan rests
+    // until the node is woken.
+    const SwarmPubkey* next_claim(hive::SNode& node);
+
+    // Places each account again, after its node backed off from a failure.
+    void place_again(const std::vector<const SwarmPubkey*>& accounts);
+
+    // Called by an SNode for an account it has acknowledged a subscription for; and for one whose
+    // claim it gives up, refused, failed, or with nothing to send.
+    void subscribed(hive::SNode& node, const SwarmPubkey& account);
+    void unclaim(hive::SNode& node, const SwarmPubkey& account);
+    // Called by an SNode for an account whose every entry it refused for good, `error` being the
+    // last refusal's text; and for accounts it is to place again after `backoff`, following a
+    // failure.
+    void refused(hive::SNode& node, const SwarmPubkey& account, std::string error);
+    // Called by an SNode for an account with no subscription it could send: lapsed, as at its
+    // renewal, when every signature has expired, and otherwise (some signature not yet valid) only
+    // given up on this node.
+    void nothing_to_send(hive::SNode& node, const SwarmPubkey& account, bool not_yet_valid);
+    void retrying(
+            hive::SNode& node,
+            const std::vector<const SwarmPubkey*>& accounts,
+            std::chrono::milliseconds backoff);
+
+    // Called by an SNode whose connection is gone: its claims go with it, and the accounts it held
+    // become the other nodes' to cover.
+    void drop_claims(hive::SNode& node);
+
+    // Called by an SNode when a request of its ends, freeing its slot.
+    void request_finished();
+
+    // Called by an SNode with the answer to its monitor_session request: a session, resumed or new,
+    // with its token and the list of its monitors (when resumed); or no session, because the node
+    // does not support them, or did not answer.
+    void monitor_session_started(
+            hive::SNode& snode, const MonitorToken& token, bool resumed, std::string_view monitors);
+    void monitor_session_unsupported(hive::SNode& snode);
+    void monitor_session_failed(hive::SNode& snode);
+
+    // Called by an SNode with a monitor request's outcome: answered, or else timed out or failed;
+    // the subscriptions it carried; and for an answer, those refused for the wrong swarm and
+    // rejected.
+    void count_monitor_reply(
+            bool answered, bool timed_out, size_t entries, size_t wrong_swarm, size_t rejected) {
+        auto& m = monitor_stats_;
+        (answered ? m.answered : timed_out ? m.timed_out : m.failed)++;
+        m.entries += entries;
+        m.wrong_swarm += wrong_swarm;
+        m.rejected += rejected;
+    }
+
+    // Called by an SNode with what a monitor_session answer said was discarded beyond the replay
+    // budget: notifications, and the accounts they were for.
+    void count_replay_discarded(int64_t discarded, int64_t accounts) {
+        monitor_session_stats_.replay_discarded += discarded;
+        monitor_session_stats_.replay_discarded_accounts += accounts;
+    }
+
+    // Called by an SNode, on the QUIC loop, for each connection it establishes and each message
+    // it receives.
+    void count_connection() { connections_established_++; }
+    void count_received(size_t bytes) { bytes_received_ += bytes; }
 
     void load_saved_subscriptions();
 
@@ -331,6 +832,8 @@ class HiveMind {
     ///   and contains any extra data (beyond just the service_id) needed for the
     ///   service handler to send the notification to the device.
     /// - enc_key this user's 32-byte encryption key for pushed notifications
+    /// - want_truncated -- whether a message over the body limit is pushed as its first part,
+    ///   rather than as its size alone, if the subscription wants data
     /// - sub -- the subscription to add
     bool add_subscription(
             SwarmPubkey pubkey,
@@ -338,6 +841,7 @@ class HiveMind {
             std::string service_id,
             std::optional<std::string> service_data,
             EncKey enc_key,
+            bool want_truncated,
             hive::Subscription sub);
 
     /// Removes a subscription for monitoring.  Returns true if the given pubkey was
@@ -369,6 +873,10 @@ class HiveMind {
 
     // Called from SNode when we get a message notification
     void on_message_notification(quic::message m);
+
+    // Called from SNode when a node has ended a subscription because the account is no longer
+    // stored by its swarm.
+    void on_monitor_ended(hive::SNode& node, quic::message m);
 };
 
 extern template void HiveMind::on_sub_unsub_impl(oxenmq::Message& m, bool subscribe);

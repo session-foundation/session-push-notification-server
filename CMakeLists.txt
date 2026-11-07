@@ -22,6 +22,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_library(spns-hivemind SHARED
     spns/hivemind.cpp
+    spns/migrations.cpp
     spns/pg.cpp
     spns/swarmpubkey.cpp
     spns/utils.cpp
@@ -54,6 +55,12 @@ endif()
 
 include(cmake/submodule_check.cmake)
 include(cmake/system_or_submodule.cmake)
+include(cmake/SpnsSchema.cmake)
+
+spns_schema_dir(
+    TARGET spns-hivemind
+    DIR "${PROJECT_SOURCE_DIR}/spns/schema"
+    DECLARE_HEADER "${PROJECT_SOURCE_DIR}/spns/migrations.hpp")
 
 system_or_submodule(LIBPQXX libpqxx libpqxx::pqxx libpqxx>=8 libpqxx)
 
@@ -97,3 +104,5 @@ execute_process(COMMAND ${Python_EXECUTABLE} -m site --user-site
 install(TARGETS spns_hivemind DESTINATION ${PYTHON_USER_SITE})
 cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_PREFIX NORMALIZE OUTPUT_VARIABLE install_path)
 set_target_properties(spns_hivemind PROPERTIES INSTALL_RPATH "${install_path}/${CMAKE_INSTALL_LIBDIR}")
+
+add_subdirectory(tests/e2e)

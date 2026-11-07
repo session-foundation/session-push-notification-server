@@ -73,6 +73,9 @@ struct EncKey : bytes<32> {};
 
 struct Blake2B_32 : bytes<32> {};
 
+// A storage server's token for resuming our monitor session with it.
+struct MonitorToken : bytes<32> {};
+
 struct Subaccount {
     SubaccountTag tag;  /// Provided by the account owner
     Signature sig;      /// signature of tag, signed by account owner
@@ -86,7 +89,7 @@ struct Subaccount {
         if (a.has_value() != b.has_value())
             return false;  // One set, one unset
         if (!a.has_value())
-            return false;  // Both unset
+            return true;  // Both unset
         return a->is_same(*b);
     }
 };

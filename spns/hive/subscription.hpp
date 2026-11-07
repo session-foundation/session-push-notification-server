@@ -39,6 +39,9 @@ class subscribe_error : public std::runtime_error {
 struct Subscription {
     static constexpr auto SIGNATURE_EXPIRY = 14 * 24h;
     static constexpr auto SIGNATURE_EARLY = 24h;
+    // A subscription is sent to nodes only while its signature has at least this long left, so that
+    // it cannot expire on its way to one, and its database row is deleted once it has less.
+    static constexpr auto SIGNATURE_MARGIN = 10s;
 
     std::optional<Subaccount> subaccount;
     std::vector<int16_t> namespaces;
