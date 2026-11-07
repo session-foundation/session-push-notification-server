@@ -1530,6 +1530,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                             counted);
         }
         result["coverage"] = {
+                {"filling", depth != StatsDepth::tick && filling(c)},
                 {"redundancy", config.redundancy},
                 {"covered_threshold",
                  config.redundancy >= 1 && config.redundancy <= 3 ? config.redundancy : 4},
@@ -1917,8 +1918,9 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             value(db_idle),
             value(db_in_use, mark(db_idle == 0 && db_in_use > 0, false)));
 
+    // During a fill, every account not yet reached is on none, as expected.
     if (const auto& accounts = get(s, "coverage", "on_none_accounts");
-        accounts.is_array() && !accounts.empty()) {
+        get(s, "coverage", "filling") != true && accounts.is_array() && !accounts.empty()) {
         out += "\n  Accounts on no node, or unsendable:";
         for (const auto& line : accounts)
             out += "\n    {}"_format(line.get<std::string>());
@@ -3417,15 +3419,19 @@ HiveMind::Coverage HiveMind::coverage(bool detail, bool recount) const {
     return c;
 }
 
-void HiveMind::log_coverage_progress() {
-    auto c = coverage();
+bool HiveMind::filling(const Coverage& c) const {
     const auto& was = coverage_logged_;
     auto differ = [](size_t a, size_t b) { return a > b ? a - b : b - a; };
     auto changed = differ(c.accounts, was.accounts) + differ(c.covered, was.covered) +
                    differ(c.under, was.under) + differ(c.at_zero, was.at_zero);
-    bool filling = !send_queue_.empty() || requests_in_flight_ >= config.monitor_requests ||
-                   changed > COVERAGE_CHANGE_SHARE * c.accounts;
-    if (!filling && !fill_started_)
+    return !send_queue_.empty() || requests_in_flight_ >= config.monitor_requests ||
+           changed > COVERAGE_CHANGE_SHARE * c.accounts;
+}
+
+void HiveMind::log_coverage_progress() {
+    auto c = coverage();
+    bool in_progress = filling(c);
+    if (!in_progress && !fill_started_)
         return;
 
     auto now = steady_clock::now();
@@ -3439,7 +3445,7 @@ void HiveMind::log_coverage_progress() {
                     c.under_down_only,
                     c.at_zero,
                     c.unsendable);
-    if (filling) {
+    if (in_progress) {
         if (!fill_started_)
             fill_started_ = now;
         log::info(

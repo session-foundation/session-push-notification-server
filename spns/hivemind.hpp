@@ -462,11 +462,13 @@ class HiveMind {
     // in progress, if one is.
     Coverage coverage_logged_;
     std::optional<steady_time> fill_started_;
-    // Logs coverage while a fill is in progress: while a node waits for a request slot, the
+    // Whether a fill is in progress, coverage now being `c`: a node waits for a request slot, the
     // requests in flight are at their cap, or coverage has changed by more than
-    // COVERAGE_CHANGE_SHARE of the accounts since the last line.  When none of those holds, logs
-    // the settled figures, and how long the fill took, once, and nothing more until the next fill.
-    // Runs every COVERAGE_LOG_INTERVAL.
+    // COVERAGE_CHANGE_SHARE of the accounts since log_coverage_progress()'s last line.
+    bool filling(const Coverage& c) const;
+    // Logs coverage while a fill is in progress (see filling()).  When none is, logs the settled
+    // figures, and how long the fill took, once, and nothing more until the next fill.  Runs every
+    // COVERAGE_LOG_INTERVAL.
     void log_coverage_progress();
 
     // Placements of an account on a node since startup: made by place(), and by nodes' scans; and
@@ -617,7 +619,9 @@ class HiveMind {
 
     void on_get_stats(oxenmq::Message& m);
 
-    std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now() - 1h;
+    // When the last status report was logged: startup, before the first, which comes one
+    // status_report_interval later.
+    std::chrono::steady_clock::time_point last_stats_logged = std::chrono::steady_clock::now();
     void log_stats(std::string pre_cmd = "WATCHDOG=1"s);
 
     using UnsubData = std::tuple<Signature, std::optional<Subaccount>, int64_t>;
