@@ -196,6 +196,10 @@ class HiveMind {
         int64_t dropped = 0;
         // Pushes sent, and dropped for exceeding PUSH_BACKLOG_MAX, since startup.
         int64_t sent = 0, dropped_total = 0;
+        // notifier.ack replies on conn since startup, and the seconds they took in all from their
+        // requests; and the longest since the last status report (which resets it).
+        int64_t acks = 0;
+        double ack_seconds = 0, ack_max = 0;
         // Times the window filled since last reported, and since when it has been full.
         int64_t blocks = 0;
         std::optional<steady_time> blocked_since;
@@ -351,6 +355,8 @@ class HiveMind {
         size_t accounts = 0, nodes = 0, sessions = 0;
         double snapshot_ms = 0;
         std::atomic<double> write_ms = 0;
+        // Whether the last save failed to be written.
+        std::atomic<bool> failed = false;
     } state_saved_;
     // Restores what save_state() saved, if it was saved within RESUME_MAX_AGE: the
     // placements on nodes still in the same swarm, the accounts' renewals, and those nodes'
@@ -515,6 +521,8 @@ class HiveMind {
     // nodes reported moved to the swarm we place them in.
     struct {
         int64_t sent = 0, answered = 0, failed = 0, timed_out = 0, wrong_swarm = 0, rejected = 0;
+        // The subscriptions the requests carried, counted with their requests' outcome.
+        int64_t entries = 0;
     } monitor_stats_;
     int64_t moved_total_ = 0;
 
@@ -738,10 +746,13 @@ class HiveMind {
     void monitor_session_failed(hive::SNode& snode);
 
     // Called by an SNode with a monitor request's outcome: answered, or else timed out or failed;
-    // and for an answer, its subscriptions refused for the wrong swarm and rejected.
-    void count_monitor_reply(bool answered, bool timed_out, size_t wrong_swarm, size_t rejected) {
+    // the subscriptions it carried; and for an answer, those refused for the wrong swarm and
+    // rejected.
+    void count_monitor_reply(
+            bool answered, bool timed_out, size_t entries, size_t wrong_swarm, size_t rejected) {
         auto& m = monitor_stats_;
         (answered ? m.answered : timed_out ? m.timed_out : m.failed)++;
+        m.entries += entries;
         m.wrong_swarm += wrong_swarm;
         m.rejected += rejected;
     }

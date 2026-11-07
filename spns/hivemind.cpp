@@ -39,12 +39,47 @@
 
 namespace spns {
 
+// How a figure in the status report reads: as it is, worth a look, or wrong now.
+enum class Mark { plain, look, wrong };
+
+// A figure in the status report, formatted by its own format spec, in bold, and in yellow or red as
+// its mark says.  The escape codes go out whatever the sink: the hivemind logs only to its coloured
+// stderr sink (see main.cpp), whose pattern carries its own codes unconditionally, and oxen-logging
+// exposes no colour setting to follow.
+template <typename T>
+struct Figure {
+    T value;
+    Mark mark;
+};
+
+}  // namespace spns
+
+template <typename T>
+struct fmt::formatter<spns::Figure<T>> : fmt::formatter<T> {
+    auto format(const spns::Figure<T>& f, fmt::format_context& ctx) const {
+        using enum spns::Mark;
+        ctx.advance_to(
+                fmt::format_to(
+                        ctx.out(),
+                        "{}",
+                        f.mark == wrong  ? "\x1b[1;31m"
+                        : f.mark == look ? "\x1b[1;33m"
+                                         : "\x1b[1m"));
+        return fmt::format_to(fmt::formatter<T>::format(f.value, ctx), "\x1b[0m");
+    }
+};
+
+namespace spns {
+
 namespace log = oxen::log;
 static auto cat = log::Cat("hivemind");
 static auto stats = log::Cat("stats");
 
-// A duration of whole seconds as hours and minutes, minutes and seconds, or seconds, as fits.
+// A duration as hours and minutes, minutes and seconds, whole seconds, or under a second as
+// milliseconds, as fits.
 static std::string friendly_duration(double secs) {
+    if (secs < 1)
+        return secs < 0.01 ? "{:.1f}ms"_format(secs * 1000) : "{:.0f}ms"_format(secs * 1000);
     auto t = static_cast<int64_t>(secs);
     return t >= 3600 ? "{}h{:02}m"_format(t / 3600, t / 60 % 60)
          : t >= 60   ? "{}m{:02}s"_format(t / 60, t % 60)
@@ -791,7 +826,8 @@ void HiveMind::request_ack(const std::string& service, const oxenmq::ConnectionI
     omq_.request(
             conn,
             "notifier.ack",
-            [this, service, conn](bool ok, std::vector<std::string> data) {
+            [this, service, conn, asked = steady_clock::now()](
+                    bool ok, std::vector<std::string> data) {
                 if (!ok) {
                     log::critical(
                             cat,
@@ -810,6 +846,10 @@ void HiveMind::request_ack(const std::string& service, const oxenmq::ConnectionI
                     if (it == service_pushes_.end() || it->second.conn != conn)
                         return;
                     auto& s = it->second;
+                    auto took = std::chrono::duration<double>(steady_clock::now() - asked).count();
+                    s.acks++;
+                    s.ack_seconds += took;
+                    s.ack_max = std::max(s.ack_max, took);
                     s.unacked -= std::min(s.unacked, PUSH_ACK_INTERVAL);
                     if (s.unacked < PUSH_WINDOW)
                         s.blocked_since.reset();
@@ -1397,10 +1437,16 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
     {
         std::lock_guard lock{notify_mutex_};
         auto now = steady_clock::now();
-        for (const auto& [service, s] : service_pushes_) {
+        for (auto& [service, s] : service_pushes_) {
             auto& q = result["notifier_queue"][service];
             q["backlog"] = s.backlog.size();
             q["unacked"] = s.unacked;
+            q["acks"] = s.acks;
+            q["ack_seconds"] = s.ack_seconds;
+            q["ack_max"] = s.ack_max;
+            // The longest over each report's interval.
+            if (audit)
+                s.ack_max = 0;
             q["sent"] = s.sent;
             q["dropped"] = s.dropped_total;
             q["blocked_for"] = seconds_since(s.blocked_since, now);
@@ -1526,7 +1572,8 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                 {"nodes", state_saved_.nodes},
                 {"sessions", state_saved_.sessions},
                 {"snapshot_ms", state_saved_.snapshot_ms},
-                {"write_ms", state_saved_.write_ms.load()}};
+                {"write_ms", state_saved_.write_ms.load()},
+                {"failed", state_saved_.failed.load()}};
         result["restored"] = {
                 {"age",
                  restored_.age < 0 ? nlohmann::json(nullptr) : nlohmann::json(restored_.age)},
@@ -1577,6 +1624,7 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                 {"answered", ms.answered},
                 {"failed", ms.failed},
                 {"timed_out", ms.timed_out},
+                {"entries", ms.entries},
                 {"wrong_swarm", ms.wrong_swarm},
                 {"rejected", ms.rejected}};
         result["accounts_moved"] = moved_total_;
@@ -1607,6 +1655,25 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
 
 // The multi-line periodic status report, from the stats now and at the previous report `dt`
 // seconds ago (null at the first), as rates over the interval for what counts up.
+// When a status report figure is worth a look (shown in yellow) or wrong now (red).  Shares are of
+// the interval's total: pushes sent to the service, subscriptions sent in monitor requests, the
+// requests themselves, accounts, and nodes.
+constexpr double NOTIFIER_ACK_LOOK = 1.0, NOTIFIER_ACK_WRONG = 10.0;  // longest ack, in seconds
+constexpr double NOTIFIER_BACKLOG_WRONG = 10'000;                     // any backlog is worth a look
+constexpr double NOTIFIER_FAILURES_LOOK = 0.01, NOTIFIER_FAILURES_WRONG = 0.10;
+constexpr double INCOMING_QUEUE_LOOK = NOTIFY_QUEUE_MAX_BYTES / 2;  // bytes queued
+// A few nodes are always restarting or broken, so requests failing or timing out, subscriptions
+// refused for the wrong swarm, and nodes not connected are only worth a look past a small share.
+constexpr double REQUESTS_FAILED_LOOK = 0.005, REQUESTS_FAILED_WRONG = 0.05;
+constexpr double WRONG_SWARM_LOOK = 0.005, WRONG_SWARM_WRONG = 0.05;
+constexpr double NODES_CONNECTED_LOOK = 0.98, NODES_CONNECTED_WRONG = 0.90;
+constexpr double COVERED_LOOK = 0.99, COVERED_WRONG = 0.90;
+constexpr auto SAVE_AGE_LOOK = 2 * DUMP_INTERVAL;
+
+static Mark mark(bool look, bool wrong) {
+    return wrong ? Mark::wrong : look ? Mark::look : Mark::plain;
+}
+
 static std::string status_report(const nlohmann::json& s, const nlohmann::json& prev, double dt) {
     // The value at `path`, or null where any of it is absent.  Every lookup goes through this: a
     // const json's operator[] asserts that its key exists, and the parts of the stats need not
@@ -1631,21 +1698,23 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     };
     auto delta = [&](const auto&... path) { return num(s, path...) - num(prev, path...); };
     auto rate = [&](const auto&... path) { return dt > 0 ? delta(path...) / dt : 0.0; };
+    // A figure in bold, and coloured as `mark` says.
+    auto value = [](auto v, Mark mark = Mark::plain) { return Figure<decltype(v)>{v, mark}; };
     auto restore_settled = [&] {
         auto dropped =
                 "{} no session, {} resume failed, {} node left swarm, {} monitor ended"_format(
-                        num(s, "restored", "no_session"),
-                        num(s, "restored", "resume_failed"),
-                        num(s, "restored", "left"),
-                        num(s, "restored", "ended"));
+                        value(num(s, "restored", "no_session")),
+                        value(num(s, "restored", "resume_failed")),
+                        value(num(s, "restored", "left")),
+                        value(num(s, "restored", "ended")));
         if (num(s, "restored", "kept") == 0 && num(s, "restored", "pending_nodes") == 0)
             return "none of its {} placements kept ({})"_format(
-                    num(s, "restored", "placements"), dropped);
+                    value(num(s, "restored", "placements")), dropped);
         return "of its {} placements, {} kept, dropped {}; {} nodes yet to settle"_format(
-                num(s, "restored", "placements"),
-                num(s, "restored", "kept"),
+                value(num(s, "restored", "placements")),
+                value(num(s, "restored", "kept")),
                 dropped,
-                num(s, "restored", "pending_nodes"));
+                value(num(s, "restored", "pending_nodes")));
     };
 
     // The notifiers' own counters (service_stats) are kept across restarts, so they are compared
@@ -1653,7 +1722,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     // report's figures for those are over the time since.
     bool have_prev = prev.is_object() && !prev.empty();
 
-    std::string out = "Status report, over the last {}:"_format(friendly_duration(dt));
+    std::string out = "Status report, over the last {}:"_format(value(friendly_duration(dt)));
 
     out += "\n  Notifiers:";
     std::vector<std::string> shown, idle;
@@ -1671,7 +1740,9 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         auto sent = delta("notifier_queue", service, "sent"),
              unacked = num(s, "notifier_queue", service, "unacked"),
              backlog = num(s, "notifier_queue", service, "backlog"),
-             dropped = delta("notifier_queue", service, "dropped");
+             dropped = delta("notifier_queue", service, "dropped"),
+             acks = delta("notifier_queue", service, "acks"),
+             ack_max = num(s, "notifier_queue", service, "ack_max");
         double failures = have_prev && get(prev, "notifier", service, "failures").is_number()
                                 ? delta("notifier", service, "failures")
                                 : 0;
@@ -1683,116 +1754,166 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             idle.push_back(service);
             continue;
         }
-        out += "\n    {}: {:.1f} pushes/s, {} unacked, {} backlogged, {} dropped"_format(
-                service, dt > 0 ? sent / dt : 0.0, unacked, backlog, dropped);
-        if (failures > 0)
-            out += ", {} failures"_format(failures);
+        out += "\n    {}: {:.1f} pushes/s"_format(service, value(dt > 0 ? sent / dt : 0.0));
+        if (acks > 0)
+            out += ", ack {} avg / {} max"_format(
+                    value(friendly_duration(
+                            delta("notifier_queue", service, "ack_seconds") / acks)),
+                    value(friendly_duration(ack_max),
+                          mark(ack_max > NOTIFIER_ACK_LOOK, ack_max > NOTIFIER_ACK_WRONG)));
+        // Only a full window is worth showing: below it, the count just cycles through the acks.
+        if (unacked >= PUSH_WINDOW)
+            out += ", {} unacked"_format(value(unacked));
+        if (backlog > 0)
+            out += ", {} backlogged"_format(
+                    value(backlog, mark(true, backlog > NOTIFIER_BACKLOG_WRONG)));
+        if (dropped > 0)
+            out += ", {} dropped"_format(value(dropped, Mark::wrong));
+        // A push service refuses some pushes in the ordinary way (a device's rate limit, say), so
+        // only their share of those sent says anything.
+        if (failures > 0) {
+            double share = sent > 0 ? failures / sent : 1;
+            out += ", {} failures"_format(
+                    value(failures,
+                          mark(share > NOTIFIER_FAILURES_LOOK, share > NOTIFIER_FAILURES_WRONG)));
+        }
         if (blocked.is_number())
-            out += "; window blocked {}"_format(friendly_duration(blocked.get<double>()));
+            out += "; window blocked {}"_format(
+                    value(friendly_duration(blocked.get<double>()), Mark::wrong));
         if (gone)
-            out += "; connection lost";
+            out += "; {}"_format(value("connection lost"s, Mark::wrong));
     }
     if (!idle.empty())
         out += "\n    idle: {}"_format(fmt::join(idle, ", "));
 
     auto batches = delta("incoming", "lookup_batches");
+    auto queue_bytes = num(s, "incoming", "queue_bytes");
+    auto incoming_dropped = delta("incoming", "dropped"),
+         lookup_failures = delta("incoming", "lookup_failures");
     out += "\n  Incoming: {:.1f}/s from nodes, {:.1f}/s unique, {:.1f} pushes/s; queue {} ({} B), "
            "{} dropped; lookups {:.2f}/s, {:.1f} per batch, {} failed"_format(
-                   rate("incoming", "received"),
-                   rate("incoming", "unique"),
-                   rate("incoming", "pushes"),
-                   num(s, "incoming", "queue"),
-                   num(s, "incoming", "queue_bytes"),
-                   delta("incoming", "dropped"),
-                   rate("incoming", "lookup_batches"),
-                   batches > 0 ? delta("incoming", "unique") / batches : 0.0,
-                   delta("incoming", "lookup_failures"));
+                   value(rate("incoming", "received")),
+                   value(rate("incoming", "unique")),
+                   value(rate("incoming", "pushes")),
+                   value(num(s, "incoming", "queue")),
+                   value(queue_bytes, mark(queue_bytes > INCOMING_QUEUE_LOOK, false)),
+                   value(incoming_dropped, mark(false, incoming_dropped > 0)),
+                   value(rate("incoming", "lookup_batches")),
+                   value(batches > 0 ? delta("incoming", "unique") / batches : 0.0),
+                   value(lookup_failures, mark(lookup_failures > 0, false)));
 
+    auto requests = delta("monitor_requests", "sent"),
+         request_failed = delta("monitor_requests", "failed"),
+         timed_out = delta("monitor_requests", "timed_out"),
+         entries = delta("monitor_requests", "entries"),
+         wrong_swarm = delta("monitor_requests", "wrong_swarm");
     out += "\n  Subscriptions: {} accounts, {} subscriptions, {} swarms; schedule {}; {} to send; "
            "requests {}/{} in flight, {} nodes waiting, {} sent ({} answered, {} failed, {} timed "
            "out), {} wrong swarm; {} accounts moved"_format(
-                   num(s, "accounts_monitored"),
-                   num(s, "subscriptions_distinct"),
-                   num(s, "swarm_index", "swarms"),
-                   num(s, "schedule"),
-                   num(s, "pending", "accounts"),
-                   num(s, "pending", "requests"),
-                   num(s, "pending", "request_cap"),
-                   num(s, "pending", "waiting_nodes"),
-                   delta("monitor_requests", "sent"),
-                   delta("monitor_requests", "answered"),
-                   delta("monitor_requests", "failed"),
-                   delta("monitor_requests", "timed_out"),
-                   delta("monitor_requests", "wrong_swarm"),
-                   delta("accounts_moved"));
+                   value(num(s, "accounts_monitored")),
+                   value(num(s, "subscriptions_distinct")),
+                   value(num(s, "swarm_index", "swarms")),
+                   value(num(s, "schedule")),
+                   value(num(s, "pending", "accounts")),
+                   value(num(s, "pending", "requests")),
+                   value(num(s, "pending", "request_cap")),
+                   value(num(s, "pending", "waiting_nodes")),
+                   value(requests),
+                   value(delta("monitor_requests", "answered")),
+                   value(request_failed,
+                         mark(request_failed > REQUESTS_FAILED_LOOK * requests,
+                              request_failed > REQUESTS_FAILED_WRONG * requests)),
+                   value(timed_out,
+                         mark(timed_out > REQUESTS_FAILED_LOOK * requests,
+                              timed_out > REQUESTS_FAILED_WRONG * requests)),
+                   value(wrong_swarm,
+                         mark(wrong_swarm > WRONG_SWARM_LOOK * entries,
+                              wrong_swarm > WRONG_SWARM_WRONG * entries)),
+                   value(delta("accounts_moved")));
 
+    auto accounts = num(s, "coverage", "accounts"), covered = num(s, "coverage", "covered"),
+         on_none = num(s, "coverage", "at_zero");
+    auto covered_share = accounts > 0 ? covered / accounts : 1;
     out += "\n  Coverage: {}/{} covered (on {}+ nodes; redundancy {}), {} under-covered ({} only "
            "on down nodes), {} on none ({} rejected, {} retrying, {} no node, {} sent but never "
            "acknowledged, {} other), {} unsendable, {} lapsed; node load min/avg/max "
            "{}/{:.0f}/{}; placements: {} direct, {} by scans, {} moved"_format(
-                   num(s, "coverage", "covered"),
-                   num(s, "coverage", "accounts"),
-                   num(s, "coverage", "covered_threshold"),
-                   num(s, "coverage", "redundancy"),
-                   num(s, "coverage", "under_covered"),
-                   num(s, "coverage", "under_covered_down_only"),
-                   num(s, "coverage", "at_zero"),
-                   num(s, "coverage", "on_none", "rejected"),
-                   num(s, "coverage", "on_none", "retrying"),
-                   num(s, "coverage", "on_none", "no_node"),
-                   num(s, "coverage", "on_none", "sent_never_acked"),
-                   num(s, "coverage", "on_none", "other"),
-                   num(s, "coverage", "unsendable"),
-                   num(s, "coverage", "lapsed"),
-                   num(s, "node_load", "min"),
-                   num(s, "node_load", "avg"),
-                   num(s, "node_load", "max"),
-                   delta("placements", "placed"),
-                   delta("placements", "by_scans"),
-                   delta("placements", "moved"));
+                   value(covered,
+                         mark(covered_share < COVERED_LOOK, covered_share < COVERED_WRONG)),
+                   value(accounts),
+                   value(num(s, "coverage", "covered_threshold")),
+                   value(num(s, "coverage", "redundancy")),
+                   value(num(s, "coverage", "under_covered")),
+                   value(num(s, "coverage", "under_covered_down_only")),
+                   value(on_none, mark(on_none > 0, false)),
+                   value(num(s, "coverage", "on_none", "rejected")),
+                   value(num(s, "coverage", "on_none", "retrying")),
+                   value(num(s, "coverage", "on_none", "no_node")),
+                   value(num(s, "coverage", "on_none", "sent_never_acked")),
+                   value(num(s, "coverage", "on_none", "other")),
+                   value(num(s, "coverage", "unsendable")),
+                   value(num(s, "coverage", "lapsed")),
+                   value(num(s, "node_load", "min")),
+                   value(num(s, "node_load", "avg")),
+                   value(num(s, "node_load", "max")),
+                   value(delta("placements", "placed")),
+                   value(delta("placements", "by_scans")),
+                   value(delta("placements", "moved")));
 
+    std::string saved = "not saved yet";
+    if (get(s, "state", "saved_ago").is_number()) {
+        auto ago = num(s, "state", "saved_ago");
+        bool failed = get(s, "state", "failed") == true;
+        saved = "saved {} ago, {} accounts on {} nodes, {} session tokens (snapshot {:.0f} ms, "
+                "write {:.0f} ms){}"_format(
+                        value(friendly_duration(ago),
+                              mark(ago > std::chrono::duration<double>(SAVE_AGE_LOOK).count(),
+                                   false)),
+                        value(num(s, "state", "accounts")),
+                        value(num(s, "state", "nodes")),
+                        value(num(s, "state", "sessions")),
+                        value(num(s, "state", "snapshot_ms")),
+                        value(num(s, "state", "write_ms")),
+                        failed ? ", {}"_format(value("last save failed"s, Mark::look)) : ""s);
+    }
     out += "\n  State: {}; {}; sessions: {} resumed, {} replays discarded for {} accounts"_format(
-            get(s, "state", "saved_ago").is_number()
-                    ? "saved {} ago, {} accounts on {} nodes, {} session tokens (snapshot "
-                      "{:.0f} ms, write {:.0f} ms)"_format(
-                              friendly_duration(num(s, "state", "saved_ago")),
-                              num(s, "state", "accounts"),
-                              num(s, "state", "nodes"),
-                              num(s, "state", "sessions"),
-                              num(s, "state", "snapshot_ms"),
-                              num(s, "state", "write_ms"))
-                    : "not saved yet"s,
+            saved,
             get(s, "restored", "age").is_number()
                     ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
-                              num(s, "restored", "accounts"),
-                              num(s, "restored", "nodes"),
-                              friendly_duration(num(s, "restored", "age")),
-                              num(s, "restored", "nodes_dropped"),
+                              value(num(s, "restored", "accounts")),
+                              value(num(s, "restored", "nodes")),
+                              value(friendly_duration(num(s, "restored", "age"))),
+                              value(num(s, "restored", "nodes_dropped")),
                               restore_settled())
                     : "restored nothing"s,
-            delta("monitor_sessions", "resumed"),
-            delta("monitor_sessions", "replay_discarded"),
-            delta("monitor_sessions", "replay_discarded_accounts"));
+            value(delta("monitor_sessions", "resumed")),
+            value(delta("monitor_sessions", "replay_discarded")),
+            value(delta("monitor_sessions", "replay_discarded_accounts")));
 
+    auto snodes = num(s, "snodes"), connected = num(s, "connections");
+    auto connected_share = snodes > 0 ? connected / snodes : 1;
     out += "\n  Nodes: {}/{} connected, {} connecting, {} cooling down, {} connections made; "
            "{:.1f}/{:.1f} kB/s out/in"_format(
-                   num(s, "connections"),
-                   num(s, "snodes"),
-                   num(s, "pending_connections"),
-                   num(s, "cooling_down"),
-                   delta("connections_established"),
-                   rate("bytes_sent") / 1000,
-                   rate("bytes_received") / 1000);
+                   value(connected,
+                         mark(connected_share < NODES_CONNECTED_LOOK,
+                              connected_share < NODES_CONNECTED_WRONG)),
+                   value(snodes),
+                   value(num(s, "pending_connections")),
+                   value(num(s, "cooling_down")),
+                   value(delta("connections_established")),
+                   value(rate("bytes_sent") / 1000),
+                   value(rate("bytes_received") / 1000));
 
+    auto db_idle = num(s, "db_connections", "idle"), db_in_use = num(s, "db_connections", "in_use");
     out += "\n  Process: RSS {:.0f} MB; block {}{}; up {}; db connections {} idle, {} busy"_format(
-            num(s, "rss") / 1e6,
-            num(s, "block_height"),
+            value(num(s, "rss") / 1e6),
+            value(num(s, "block_height")),
             get(s, "block_age").is_number()
-                    ? ", {} old"_format(friendly_duration(num(s, "block_age")))
+                    ? ", {} old"_format(value(friendly_duration(num(s, "block_age"))))
                     : ""s,
-            friendly_duration(num(s, "uptime")),
-            num(s, "db_connections", "idle"),
-            num(s, "db_connections", "in_use"));
+            value(friendly_duration(num(s, "uptime"))),
+            value(db_idle),
+            value(db_in_use, mark(db_idle == 0 && db_in_use > 0, false)));
 
     if (const auto& accounts = get(s, "coverage", "on_none_accounts");
         accounts.is_array() && !accounts.empty()) {
@@ -3419,6 +3540,7 @@ void HiveMind::save_state(bool wait) {
             state_saved_.write_ms =
                     std::chrono::duration<double, std::milli>(steady_clock::now() - started)
                             .count();
+            state_saved_.failed = false;
             log::debug(
                     cat,
                     "Saved placement state of {} accounts on {} nodes, {} monitor session tokens: "
@@ -3430,6 +3552,7 @@ void HiveMind::save_state(bool wait) {
                     state_saved_.write_ms.load());
         } catch (const std::exception& e) {
             log::warning(cat, "Failed to save placement state: {}", e.what());
+            state_saved_.failed = true;
         }
         state_writing_ = false;
     };

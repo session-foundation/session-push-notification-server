@@ -1540,12 +1540,13 @@ def scenario_body_limit(build_dir):
 
 def scenario_status_report(build_dir):
     """The periodic status report, here every 15 seconds, with no saved state, and notifiers in
-    every state a service's stats can be in: one sent a push, with a large lifetime failure count
-    from earlier runs; one registered and reporting its stats but sent no push; and one with stats
-    left in the database from an earlier run but not registered now.  The hivemind logs two
-    reports and keeps running: the busy notifier has its own line, without the lifetime failures
-    shown as if they were the interval's, the quiet one is listed as idle, and the unregistered
-    one is left out."""
+    every state a service's stats can be in: one sent more pushes than the ack interval, with a
+    large lifetime failure count from earlier runs; one registered and reporting its stats but
+    sent no push; and one with stats left in the database from an earlier run but not registered
+    now.  The hivemind logs two reports and keeps running: the busy notifier has its own line, with
+    its acks' round trip and no count of unacknowledged pushes below a full window, and without the
+    lifetime failures shown as if they were the interval's; the quiet one is listed as idle, and
+    the unregistered one is left out."""
     fresh_db()
     seed(0, 10)
     execute(
@@ -1557,16 +1558,25 @@ def scenario_status_report(build_dir):
     try:
         quiet = Proc("quiet", [f"{FAKES}/fake_notifier", "--stats", HIVEMIND_SOCK, "200", "quiet"])
         check(quiet.readline(120) == "registered", "the quiet notifier did not register")
-        s.network.cmd("send #1 status-report-aaaaaaaaaaaaaaaaaaaaaaaaaaa 0 100")
-        c = s.wait_pushes(1, 30)
-        check(c["pushes"] == 1, f"no push for the busy notifier: {c}")
+        # More pushes than the ack interval (95), for an acknowledgement's round trip to be timed.
+        pushes = 100
+        for i in range(pushes):
+            s.network.cmd(f"send #1 status-report-{i:026d} 0 100")
+        c = s.wait_pushes(pushes, 30)
+        check(c["pushes"] == pushes, f"not every push for the busy notifier: {c}")
         deadline = time.time() + 60 * TIME_SCALE
         while (reports := s.hivemind.log().count("Status report, over the last")) < 2:
             check(s.hivemind.p.poll() is None, "the hivemind died before its second report")
             check(time.time() < deadline, f"only {reports} status reports logged")
             time.sleep(0.5)
         log = s.hivemind.log()
-        check("    dummy: " in log, "the busy notifier has no line in the report")
+        busy = re.search(r"^    dummy: .*", log, re.M)
+        check(busy, "the busy notifier has no line in the report")
+        check(
+            re.match(r"    dummy: [\d.]+ pushes/s, ack [\d.]+m?s avg / [\d.]+m?s max", busy.group(0)),
+            f"no ack round trip on the busy notifier's line: {busy.group(0)}",
+        )
+        check("unacked" not in log, "a report shows unacked pushes below a full window")
         check(
             re.search(r"^    idle: .*\bquiet\b", log, re.M),
             "the quiet notifier is not listed as idle",
@@ -1574,6 +1584,7 @@ def scenario_status_report(build_dir):
         check("retired" not in log, "the unregistered notifier is in the report")
         check("failures" not in log, "lifetime failures reported as the interval's")
         print(f"    {reports} status reports logged, with the busy, quiet and retired notifiers")
+        print(f"    {busy.group(0).strip()}")
     finally:
         if quiet:
             quiet.stop()

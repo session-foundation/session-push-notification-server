@@ -504,7 +504,8 @@ void SNode::on_monitor_response(std::vector<const SwarmPubkey*> entries, quic::m
             hivemind_.refused(*this, *acct, std::move(errors[last]));
     }
 
-    hivemind_.count_monitor_reply(bool(response), response.timed_out, wrong_swarm, rejected);
+    hivemind_.count_monitor_reply(
+            bool(response), response.timed_out, entries.size(), wrong_swarm, rejected);
 
     // Log the per-entry outcome of an answered request: a warning if any entry was rejected or
     // failed, and only a debug line if the sole non-successes were wrong-swarm refusals, which
