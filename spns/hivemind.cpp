@@ -42,6 +42,14 @@ namespace log = oxen::log;
 static auto cat = log::Cat("hivemind");
 static auto stats = log::Cat("stats");
 
+// A duration of whole seconds as hours and minutes, minutes and seconds, or seconds, as fits.
+static std::string friendly_duration(double secs) {
+    auto t = static_cast<int64_t>(secs);
+    return t >= 3600 ? "{}h{:02}m"_format(t / 3600, t / 60 % 60)
+         : t >= 60   ? "{}m{:02}s"_format(t / 60, t % 60)
+                     : "{}s"_format(t);
+}
+
 HiveMind::HiveMind(Config conf_in) :
         config{std::move(conf_in)},
         pool_{config.pg_connect},
@@ -378,7 +386,7 @@ HiveMind::HiveMind(Config conf_in) :
         log::info(
                 cat,
                 "Waiting for notifiers to register (max {})",
-                wait_until - steady_clock::now());
+                friendly_duration(std::chrono::duration<double>(config.notifier_wait).count()));
         while (!notifier_startup_done(wait_until))
             std::this_thread::sleep_for(25ms);
         std::lock_guard lock{services_mutex_};
@@ -1620,12 +1628,6 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     };
     auto delta = [&](const auto&... path) { return num(s, path...) - num(prev, path...); };
     auto rate = [&](const auto&... path) { return dt > 0 ? delta(path...) / dt : 0.0; };
-    auto duration = [](double secs) {
-        auto t = static_cast<int64_t>(secs);
-        return t >= 3600 ? "{}h{:02}m"_format(t / 3600, t / 60 % 60)
-             : t >= 60   ? "{}m{:02}s"_format(t / 60, t % 60)
-                         : "{}s"_format(t);
-    };
     auto restore_settled = [&] {
         auto dropped =
                 "{} no session, {} resume failed, {} node left swarm, {} monitor ended"_format(
@@ -1648,7 +1650,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     // report's figures for those are over the time since.
     bool have_prev = prev.is_object() && !prev.empty();
 
-    std::string out = "Status report, over the last {}:"_format(duration(dt));
+    std::string out = "Status report, over the last {}:"_format(friendly_duration(dt));
 
     out += "\n  Notifiers:";
     std::vector<std::string> shown, idle;
@@ -1683,7 +1685,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         if (failures > 0)
             out += ", {} failures"_format(failures);
         if (blocked.is_number())
-            out += "; window blocked {}"_format(duration(blocked.get<double>()));
+            out += "; window blocked {}"_format(friendly_duration(blocked.get<double>()));
         if (gone)
             out += "; connection lost";
     }
@@ -1750,7 +1752,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
             get(s, "state", "saved_ago").is_number()
                     ? "saved {} ago, {} accounts on {} nodes, {} session tokens (snapshot "
                       "{:.0f} ms, write {:.0f} ms)"_format(
-                              duration(num(s, "state", "saved_ago")),
+                              friendly_duration(num(s, "state", "saved_ago")),
                               num(s, "state", "accounts"),
                               num(s, "state", "nodes"),
                               num(s, "state", "sessions"),
@@ -1761,7 +1763,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                     ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped; {}"_format(
                               num(s, "restored", "accounts"),
                               num(s, "restored", "nodes"),
-                              duration(num(s, "restored", "age")),
+                              friendly_duration(num(s, "restored", "age")),
                               num(s, "restored", "nodes_dropped"),
                               restore_settled())
                     : "restored nothing"s,
@@ -1782,9 +1784,10 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     out += "\n  Process: RSS {:.0f} MB; block {}{}; up {}; db connections {} idle, {} busy"_format(
             num(s, "rss") / 1e6,
             num(s, "block_height"),
-            get(s, "block_age").is_number() ? ", {} old"_format(duration(num(s, "block_age")))
-                                            : ""s,
-            duration(num(s, "uptime")),
+            get(s, "block_age").is_number()
+                    ? ", {} old"_format(friendly_duration(num(s, "block_age")))
+                    : ""s,
+            friendly_duration(num(s, "uptime")),
             num(s, "db_connections", "idle"),
             num(s, "db_connections", "in_use"));
 

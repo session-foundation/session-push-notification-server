@@ -40,7 +40,14 @@ struct Config {
     // missed notifications (an unrecognised key gets a small anonymous session).
     Ed25519Secret quic_keys;
 
-    std::chrono::seconds filter_lifetime = 10min;
+    // The least time the notification filter remembers a notification's hash for, so as to push it
+    // only once however many nodes, or replays, deliver it.  It must outlast the oldest a
+    // notification can be when it arrives: one replayed when a monitor session is resumed can be
+    // about 13 minutes old (the 10 minutes a detached session lasts, plus the reconnection and the
+    // node's cleanup timer), and a duplicate of one already pushed must still be recognised then.
+    // The filter keeps two generations, each this long, so a longer lifetime costs only a little
+    // more memory.
+    std::chrono::seconds filter_lifetime = 15min;
 
     // How long after startup we wait for notifier services to register themselves with us before we
     // connect to the network and start processing user requests.

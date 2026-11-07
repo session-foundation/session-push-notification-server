@@ -39,8 +39,12 @@ max_connects = 1000
 
 # We use a time-based filter on notifications to avoid sending duplicate notifications; this timer
 # controls the minimum time for which we will filter duplicates.  (In practice, the filter will
-# often last somewhat longer than this, but this is the minimum).
-filter_lifetime = 300
+# often last somewhat longer than this, but this is the minimum).  It must outlast the oldest a
+# notification can be when it reaches us: one replayed after a monitor session is resumed can be
+# about 13 minutes old (the 10 minutes a detached session lasts, plus the reconnection and the
+# storage server's cleanup timer), and a duplicate of one already pushed must still be recognised
+# then.  The filter keeps two generations of hashes, so a longer lifetime costs a little memory.
+filter_lifetime = 900
 
 # How long the main hivemind process will wait at startup before establishing connections to
 # the network's service nodes.  This delay is designed to allow subordinate notification processes
