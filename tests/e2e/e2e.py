@@ -1272,19 +1272,23 @@ def scenario_body_limit(build_dir):
 
 def scenario_status_report(build_dir):
     """The periodic status report, here every 15 seconds, with no saved state, and notifiers in
-    every state a service's stats can be in: one sent a push, one registered and reporting its
-    stats but sent no push, and one with stats left in the database from an earlier run but not
-    registered now.  The hivemind logs two reports, naming all three, and keeps running."""
+    every state a service's stats can be in: one sent a push, with a large lifetime failure count
+    from earlier runs; one registered and reporting its stats but sent no push; and one with stats
+    left in the database from an earlier run but not registered now.  The hivemind logs two
+    reports and keeps running: the busy notifier has its own line, without the lifetime failures
+    shown as if they were the interval's, the quiet one is listed as idle, and the unregistered
+    one is left out."""
     fresh_db()
     seed(0, 10)
     execute(
-        "INSERT INTO service_stats (service, name, val_int) VALUES ('retired', 'notifies', 5)"
+        "INSERT INTO service_stats (service, name, val_int) VALUES ('retired', 'notifies', 5), "
+        "('dummy', 'failures', 1000000)"
     )
     s = Setup(build_dir, nodes=3, config="status_report_interval = 15")
-    idle = None
+    quiet = None
     try:
-        idle = Proc("idle", [f"{FAKES}/fake_notifier", "--stats", HIVEMIND_SOCK, "200", "idle"])
-        check(idle.readline(120) == "registered", "the idle notifier did not register")
+        quiet = Proc("quiet", [f"{FAKES}/fake_notifier", "--stats", HIVEMIND_SOCK, "200", "quiet"])
+        check(quiet.readline(120) == "registered", "the quiet notifier did not register")
         s.network.cmd("send #1 status-report-aaaaaaaaaaaaaaaaaaaaaaaaaaa 0 100")
         c = s.wait_pushes(1, 30)
         check(c["pushes"] == 1, f"no push for the busy notifier: {c}")
@@ -1294,12 +1298,17 @@ def scenario_status_report(build_dir):
             check(time.time() < deadline, f"only {reports} status reports logged")
             time.sleep(0.5)
         log = s.hivemind.log()
-        for service in ("dummy", "idle", "retired"):
-            check(f"    {service}: " in log, f"the {service} notifier is missing from the report")
-        print(f"    {reports} status reports logged, naming the busy, idle and retired notifiers")
+        check("    dummy: " in log, "the busy notifier has no line in the report")
+        check(
+            re.search(r"^    idle: .*\bquiet\b", log, re.M),
+            "the quiet notifier is not listed as idle",
+        )
+        check("retired" not in log, "the unregistered notifier is in the report")
+        check("failures" not in log, "lifetime failures reported as the interval's")
+        print(f"    {reports} status reports logged, with the busy, quiet and retired notifiers")
     finally:
-        if idle:
-            idle.stop()
+        if quiet:
+            quiet.stop()
         rc = s.stop()
     check(rc == 0, f"hivemind exit code {rc}")
     check_log(s.hivemind)

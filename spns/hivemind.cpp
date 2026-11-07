@@ -1405,6 +1405,12 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, bo
     }
     {
         std::lock_guard lock{services_mutex_};
+        auto& registered = result["notifiers_registered"] = nlohmann::json::array();
+        for (const auto& [service, conn] : services_)
+            registered.push_back(service);
+        auto& gone = result["notifiers_gone"] = nlohmann::json::array();
+        for (const auto& [service, since] : services_gone_)
+            gone.push_back(service);
         for (const auto& [service, dropped] : registrations_dropped_)
             result["registrations_dropped"][service] = {
                     {"ids", dropped.first}, {"subscriptions", dropped.second}};
@@ -1613,38 +1619,56 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                          : "{}s"_format(t);
     };
 
+    // The notifiers' own counters (service_stats) are kept across restarts, so they are compared
+    // only with an earlier report's; the hivemind's start from zero at startup, and the first
+    // report's figures for those are over the time since.
+    bool have_prev = prev.is_object() && !prev.empty();
+
     std::string out = "Status report, over the last {}:"_format(duration(dt));
 
     out += "\n  Notifiers:";
-    if (!s.contains("notifier_queue") && !s.contains("notifier"))
+    std::vector<std::string> shown, idle;
+    for (const auto* key : {"notifiers_registered", "notifiers_gone"})
+        if (const auto& names = get(s, key); names.is_array())
+            for (const auto& name : names)
+                shown.push_back(name.get<std::string>());
+    if (shown.empty())
         out += " none";
-    std::set<std::string> services;
-    for (const auto* key : {"notifier_queue", "notifier", "registrations_dropped"})
-        if (const auto& by_service = get(s, key); by_service.is_object())
-            for (const auto& [service, v] : by_service.items())
-                services.insert(service);
-    for (const auto& service : services) {
+    std::sort(shown.begin(), shown.end());
+    for (const auto& service : shown) {
+        bool gone = false;
+        if (const auto& names = get(s, "notifiers_gone"); names.is_array())
+            gone = std::find(names.begin(), names.end(), service) != names.end();
+        auto sent = delta("notifier_queue", service, "sent"),
+             unacked = num(s, "notifier_queue", service, "unacked"),
+             backlog = num(s, "notifier_queue", service, "backlog"),
+             dropped = delta("notifier_queue", service, "dropped");
+        double failures = have_prev && get(prev, "notifier", service, "failures").is_number()
+                                ? delta("notifier", service, "failures")
+                                : 0;
+        const auto& blocked = get(s, "notifier_queue", service, "blocked_for");
+        // Pushes sent but not yet acknowledged are no sign of activity: below the ack interval
+        // some always are.
+        if (!gone && sent == 0 && backlog == 0 && dropped == 0 && failures == 0 &&
+            !blocked.is_number()) {
+            idle.push_back(service);
+            continue;
+        }
         out += "\n    {}: {:.1f} pushes/s, {} unacked, {} backlogged, {} dropped"_format(
-                service,
-                rate("notifier_queue", service, "sent"),
-                num(s, "notifier_queue", service, "unacked"),
-                num(s, "notifier_queue", service, "backlog"),
-                delta("notifier_queue", service, "dropped"));
-        if (const auto& b = get(s, "notifier_queue", service, "blocked_for"); b.is_number())
-            out += "; window blocked for {}"_format(duration(b.get<double>()));
-        if (const auto& stats = get(s, "notifier", service); stats.is_object())
-            for (const auto& [stat, v] : stats.items())
-                if (v.is_number_integer())
-                    out += "; {} {:.1f}/s"_format(stat, rate("notifier", service, stat));
-        if (auto ids = delta("registrations_dropped", service, "ids"); ids > 0)
-            out += "; registrations dropped: {} ids / {} subscriptions"_format(
-                    ids, delta("registrations_dropped", service, "subscriptions"));
+                service, dt > 0 ? sent / dt : 0.0, unacked, backlog, dropped);
+        if (failures > 0)
+            out += ", {} failures"_format(failures);
+        if (blocked.is_number())
+            out += "; window blocked {}"_format(duration(blocked.get<double>()));
+        if (gone)
+            out += "; connection lost";
     }
+    if (!idle.empty())
+        out += "\n    idle: {}"_format(fmt::join(idle, ", "));
 
     auto batches = delta("incoming", "lookup_batches");
-    out += "\n  Incoming: {:.1f} notifications/s from nodes, {:.1f}/s unique, {:.1f} pushes/s; "
-           "queue {} ({} B); {} dropped; {:.2f} lookup batches/s of {:.1f} on average; {} lookup "
-           "failures"_format(
+    out += "\n  Incoming: {:.1f}/s from nodes, {:.1f}/s unique, {:.1f} pushes/s; queue {} ({} B), "
+           "{} dropped; lookups {:.2f}/s, {:.1f} per batch, {} failed"_format(
                    rate("incoming", "received"),
                    rate("incoming", "unique"),
                    rate("incoming", "pushes"),
@@ -1655,15 +1679,11 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    batches > 0 ? delta("incoming", "unique") / batches : 0.0,
                    delta("incoming", "lookup_failures"));
 
-    out += "\n  Subscriptions: {} accounts, {} subscriptions; swarm index {} accounts in {} "
-           "swarms; "
-           "schedule {}; {} placed to send; {}/{} requests in flight, "
-           "{} nodes waiting; over the interval {} requests ({} answered, {} failed, {} timed "
-           "out), {} refused for the wrong swarm, {} accounts moved, {} monitor sessions "
-           "resumed"_format(
+    out += "\n  Subscriptions: {} accounts, {} subscriptions, {} swarms; schedule {}; {} to send; "
+           "requests {}/{} in flight, {} nodes waiting, {} sent ({} answered, {} failed, {} timed "
+           "out), {} wrong swarm; {} accounts moved"_format(
                    num(s, "accounts_monitored"),
                    num(s, "subscriptions_distinct"),
-                   num(s, "swarm_index", "accounts"),
                    num(s, "swarm_index", "swarms"),
                    num(s, "schedule"),
                    num(s, "pending", "accounts"),
@@ -1675,14 +1695,12 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    delta("monitor_requests", "failed"),
                    delta("monitor_requests", "timed_out"),
                    delta("monitor_requests", "wrong_swarm"),
-                   delta("accounts_moved"),
-                   delta("monitor_sessions", "resumed"));
+                   delta("accounts_moved"));
 
-    out += "\n  Coverage: {}/{} accounts covered (on {} nodes or their swarm's target, if fewer; "
-           "redundancy {}), {} under-covered ({} of them only on down nodes), {} on none ({} "
-           "rejected, {} retrying, {} no node, {} unacknowledged, {} other), {} unsendable, {} "
-           "lapsed; node load {}/{:.0f}/{} accounts (min/avg/max); over the interval {} "
-           "placements, {} more by nodes' scans, {} moving a monitor to another node"_format(
+    out += "\n  Coverage: {}/{} covered (on {}+ nodes; redundancy {}), {} under-covered ({} only "
+           "on down nodes), {} on none ({} rejected, {} retrying, {} no node, {} unacknowledged, "
+           "{} other), {} unsendable, {} lapsed; node load min/avg/max {}/{:.0f}/{}; placements: "
+           "{} direct, {} by scans, {} moved"_format(
                    num(s, "coverage", "covered"),
                    num(s, "coverage", "accounts"),
                    num(s, "coverage", "covered_threshold"),
@@ -1704,31 +1722,29 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    delta("placements", "by_scans"),
                    delta("placements", "moved"));
 
-    out += "\n  State: {}; at startup {}; over the interval {} monitor sessions resumed, {} missed "
-           "notifications for {} accounts discarded beyond the replay budget"_format(
-                   get(s, "state", "saved_ago").is_number()
-                           ? "saved {} ago, {} accounts in {:.1f} MB (snapshot {:.0f} ms, write "
-                             "{:.0f} ms)"_format(
-                                     duration(num(s, "state", "saved_ago")),
-                                     num(s, "state", "accounts"),
-                                     num(s, "state", "bytes") / 1e6,
-                                     num(s, "state", "snapshot_ms"),
-                                     num(s, "state", "write_ms"))
-                           : "not saved yet"s,
-                   get(s, "restored", "age").is_number()
-                           ? "restored {} accounts on {} nodes from a save {} old ({} nodes "
-                             "dropped)"_format(
-                                     num(s, "restored", "accounts"),
-                                     num(s, "restored", "nodes"),
-                                     duration(num(s, "restored", "age")),
-                                     num(s, "restored", "nodes_dropped"))
-                           : "nothing restored"s,
-                   delta("monitor_sessions", "resumed"),
-                   delta("monitor_sessions", "replay_discarded"),
-                   delta("monitor_sessions", "replay_discarded_accounts"));
+    out += "\n  State: {}; {}; sessions: {} resumed, {} replays discarded for {} accounts"_format(
+            get(s, "state", "saved_ago").is_number()
+                    ? "saved {} ago, {} accounts, {:.1f} MB (snapshot {:.0f} ms, write {:.0f} "
+                      "ms)"_format(
+                              duration(num(s, "state", "saved_ago")),
+                              num(s, "state", "accounts"),
+                              num(s, "state", "bytes") / 1e6,
+                              num(s, "state", "snapshot_ms"),
+                              num(s, "state", "write_ms"))
+                    : "not saved yet"s,
+            get(s, "restored", "age").is_number()
+                    ? "restored {} accounts on {} nodes from {} ago, {} nodes dropped"_format(
+                              num(s, "restored", "accounts"),
+                              num(s, "restored", "nodes"),
+                              duration(num(s, "restored", "age")),
+                              num(s, "restored", "nodes_dropped"))
+                    : "restored nothing"s,
+            delta("monitor_sessions", "resumed"),
+            delta("monitor_sessions", "replay_discarded"),
+            delta("monitor_sessions", "replay_discarded_accounts"));
 
-    out += "\n  Nodes: {}/{} connected, {} connecting, {} cooling down; {} connections made; "
-           "{:.1f} kB/s sent, {:.1f} kB/s received"_format(
+    out += "\n  Nodes: {}/{} connected, {} connecting, {} cooling down, {} connections made; "
+           "{:.1f}/{:.1f} kB/s out/in"_format(
                    num(s, "connections"),
                    num(s, "snodes"),
                    num(s, "pending_connections"),
@@ -1737,16 +1753,14 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                    rate("bytes_sent") / 1000,
                    rate("bytes_received") / 1000);
 
-    out += "\n  Process: RSS {:.0f} MB; block {} ({}); up {}; database connections {} idle, {} in "
-           "use"_format(
-                   num(s, "rss") / 1e6,
-                   num(s, "block_height"),
-                   get(s, "block_age").is_number()
-                           ? "hash changed {} ago"_format(duration(num(s, "block_age")))
-                           : "none yet"s,
-                   duration(num(s, "uptime")),
-                   num(s, "db_connections", "idle"),
-                   num(s, "db_connections", "in_use"));
+    out += "\n  Process: RSS {:.0f} MB; block {}{}; up {}; db connections {} idle, {} busy"_format(
+            num(s, "rss") / 1e6,
+            num(s, "block_height"),
+            get(s, "block_age").is_number() ? ", {} old"_format(duration(num(s, "block_age")))
+                                            : ""s,
+            duration(num(s, "uptime")),
+            num(s, "db_connections", "idle"),
+            num(s, "db_connections", "in_use"));
 
     if (const auto& accounts = get(s, "coverage", "on_none_accounts");
         accounts.is_array() && !accounts.empty()) {
@@ -3144,9 +3158,8 @@ void HiveMind::log_coverage_progress() {
          c.under_down_only != was.under_down_only || c.at_zero != was.at_zero))
         log::info(
                 cat,
-                "{}/{} accounts ({:.1f}%) covered, {} under-covered ({} of them only on down "
-                "nodes); {} on none; {} unsendable; {}/{} requests in flight, {} nodes waiting for "
-                "one",
+                "Coverage: {}/{} accounts ({:.1f}%) covered, {} under-covered ({} only on down "
+                "nodes), {} on none, {} unsendable; {}/{} requests in flight, {} nodes waiting",
                 c.covered,
                 c.accounts,
                 c.accounts ? 100.0 * c.covered / c.accounts : 100.0,
