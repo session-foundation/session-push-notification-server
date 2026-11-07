@@ -1837,7 +1837,8 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
     auto accounts = num(s, "coverage", "accounts"), covered = num(s, "coverage", "covered"),
          on_none = num(s, "coverage", "at_zero");
     auto covered_share = accounts > 0 ? covered / accounts : 1;
-    out += "\n  Coverage: {}/{} covered (on {}+ nodes; redundancy {}), {} under-covered ({} only "
+    auto redundancy = num(s, "coverage", "redundancy");
+    out += "\n  Coverage: {}/{} covered (on {}+ nodes; {}), {} under-covered ({} only "
            "on down nodes), {} on none ({} rejected, {} retrying, {} no node, {} sent but never "
            "acknowledged, {} other), {} unsendable, {} lapsed; node load min/avg/max "
            "{}/{:.0f}/{}; placements: {} direct, {} by scans, {} moved"_format(
@@ -1845,7 +1846,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
                          mark(covered_share < COVERED_LOOK, covered_share < COVERED_WRONG)),
                    value(accounts),
                    value(num(s, "coverage", "covered_threshold")),
-                   value(num(s, "coverage", "redundancy")),
+                   redundancy < 0 ? "full redundancy"s : "redundancy {}"_format(value(redundancy)),
                    value(num(s, "coverage", "under_covered")),
                    value(num(s, "coverage", "under_covered_down_only")),
                    value(on_none, mark(on_none > 0, on_none >= ON_NONE_WRONG * accounts)),
