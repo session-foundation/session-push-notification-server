@@ -323,17 +323,18 @@ void SNode::on_monitor_session_response(quic::message response) {
 
     try {
         oxenc::bt_dict_consumer d{response.body()};
-        // The accounts with more missed notifications than the request's budget, and how many of
-        // each it discarded.
+        // The accounts with more missed notifications than the request's budget, each with how
+        // many it discarded in each namespace that had any.
         int64_t discarded = 0, discarded_accounts = 0;
         if (d.skip_until("m"))
-            for (auto list = d.consume_list_consumer(); !list.is_finished();) {
-                auto e = list.consume_dict_consumer();
-                e.require<std::string_view>("@");
-                discarded += e.require<int64_t>("o");
+            for (auto accounts = d.consume_dict_consumer(); !accounts.is_finished();) {
+                for (auto [account, cut] = accounts.next_list_consumer(); !cut.is_finished();) {
+                    auto e = cut.consume_dict_consumer();
+                    e.require<int>("n");
+                    discarded += e.require<int64_t>("o");
+                }
                 discarded_accounts++;
             }
-        auto overflow = d.maybe<int64_t>("o").value_or(0);
         auto resumed = d.maybe<int>("r").value_or(0) != 0;
         auto monitors = "le"sv;
         if (d.skip_until("s"))
@@ -347,7 +348,7 @@ void SNode::on_monitor_session_response(quic::message response) {
         monitor_sessions_ = MonitorSessions::supported;
         session_bound_ = true;
         hivemind_.count_replay_discarded(discarded, discarded_accounts);
-        hivemind_.monitor_session_started(*this, token, resumed, monitors, overflow);
+        hivemind_.monitor_session_started(*this, token, resumed, monitors);
     } catch (const std::exception& e) {
         log::warning(
                 cat,

@@ -1564,7 +1564,6 @@ void HiveMind::get_stats_json(std::function<void(nlohmann::json)> when_ready, St
                 {"failed", ss.failed},
                 {"resumed_live", ss.kept},
                 {"resumed_ended", ss.ended},
-                {"missed_overflow", ss.overflow},
                 {"replay_discarded", ss.replay_discarded},
                 {"replay_discarded_accounts", ss.replay_discarded_accounts}};
         result["subscriptions_distinct"] = subscription_count_;
@@ -3655,22 +3654,10 @@ void HiveMind::abandon_resume(hive::SNode& node, Settled why) {
 }
 
 void HiveMind::monitor_session_started(
-        hive::SNode& node,
-        const MonitorToken& token,
-        bool resumed,
-        std::string_view monitors,
-        int64_t overflow) {
+        hive::SNode& node, const MonitorToken& token, bool resumed, std::string_view monitors) {
     auto [it, inserted] = monitor_tokens_.try_emplace(node.pubkey, token);
     bool had_token = !inserted;
     it->second = token;
-    if (overflow > 0) {
-        log::warning(
-                cat,
-                "{} discarded {} notifications for us while we were away, more than it holds",
-                node.pubkey,
-                overflow);
-        monitor_session_stats_.overflow += overflow;
-    }
 
     if (!resumed) {
         if (had_token)

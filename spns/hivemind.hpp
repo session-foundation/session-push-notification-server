@@ -384,11 +384,10 @@ class HiveMind {
     // How the nodes' connections have gone for monitor sessions since startup: not offered one for
     // their version; and for monitor_session requests, a new session, a resumed one, a node without
     // sessions (despite its version), or no answer; and for resumed ones, the accounts whose claims
-    // stood, the monitors the node reported ended, and the notifications it discarded for overflow
-    // while we were away.
+    // stood, and the monitors the node reported ended.
     struct {
         int64_t old_version = 0, created = 0, resumed = 0, unsupported = 0, failed = 0;
-        int64_t kept = 0, ended = 0, overflow = 0;
+        int64_t kept = 0, ended = 0;
         // Missed notifications nodes discarded beyond Config::resume_replay, and the accounts they
         // were for.
         int64_t replay_discarded = 0, replay_discarded_accounts = 0;
@@ -731,14 +730,10 @@ class HiveMind {
     void request_finished();
 
     // Called by an SNode with the answer to its monitor_session request: a session, resumed or new,
-    // with its token, the list of its monitors (when resumed) and its count of notifications lost
-    // to overflow; or no session, because the node does not support them, or did not answer.
+    // with its token and the list of its monitors (when resumed); or no session, because the node
+    // does not support them, or did not answer.
     void monitor_session_started(
-            hive::SNode& snode,
-            const MonitorToken& token,
-            bool resumed,
-            std::string_view monitors,
-            int64_t overflow);
+            hive::SNode& snode, const MonitorToken& token, bool resumed, std::string_view monitors);
     void monitor_session_unsupported(hive::SNode& snode);
     void monitor_session_failed(hive::SNode& snode);
 

@@ -19,7 +19,7 @@
 // protocol (the token the only credential, and only the latest one issued valid, the session's
 // monitors listed on resume, or only its ended ones with "l" at 0, missed notifications recorded
 // while it is detached, at most "m" per account, the newest, and replayed after the reply, which
-// reports the discards), cut the bodies they send for a monitor session to its "b", with "L", and
+// reports the discards per account and namespace, as storage server 2.13.0 does), cut the bodies they send for a monitor session to its "b", with "L", and
 // give "x" in replies; without, they model today's network: monitor_session is an unknown endpoint,
 // and there is no "x".  A "b" on a monitor entry is ignored, and monitors on a connection without a
 // session get whole bodies.  When a swarm change takes an account from a node, its monitors there
@@ -285,14 +285,14 @@ struct MonitorSession {
     Monitors monitors;
     std::optional<quic::ConnectionID> bound;
     std::deque<Missed> missed;
-    int64_t overflow = 0;
     // The most bytes of a body sent for the session (the request's b; none if unset), live and on
     // replay alike.
     std::optional<int64_t> body_limit;
     // The most missed notifications kept per account (the request's m), and how many each
-    // account has had discarded beyond it since the session's last answer.
+    // account has had discarded beyond it in each namespace since the session's last answer (in
+    // byte order of the account, and namespace order, as the reply lists them).
     std::optional<int64_t> budget;
-    std::map<std::string, int64_t> discarded;
+    std::map<std::string, std::map<int, int64_t>> discarded;
 
     bool live(steady_clock::time_point now) const {
         return std::any_of(monitors.begin(), monitors.end(), [&](const auto& m) {
@@ -612,16 +612,18 @@ int main(int argc, char** argv) {
         conn.monitor_session = token;
 
         oxenc::bt_dict_producer reply;
-        if (!sess.discarded.empty()) {
-            auto list = reply.append_list("m");
-            for (const auto& [account, count] : sess.discarded) {
-                auto e = list.append_dict();
-                e.append("@", account);
-                e.append("o", count);
+        {
+            auto accounts = reply.append_dict("m");
+            for (const auto& [account, by_ns] : sess.discarded) {
+                auto list = accounts.append_list(account);
+                for (const auto& [ns, count] : by_ns) {
+                    auto e = list.append_dict();
+                    e.append("n", ns);
+                    e.append("o", count);
+                }
             }
             sess.discarded.clear();
         }
-        reply.append("o", sess.overflow);
         reply.append("r", resumed ? 1 : 0);
         {
             auto list = reply.append_list("s");
@@ -677,7 +679,6 @@ int main(int argc, char** argv) {
                     conn.stream->command(
                             "notify", notification(missed.note, missed.data, sess.body_limit));
         sess.missed.clear();
-        sess.overflow = 0;
         node.monitor_sessions.emplace(token, std::move(sess));
     };
 
@@ -808,7 +809,6 @@ int main(int argc, char** argv) {
     // detached monitor sessions with a live monitor that wants it.
     auto deliver = [&](Node& node, const Note& note) {
         auto now = steady_clock::now();
-        size_t total_missed = 0;
         for (auto& [token, sess] : node.monitor_sessions) {
             if (!sess.bound) {
                 auto it = sess.monitors.find(note.account);
@@ -820,36 +820,15 @@ int main(int argc, char** argv) {
                         std::count_if(sess.missed.begin(), sess.missed.end(), [&](const Missed& m) {
                             return m.note.account == note.account;
                         }) > *sess.budget) {
-                        sess.missed.erase(
-                                std::find_if(
-                                        sess.missed.begin(),
-                                        sess.missed.end(),
-                                        [&](const Missed& m) {
-                                            return m.note.account == note.account;
-                                        }));
-                        sess.discarded[note.account]++;
-                    }
-                    size_t cap =
-                            std::clamp<size_t>(100 * monitor_count(sess.monitors), 1000, 50'000);
-                    while (sess.missed.size() > cap) {
-                        sess.missed.pop_front();
-                        sess.overflow++;
+                        auto oldest = std::find_if(
+                                sess.missed.begin(), sess.missed.end(), [&](const Missed& m) {
+                                    return m.note.account == note.account;
+                                });
+                        sess.discarded[note.account][oldest->note.ns]++;
+                        sess.missed.erase(oldest);
                     }
                 }
             }
-            total_missed += sess.missed.size();
-        }
-        while (total_missed > 1'000'000) {
-            auto& biggest = std::max_element(
-                                    node.monitor_sessions.begin(),
-                                    node.monitor_sessions.end(),
-                                    [](const auto& a, const auto& b) {
-                                        return a.second.missed.size() < b.second.missed.size();
-                                    })
-                                    ->second;
-            biggest.missed.pop_front();
-            biggest.overflow++;
-            total_missed--;
         }
         if (!node.current)
             return;
