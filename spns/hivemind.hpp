@@ -319,6 +319,9 @@ class HiveMind {
         return a.second > b.second;
     }
     void schedule(const SwarmPubkey& account, system_time when);
+    // Replaces the schedule with one entry per scheduled account, at its next_due: for when many
+    // accounts' renewals have been set at once, superseding the entries they had.
+    void rebuild_schedule();
     // How long until an account placed now is next renewed: 45-55 minutes (see RESUBSCRIBE_MIN),
     // unless configured otherwise.
     std::chrono::seconds resubscribe_delay() const;
@@ -359,6 +362,12 @@ class HiveMind {
     // Gives up the claims a node holds for its monitor session to be resumed, when it was not
     // resumed after all.
     void abandon_resume(hive::SNode& node);
+    // Settles the restored claims (see SwarmPubkey::restored) a node holds: confirmed, its session
+    // resumed, or about to be released, which drops each with drop_restored().
+    void settle_restored(const hive::SNode& node, bool confirmed);
+    // Drops `account`'s restored claim on `slot`, if it has one, ahead of the claim's release:
+    // once it has none left, it is renewed as for a placement made now.
+    void drop_restored(const SwarmPubkey& account, int slot);
 
     // How the nodes' connections have gone for monitor sessions since startup: not offered one for
     // their version; and for monitor_session requests, a new session, a resumed one, a node without

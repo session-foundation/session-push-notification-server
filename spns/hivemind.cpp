@@ -2549,6 +2549,14 @@ void HiveMind::schedule(const SwarmPubkey& account, system_time when) {
     std::push_heap(schedule_.begin(), schedule_.end(), schedule_later);
 }
 
+void HiveMind::rebuild_schedule() {
+    schedule_.clear();
+    for (const auto& [account, subs] : subscribers_)
+        if (account.next_due != SwarmPubkey::UNSCHEDULED)
+            schedule_.emplace_back(&account, account.next_due);
+    std::make_heap(schedule_.begin(), schedule_.end(), schedule_later);
+}
+
 std::vector<const SwarmPubkey*>::iterator HiveMind::Swarm::find(const SwarmPubkey& account) {
     auto it = std::lower_bound(
             members.begin(),
@@ -2597,6 +2605,7 @@ void HiveMind::release(const SwarmPubkey& account, Swarm& swarm, int slot) {
         swarm.by_claims[claims - 1]++;
         account.sent &= ~bit;
         account.acked &= ~bit;
+        account.restored &= ~bit;
         if (auto* node = swarm.slots[slot])
             node->claimed--;
     }
@@ -2734,6 +2743,7 @@ void HiveMind::leave_swarm(hive::SNode& node) {
         return;
     auto it = swarms_.find(node.swarm);
     auto& swarm = it->second;
+    settle_restored(node, false);
     clear_slot(swarm, node);
     swarm.slots[node.slot] = nullptr;
     swarm.nodes--;
@@ -3454,6 +3464,7 @@ void HiveMind::restore_state() {
                         sw->second.by_claims[claims]--;
                         sw->second.by_claims[claims + 1]++;
                         account.acked |= bit;
+                        account.restored |= bit;
                         sw->second.slots[s]->claimed++;
                         any = true;
                     }
@@ -3462,13 +3473,11 @@ void HiveMind::restore_state() {
                 restored_.accounts++;
                 account.acked_at = acked_at;
                 // Renewed as it would have been, which may be now; and at the latest well
-                // before its monitors run out.
+                // before its monitors run out.  Set, not scheduled: its first placement here
+                // scheduled it already, and rebuild_schedule() replaces that entry.
                 auto last = system_time{std::chrono::seconds{acked_at}};
-                schedule(
-                        account,
-                        std::min(
-                                last + resubscribe_delay(),
-                                last + hive::MONITOR_LIFETIME - RESUME_MARGIN));
+                account.next_due = std::min(
+                        last + resubscribe_delay(), last + hive::MONITOR_LIFETIME - RESUME_MARGIN);
             }
         }
         if (!r.in.empty())
@@ -3497,6 +3506,7 @@ void HiveMind::restore_state() {
         return;
     }
     walk(true);
+    rebuild_schedule();
     // Only the restored nodes' sessions can be resumed: without the listing, nothing else could
     // be reconciled.
     std::erase_if(monitor_tokens_, [this](const auto& t) {
@@ -3520,12 +3530,37 @@ void HiveMind::restore_state() {
             restored_.slots_dropped);
 }
 
+void HiveMind::settle_restored(const hive::SNode& node, bool confirmed) {
+    if (node.slot < 0 || node.claimed == 0)
+        return;
+    auto bit = static_cast<uint16_t>(1u << node.slot);
+    for (const auto* account : swarms_.at(node.swarm).members)
+        if (account->restored & bit) {
+            if (confirmed)
+                account->restored = 0;
+            else
+                drop_restored(*account, node.slot);
+        }
+}
+
+void HiveMind::drop_restored(const SwarmPubkey& account, int slot) {
+    auto bit = static_cast<uint16_t>(1u << slot);
+    if (!(account.restored & bit))
+        return;
+    account.restored &= ~bit;
+    // Its renewal was for monitors that may no longer be on any node, while the nodes placing it
+    // in their place subscribe it from now on.
+    if (!account.restored && account.next_due != SwarmPubkey::UNSCHEDULED)
+        schedule(account, system_clock::now() + resubscribe_delay());
+}
+
 void HiveMind::abandon_resume(hive::SNode& node) {
     if (!node.resuming)
         return;
     node.resuming = false;
     if (node.slot < 0 || node.claimed == 0)
         return;
+    settle_restored(node, false);
     auto& swarm = swarms_.at(node.swarm);
     clear_slot(swarm, node);
     wake(swarm, &node);
@@ -3584,8 +3619,11 @@ void HiveMind::monitor_session_started(
             std::memcpy(id.data(), account.data(), id.size());
             if (auto acct =
                         subscribers_.find(SwarmPubkey{id, std::nullopt, /*_skip_validation=*/true});
-                acct != subscribers_.end())
+                acct != subscribers_.end()) {
+                if (node.slot >= 0 && acct->first.swarm == node.swarm)
+                    drop_restored(acct->first, node.slot);
                 unclaim(node, acct->first);
+            }
         }
     } catch (const std::exception& e) {
         log::warning(
@@ -3597,6 +3635,7 @@ void HiveMind::monitor_session_started(
         node.resuming = true;
         abandon_resume(node);
     }
+    settle_restored(node, true);
     monitor_session_stats_.kept += node.claimed;
     monitor_session_stats_.ended += ended;
     log::debug(

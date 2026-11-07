@@ -32,6 +32,11 @@ struct SwarmPubkey {
     // When a node last acknowledged a subscription for the account (unix seconds; 0 for never):
     // what is saved of its renewals, for a restarted hivemind to know how long its monitors last.
     mutable uint32_t acked_at = 0;
+    // The slots whose claims were restored from saved state and whose nodes have yet to confirm
+    // them by resuming their monitor sessions.  The renewal restored with them stands while any is
+    // left, or once one is confirmed (clearing the rest); an account losing the last of them
+    // unconfirmed is renewed as if placed when it lost it.
+    mutable uint16_t restored = 0;
     uint64_t swarm_space;
     mutable uint64_t swarm;
 

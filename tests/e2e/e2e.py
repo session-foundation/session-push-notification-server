@@ -381,10 +381,11 @@ class Setup:
             self.stop()
             raise
 
-    def restart_hivemind(self, name):
+    def restart_hivemind(self, name, **overrides):
         """Stops the hivemind and its notifier, then yields, for the scenario to act while it is
-        down; resumed, starts a new one as the same QUIC instance with the same settings, and a new
-        notifier, and waits for it to connect to every node."""
+        down; resumed, starts a new one as the same QUIC instance with the same settings, but for
+        any `overrides` of Hivemind's arguments for this one alone, and a new notifier, and waits
+        for it to connect to every node."""
         rc = self.hivemind.stop()
         check(rc == 0, f"hivemind exit code {rc}")
         self.stopped.append(self.hivemind)
@@ -393,7 +394,12 @@ class Setup:
         self.network.cmd("mark")
         self.hivemind = Hivemind(
             self.build_dir,
-            **{**self.hivemind_args, "name": name, "quic_key": self.hivemind.quic_key},
+            **{
+                **self.hivemind_args,
+                **overrides,
+                "name": name,
+                "quic_key": self.hivemind.quic_key,
+            },
         )
         self.hivemind.wait_socket()
         self.notifier = Proc(f"notifier-{name}", [f"{FAKES}/fake_notifier", HIVEMIND_SOCK])
@@ -980,7 +986,11 @@ def scenario_restart(build_dir):
     which the swarms
     split, the nodes that stayed resume so, and their accounts that moved are subscribed in their
     new swarm; and from saved state too old to trust, every node starts afresh.  Without monitor
-    sessions, the gap is lost, and everything is subscribed again."""
+    sessions, the gap is lost, and everything is subscribed again.
+
+    The first restarted hivemind renews every minute or so, to see when it renews what it restored:
+    with monitor sessions, when the first would have; without them, a renewal interval after it
+    placed everything afresh, not again when the first would have."""
     accounts, gap = 2000, 100
     subscriptions = accounts + accounts // 4
     fresh_db()
@@ -998,16 +1008,25 @@ def scenario_restart(build_dir):
         # only what is missing counts here.
         s.wait_for(lambda: s.check(0, accounts), 60, lambda c: c["missing"] == 0)
 
+    # The restored renewals fall due within the first restarted hivemind's run: those saved by the
+    # first, all acknowledged by `filled`, at most 1.1 intervals on; while it places nothing afresh
+    # before it starts, `down` after `filled`, and renews that no sooner than 0.9 intervals on.
+    renewal, down = 60, 25
+
     try:
         s.wait_subscribed(0, accounts, 60)
+        filled = time.time()
         s.network.cmd("send #1 before-the-restart-aaaaaaaaaaaaaaaaaaaaaa 0 100")
         c = s.wait_pushes(1, 30)
         check(c["pushes"] == 1, f"no push before the restart: {c}")
 
-        steps = s.restart_hivemind("hivemind2")
+        steps = s.restart_hivemind(
+            "hivemind2", config=f"{config}\nrenewal_interval = {renewal}"
+        )
         next(steps)
         for i in range(gap):
             s.network.cmd(f"send #{i} gap-{i:036d} 0 100")
+        time.sleep(max(0, filled + down - time.time()))
         next(steps, None)
         s.wait_subscribed(0, accounts, 60)
         c = s.wait_pushes(gap, 15 if MODE == "monitor" else 5)
@@ -1037,6 +1056,47 @@ def scenario_restart(build_dir):
         s.network.cmd("send #7 after-the-restart-aaaaaaaaaaaaaaaaaaaaaaa 0 100")
         c = s.wait_pushes(before + 1, 30)
         check(c["pushes"] == before + 1, "no push for a notification sent after the restart")
+
+        restored_due = filled + renewal * 11 / 10
+        fresh_due = filled + down + renewal * 9 / 10
+        if MODE == "monitor":
+            # Every placement was restored and kept, each account scheduled once, to be renewed
+            # when the first hivemind would have.
+            sched = s.stats()["schedule"]
+            check(sched == accounts, f"{sched} renewals scheduled for {accounts} accounts")
+            s.network.cmd("mark")
+            s.wait_for(
+                s.net_counts,
+                restored_due + 5 - time.time(),
+                lambda n: n["entries"] >= 3 * subscriptions,
+            )
+            renewed = time.time() - filled
+            print(f"    the restored placements renewed {renewed:.0f}s after the first fill")
+            check(
+                time.time() < fresh_due,
+                f"restored placements renewed {renewed:.0f}s after the first fill, as if placed "
+                f"afresh",
+            )
+        else:
+            # Every restored placement was dropped, and its account placed afresh: renewed a
+            # renewal interval from then, and not when the first hivemind would have.
+            s.network.cmd("mark")
+            time.sleep(max(0, restored_due + 2 - time.time()))
+            n = s.net_counts()
+            print(
+                f"    {n['entries']} subscriptions sent between the fill and "
+                f"{time.time() - filled:.0f}s after the first fill"
+            )
+            check(
+                n["entries"] < subscriptions // 20,
+                f"placed again when the restored placements would have been renewed: {n}",
+            )
+            s.wait_for(
+                s.net_counts,
+                fresh_due + renewal / 5 + 10 - time.time(),
+                lambda n: n["entries"] >= 3 * subscriptions,
+            )
+            print(f"    renewed {time.time() - filled:.0f}s after the first fill")
 
         if MODE == "monitor":
             # More notifications for each of a few accounts than the replay budget: each node
