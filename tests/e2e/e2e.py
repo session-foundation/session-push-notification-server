@@ -1508,10 +1508,13 @@ def scenario_rebalance(build_dir):
     interval = 10
     fresh_db()
     seed(0, accounts)
+    # Replies held back for long enough that a sample of the coverage catches what a renewal
+    # leaves while it is answered.
     s = Setup(
         build_dir,
         nodes=6,
         swarms=1,
+        network_args=["--reply-delay", "500"],
         config=f"redundancy = 3\nrenewal_interval = {interval}",
     )
     try:
@@ -1530,11 +1533,16 @@ def scenario_rebalance(build_dir):
         s.network.cmd("join 5")
         st = s.wait_for(s.stats, 60, covered(6))
         check(st["node_load"]["min"] < 500, f"node 5 joined with accounts already: {st}")
-        st = s.wait_for(
-            s.stats,
-            4 * interval,
-            lambda st: covered(6)(st) and st["node_load"]["max"] - st["node_load"]["min"] <= 500,
-        )
+
+        def balanced(st):
+            # A renewal moving an account keeps the node it leaves until the new one answers.
+            check(
+                st["coverage"]["covered"] == st["coverage"]["accounts"],
+                f"coverage dipped while renewals moved accounts: {st['coverage']}",
+            )
+            return covered(6)(st) and st["node_load"]["max"] - st["node_load"]["min"] <= 500
+
+        st = s.wait_for(s.stats, 4 * interval, balanced, interval=0.2)
         print(
             f"    node 5 back: loads {st['node_load']} {time.time() - start:.0f}s later, "
             f"{st['placements']['moved'] - moved} monitors moved by renewals"

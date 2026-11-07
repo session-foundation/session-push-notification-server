@@ -207,6 +207,9 @@ class SNode : public std::enable_shared_from_this<SNode> {
     /// to send before anything its scan finds; and its coverage scan (see HiveMind::next_claim).
     int slot = -1;
     size_t claimed = 0;
+    /// Of those claims, the ones on accounts leaving it (SwarmPubkey::leaving), which no longer
+    /// count to its load when accounts are placed.
+    size_t leaving = 0;
     /// Set while the node's claims are held for its monitor session to be resumed, restored from
     /// saved state after a restart or kept across a lost connection: they stand until the
     /// session's resumption confirms or refutes them.

@@ -436,11 +436,11 @@ class HiveMind {
     Coverage coverage(bool detail = false, bool recount = false) const;
     // The incremental counters recounted from the accounts themselves: for each swarm, its
     // accounts, how many are claimed by each number of nodes (Swarm::by_claims), and how many
-    // each slot's node claims (SNode::claimed).
+    // each slot's node claims (SNode::claimed) and is being left by (SNode::leaving).
     struct Recount {
         size_t members = 0;
         std::array<size_t, SWARM_SLOTS + 1> by_claims{};
-        std::array<size_t, SWARM_SLOTS> claimed{};
+        std::array<size_t, SWARM_SLOTS> claimed{}, leaving{};
     };
     // Recounts them, warning of every one that disagrees with its recount.
     std::unordered_map<uint64_t, Recount> audit_counters() const;
@@ -460,6 +460,11 @@ class HiveMind {
     static void claim(const SwarmPubkey& account, Swarm& swarm, hive::SNode& node);
     // Clears the bits of the node in `slot` for `account`, if either is set, and its claim.
     static void release(const SwarmPubkey& account, Swarm& swarm, int slot);
+    // Sets the nodes the account is leaving (SwarmPubkey::leaving), and their counts of them.
+    static void set_leaving(const SwarmPubkey& account, Swarm& swarm, uint16_t leaving);
+    // Releases the nodes the account is leaving, once it has been sent to no other node still to
+    // answer.
+    static void release_leaving(const SwarmPubkey& account, Swarm& swarm);
     // Releases every claim on the account by a node of swarm `swarm` (its own, or the one it is
     // leaving).
     void release_all(const SwarmPubkey& account, uint64_t swarm);
@@ -476,7 +481,9 @@ class HiveMind {
     void place(const SwarmPubkey& account, bool by_scan = false);
     // Sends `account` to its target number of its swarm's nodes afresh (see choose()), for its
     // renewal or a change to its subscriptions.  A node chosen that holds it keeps its claim,
-    // acknowledged or not, sent again; one not chosen gives it up.
+    // acknowledged or not, sent again.  One not chosen gives it up: once the chosen nodes have
+    // answered, if it is a connected node holding a live monitor (see release_leaving()), and at
+    // once otherwise.
     void renew(const SwarmPubkey& account);
     // Sets the node's scan going again, and queues it with the dispatcher.
     void wake(hive::SNode& node);

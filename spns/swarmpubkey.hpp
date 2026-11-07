@@ -42,6 +42,9 @@ struct SwarmPubkey {
     // left, or once one is confirmed (clearing the rest); an account losing the last of them
     // unconfirmed is renewed as if placed when it lost it.
     mutable uint16_t restored = 0;
+    // The slots of nodes a renewal moved the account away from, whose acknowledged monitors are
+    // live until the nodes it was sent to have answered: released once none of those is left to.
+    mutable uint16_t leaving = 0;
     uint64_t swarm_space;
     mutable uint64_t swarm;
 

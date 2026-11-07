@@ -2621,16 +2621,41 @@ void HiveMind::claim(const SwarmPubkey& account, Swarm& swarm, hive::SNode& node
 
 void HiveMind::release(const SwarmPubkey& account, Swarm& swarm, int slot) {
     auto bit = static_cast<uint16_t>(1u << slot);
-    if ((account.sent | account.acked) & bit) {
-        auto claims = std::popcount<uint16_t>(account.sent | account.acked);
-        swarm.by_claims[claims]--;
-        swarm.by_claims[claims - 1]++;
-        account.sent &= ~bit;
-        account.acked &= ~bit;
-        account.restored &= ~bit;
-        if (auto* node = swarm.slots[slot])
-            node->claimed--;
+    if (!((account.sent | account.acked) & bit))
+        return;
+    auto claims = std::popcount<uint16_t>(account.sent | account.acked);
+    swarm.by_claims[claims]--;
+    swarm.by_claims[claims - 1]++;
+    bool answering = account.sent & ~account.leaving & bit;
+    auto* node = swarm.slots[slot];
+    if (account.leaving & bit) {
+        account.leaving &= ~bit;
+        if (node)
+            node->leaving--;
     }
+    account.sent &= ~bit;
+    account.acked &= ~bit;
+    account.restored &= ~bit;
+    if (node)
+        node->claimed--;
+    // A node the account was sent to has failed it, which may have been the last to answer.
+    if (answering)
+        release_leaving(account, swarm);
+}
+
+void HiveMind::set_leaving(const SwarmPubkey& account, Swarm& swarm, uint16_t leaving) {
+    for (uint16_t bits = account.leaving & ~leaving; bits; bits &= bits - 1)
+        swarm.slots[std::countr_zero(bits)]->leaving--;
+    for (uint16_t bits = leaving & ~account.leaving; bits; bits &= bits - 1)
+        swarm.slots[std::countr_zero(bits)]->leaving++;
+    account.leaving = leaving;
+}
+
+void HiveMind::release_leaving(const SwarmPubkey& account, Swarm& swarm) {
+    if (!account.leaving || (account.sent & ~account.leaving))
+        return;
+    for (uint16_t bits = account.leaving; bits; bits &= bits - 1)
+        release(account, swarm, std::countr_zero(bits));
 }
 
 void HiveMind::release_all(const SwarmPubkey& account, uint64_t swarm) {
@@ -2655,7 +2680,7 @@ uint16_t HiveMind::choose(
     for (int s = 0; s < SWARM_SLOTS; s++)
         if (auto* node = swarm.slots[s]; node && node->settled() && !(exclude >> s & 1)) {
             bool h = held >> s & 1;
-            candidates[n++] = {s, node->claimed - h, h, rng()};
+            candidates[n++] = {s, node->claimed - node->leaving - h, h, rng()};
         }
     int chosen = std::clamp(count, 0, n);
     std::partial_sort(
@@ -2703,13 +2728,22 @@ void HiveMind::renew(const SwarmPubkey& account) {
     if (it == swarms_.end())
         return;
     auto& swarm = it->second;
+    set_leaving(account, swarm, 0);
     uint16_t held = account.sent | account.acked, prev_acked = account.acked;
     auto chosen = choose(account, swarm, 0, target(swarm));
-    // The nodes left out, for the balance or for being down, give the account up.  A chosen node
-    // that holds it keeps its acknowledged monitor, which outlives the renewal by several minutes:
-    // it is short only if the renewal fails, which releases it (see unclaim()).
-    for (uint16_t bits = held & ~chosen; bits; bits &= bits - 1)
-        release(account, swarm, std::countr_zero(bits));
+    // A chosen node that holds the account keeps its acknowledged monitor, which outlives the
+    // renewal by several minutes: it is short only if the renewal fails, which releases it (see
+    // unclaim()).  So does a connected node left out for the balance, until the nodes chosen have
+    // answered, so that a move leaves the account short only if they fail it.  The rest of those
+    // left out, down or never acknowledged, give it up now.
+    uint16_t leaving = 0;
+    for (uint16_t bits = held & ~chosen; bits; bits &= bits - 1) {
+        auto s = std::countr_zero(bits);
+        if ((account.acked >> s & 1) && swarm.slots[s] && swarm.slots[s]->settled())
+            leaving |= static_cast<uint16_t>(1u << s);
+        else
+            release(account, swarm, s);
+    }
     for (uint16_t bits = chosen; bits; bits &= bits - 1) {
         auto& node = *swarm.slots[std::countr_zero(bits)];
         if (held >> node.slot & 1)
@@ -2718,6 +2752,8 @@ void HiveMind::renew(const SwarmPubkey& account) {
             claim(account, swarm, node);
         send_placed(account, node);
     }
+    set_leaving(account, swarm, leaving);
+    release_leaving(account, swarm);
     placements_ += std::popcount(chosen);
     // A node that did not hold the account before takes the place of one that did, while any of
     // those is left out; beyond them it is an addition, not a move.
@@ -2774,6 +2810,7 @@ void HiveMind::join_swarm(hive::SNode& node) {
     swarm.nodes++;
     node.slot = free - swarm.slots.begin();
     node.claimed = 0;
+    node.leaving = 0;
     node.due.clear();
     node.scan.cursor = scan_start(swarm.members);
     node.scan.generation = UINT64_MAX;
@@ -2848,6 +2885,7 @@ void HiveMind::subscribed(hive::SNode& node, const SwarmPubkey& account) {
         account.sent &= ~bit;
         account.acked |= bit;
         account.acked_at = unix_timestamp(system_clock::now());
+        release_leaving(account, swarms_.at(node.swarm));
     }
 }
 
@@ -3070,6 +3108,8 @@ std::unordered_map<uint64_t, HiveMind::Recount> HiveMind::audit_counters() const
         r.by_claims[std::popcount(bits)]++;
         for (; bits; bits &= bits - 1)
             r.claimed[std::countr_zero(bits)]++;
+        for (bits = account.leaving; bits; bits &= bits - 1)
+            r.leaving[std::countr_zero(bits)]++;
     }
     auto check = [](uint64_t id, std::string_view counter, size_t kept, size_t counted) {
         if (kept != counted)
@@ -3093,6 +3133,11 @@ std::unordered_map<uint64_t, HiveMind::Recount> HiveMind::audit_counters() const
                   "slot {}'s claim count"_format(slot),
                   swarm.slots[slot] ? swarm.slots[slot]->claimed : 0,
                   r.claimed[slot]);
+        for (int slot = 0; slot < SWARM_SLOTS; slot++)
+            check(id,
+                  "slot {}'s leaving count"_format(slot),
+                  swarm.slots[slot] ? swarm.slots[slot]->leaving : 0,
+                  r.leaving[slot]);
     }
     for (const auto& [id, r] : recount)
         if (!swarms_.contains(id))
