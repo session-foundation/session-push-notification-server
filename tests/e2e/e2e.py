@@ -1573,7 +1573,10 @@ def scenario_status_report(build_dir):
         busy = re.search(r"^    dummy: .*", log, re.M)
         check(busy, "the busy notifier has no line in the report")
         check(
-            re.match(r"    dummy: [\d.]+ pushes/s, ack [\d.]+m?s avg / [\d.]+m?s max", busy.group(0)),
+            re.match(
+                r"    dummy: [\d.]+ pushes/s, ack latency [\d.]+m?s avg / [\d.]+m?s max",
+                busy.group(0),
+            ),
             f"no ack round trip on the busy notifier's line: {busy.group(0)}",
         )
         check("unacked" not in log, "a report shows unacked pushes below a full window")

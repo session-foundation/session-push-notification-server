@@ -1758,7 +1758,7 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         }
         out += "\n    {}: {:.1f} pushes/s"_format(service, value(dt > 0 ? sent / dt : 0.0));
         if (acks > 0)
-            out += ", ack {} avg / {} max"_format(
+            out += ", ack latency {} avg / {} max"_format(
                     value(friendly_duration(
                             delta("notifier_queue", service, "ack_seconds") / acks)),
                     value(friendly_duration(ack_max),
@@ -1776,8 +1776,8 @@ static std::string status_report(const nlohmann::json& s, const nlohmann::json& 
         // pushes (retries, say), and there is no share to judge.
         if (failures > 0) {
             double share = sent > 0 ? failures / sent : 0;
-            out += ", {} failures"_format(
-                    value(failures,
+            out += ", {:.1f} failures/s"_format(
+                    value(dt > 0 ? failures / dt : 0.0,
                           mark(share > NOTIFIER_FAILURES_LOOK, share > NOTIFIER_FAILURES_WRONG)));
         }
         if (blocked.is_number())
